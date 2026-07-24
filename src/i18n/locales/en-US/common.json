@@ -1,0 +1,45 @@
+{
+  "app": {
+    "name": "Thread",
+    "tagline": "A Tauri + React starter template"
+  },
+  "actions": {
+    "settings": "Settings",
+    "close": "Close",
+    "save": "Save",
+    "cancel": "Cancel",
+    "confirm": "Confirm"
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System"
+  },
+  "window": {
+    "minimize": "Minimize",
+    "maximize": "Maximize",
+    "restore": "Restore",
+    "close": "Close"
+  },
+  "shells": {
+    "main": "Empty main workspace",
+    "settings": "Settings window",
+    "connections": "Connections window",
+    "editor": "Editor window",
+    "placeholder": "This is an empty template. Build your feature here."
+  },
+  "errorBoundary": {
+    "title": "Something went wrong",
+    "description": "The interface hit an unexpected render error. You can retry or reload the app.",
+    "retry": "Try again",
+    "reload": "Reload"
+  },
+  "bootstrapFailed": {
+    "title": "Startup failed",
+    "description": "The app could not load persisted configuration, so it cannot start."
+  },
+  "configRecovered": {
+    "title": "Configuration reset",
+    "description": "A corrupted configuration file was detected. The original was backed up and defaults were restored."
+  }
+}
