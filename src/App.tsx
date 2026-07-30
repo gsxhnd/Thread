@@ -1,7 +1,6 @@
 import { RouterProvider } from "@tanstack/react-router";
 import { AppProviders } from "@/layout/providers/app-providers";
 import { router } from "@/app/router";
-import "./App.css";
 
 function App() {
   return (

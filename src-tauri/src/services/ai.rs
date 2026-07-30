@@ -84,13 +84,19 @@ pub fn ai_config_set(base_url: &str, api_key: &str, model: &str) -> AppResult<()
             "baseUrl and model are required".into(),
         ));
     }
-    if api_key.trim().is_empty() {
-        return Err(AppError::Validation("apiKey is required".into()));
-    }
+    let existing = load_config().unwrap_or_else(|_| AiConfigFile::default());
+    let next_key = if api_key.trim().is_empty() {
+        if existing.api_key.is_empty() {
+            return Err(AppError::Validation("apiKey is required".into()));
+        }
+        existing.api_key
+    } else {
+        api_key.trim().to_string()
+    };
     save_config(&AiConfigFile {
         base_url: base_url.trim().trim_end_matches('/').to_string(),
         model: model.trim().to_string(),
-        api_key: api_key.trim().to_string(),
+        api_key: next_key,
     })
 }
 

@@ -1,7 +1,7 @@
 {
   "app": {
     "name": "Thread",
-    "tagline": "Tauri + React 起手模板"
+    "tagline": "草蛇灰线，伏脉千里"
   },
   "actions": {
     "settings": "设置",
@@ -20,13 +20,6 @@
     "maximize": "最大化",
     "restore": "还原",
     "close": "关闭"
-  },
-  "shells": {
-    "main": "空白主工作区",
-    "settings": "设置窗口",
-    "connections": "连接管理窗口",
-    "editor": "编辑器窗口",
-    "placeholder": "这是一个空模板，在这里开始构建你的功能。"
   },
   "errorBoundary": {
     "title": "应用出现错误",

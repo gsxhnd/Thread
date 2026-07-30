@@ -4,6 +4,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -24,6 +25,7 @@ export function ForeshadowingPage() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [filter, setFilter] = useState<"all" | "planted" | "resolved">("all");
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const { data = [] } = useQuery({
     queryKey: ["foreshadowings", projectId, filter],
@@ -72,12 +74,17 @@ export function ForeshadowingPage() {
       invalidate();
       toast.success("关联已更新");
     },
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "关联失败"),
   });
 
   const delMut = useMutation({
     mutationFn: (id: string) => foreshadowingDelete(id),
     onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "删除失败"),
   });
+
+  const pendingTitle =
+    data.find((f) => f.id === pendingDeleteId)?.title ?? "该伏笔";
 
   return (
     <div className="flex h-full flex-col">
@@ -152,7 +159,7 @@ export function ForeshadowingPage() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => delMut.mutate(f.id)}
+                  onClick={() => setPendingDeleteId(f.id)}
                 >
                   <Trash2 className="size-4" />
                 </Button>
@@ -206,6 +213,20 @@ export function ForeshadowingPage() {
           )}
         </ul>
       </div>
+
+      <ConfirmDialog
+        open={pendingDeleteId !== null}
+        title="删除伏笔"
+        description={`确定删除「${pendingTitle}」？此操作不可撤销。`}
+        destructive
+        confirmLabel="删除"
+        onConfirm={() => {
+          if (pendingDeleteId) delMut.mutate(pendingDeleteId);
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      />
     </div>
   );
 }

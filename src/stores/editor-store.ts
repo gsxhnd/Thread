@@ -13,12 +13,13 @@ interface EditorState {
   setDraft: (md: string) => void;
   setTitle: (title: string) => void;
   setSaving: () => void;
-  markSaved: (wordCount: number) => void;
+  /** Only clears dirty when `forChapterId` matches the active chapter (or is omitted). */
+  markSaved: (wordCount: number, forChapterId?: string) => void;
   markError: () => void;
   clear: () => void;
 }
 
-export const useEditorStore = create<EditorState>((set) => ({
+export const useEditorStore = create<EditorState>((set, get) => ({
   chapterId: null,
   draft: "",
   title: "",
@@ -37,8 +38,10 @@ export const useEditorStore = create<EditorState>((set) => ({
   setDraft: (md) => set({ draft: md, dirty: true, saveState: "idle" }),
   setTitle: (title) => set({ title, dirty: true }),
   setSaving: () => set({ saveState: "saving" }),
-  markSaved: (wordCount) =>
-    set({ dirty: false, saveState: "saved", wordCount }),
+  markSaved: (wordCount, forChapterId) => {
+    if (forChapterId !== undefined && get().chapterId !== forChapterId) return;
+    set({ dirty: false, saveState: "saved", wordCount });
+  },
   markError: () => set({ saveState: "error" }),
   clear: () =>
     set({

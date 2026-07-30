@@ -23,7 +23,8 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "transparent": true,
-        "shadow": true
+        "shadow": true,
+        "acceptFirstMouse": true
       }
     ],
     "security": {

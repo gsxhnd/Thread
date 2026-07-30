@@ -18,7 +18,6 @@ const MODES: { id: AiMode; label: string }[] = [
 ];
 
 type Props = {
-  projectId: string;
   getSelection: () => string;
   getContext: () => string;
   onApply: (text: string) => void;
@@ -42,17 +41,20 @@ export function AiPanel({ getSelection, getContext, onApply }: Props) {
   const promptRef = useRef("");
 
   useEffect(() => {
-    const unsubs: Array<() => void> = [];
-    void onAiChunk((p) => {
+    const offChunk = onAiChunk((p) => {
       if (p.requestId === useAiStore.getState().requestId) append(p.delta);
-    }).then((u) => unsubs.push(u));
-    void onAiDone((p) => {
+    });
+    const offDone = onAiDone((p) => {
       if (p.requestId === useAiStore.getState().requestId) finish();
-    }).then((u) => unsubs.push(u));
-    void onAiError((p) => {
+    });
+    const offError = onAiError((p) => {
       if (p.requestId === useAiStore.getState().requestId) fail(p.message);
-    }).then((u) => unsubs.push(u));
-    return () => unsubs.forEach((u) => u());
+    });
+    return () => {
+      offChunk();
+      offDone();
+      offError();
+    };
   }, [append, finish, fail]);
 
   const runMut = useMutation({

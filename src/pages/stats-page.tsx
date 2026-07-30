@@ -37,16 +37,29 @@ export function StatsPage() {
   });
 
   const goalMut = useMutation({
-    mutationFn: () =>
-      goalSet({
+    mutationFn: () => {
+      const dailyWords = daily ? Number(daily) : goal?.dailyWords;
+      const totalWords = total ? Number(total) : goal?.totalWords;
+      if (daily && !Number.isFinite(dailyWords)) {
+        throw new Error("日更目标必须是数字");
+      }
+      if (total && !Number.isFinite(totalWords)) {
+        throw new Error("总量目标必须是数字");
+      }
+      return goalSet({
         projectId,
-        dailyWords: daily ? Number(daily) : goal?.dailyWords ?? undefined,
-        totalWords: total ? Number(total) : goal?.totalWords ?? undefined,
-      }),
+        dailyWords: dailyWords ?? undefined,
+        totalWords: totalWords ?? undefined,
+      });
+    },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["goal", projectId] });
+      setDaily("");
+      setTotal("");
       toast.success("目标已保存");
     },
+    onError: (e) =>
+      toast.error(e instanceof Error ? e.message : "保存目标失败"),
   });
 
   const maxWords = Math.max(1, ...calendar.map((d) => d.words));

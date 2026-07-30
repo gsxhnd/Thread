@@ -29,7 +29,7 @@ export function ForeshadowSidePanel({ projectId }: { projectId: string }) {
             </p>
           )}
           <div className="mt-1 text-[10px] text-amber-700 dark:text-amber-300">
-            重要度 {f.importance} · planted
+            重要度 {f.importance} · 未回收
           </div>
         </li>
       ))}

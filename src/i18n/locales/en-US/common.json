@@ -1,7 +1,7 @@
 {
   "app": {
     "name": "Thread",
-    "tagline": "A Tauri + React starter template"
+    "tagline": "Subtle threads that run through the story"
   },
   "actions": {
     "settings": "Settings",
@@ -20,13 +20,6 @@
     "maximize": "Maximize",
     "restore": "Restore",
     "close": "Close"
-  },
-  "shells": {
-    "main": "Empty main workspace",
-    "settings": "Settings window",
-    "connections": "Connections window",
-    "editor": "Editor window",
-    "placeholder": "This is an empty template. Build your feature here."
   },
   "errorBoundary": {
     "title": "Something went wrong",

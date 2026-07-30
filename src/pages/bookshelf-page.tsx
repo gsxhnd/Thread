@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { BookOpen, Plus } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
@@ -13,11 +13,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { WindowTitleBar } from "@/components/window-title-bar";
 import { projectCreate, projectList } from "@/lib/api";
 import { ApiError } from "@/lib/api/client";
+import { getPlatform } from "@/lib/platform";
 
 export function BookshelfPage() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
   const [synopsis, setSynopsis] = useState("");
@@ -29,12 +32,16 @@ export function BookshelfPage() {
 
   const createMut = useMutation({
     mutationFn: () => projectCreate({ title, synopsis: synopsis || undefined }),
-    onSuccess: () => {
+    onSuccess: (project) => {
       void qc.invalidateQueries({ queryKey: ["projects"] });
       setOpen(false);
       setTitle("");
       setSynopsis("");
       toast.success("作品已创建");
+      void navigate({
+        to: "/project/$projectId/write",
+        params: { projectId: project.id },
+      });
     },
     onError: (e) => {
       toast.error(e instanceof ApiError ? e.message : "创建失败");
@@ -44,20 +51,27 @@ export function BookshelfPage() {
   return (
     <div
       data-app-shell
+      data-platform={getPlatform()}
       className="flex h-screen flex-col bg-shell-main text-foreground"
     >
-      <header className="flex items-center justify-between border-b border-border px-8 py-5 pt-[max(1.25rem,env(safe-area-inset-top))] [padding-left:max(2rem,var(--titlebar-macos-inset))]">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Thread · 灰线</h1>
+      <WindowTitleBar
+        className="h-auto items-start py-5 pr-8 pl-[max(2rem,var(--titlebar-macos-inset))]"
+        trailing={
+          <Button onClick={() => setOpen(true)}>
+            <Plus className="size-4" />
+            新建作品
+          </Button>
+        }
+      >
+        <div className="py-0.5">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            Thread · 灰线
+          </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             草蛇灰线，伏脉千里
           </p>
         </div>
-        <Button onClick={() => setOpen(true)}>
-          <Plus className="size-4" />
-          新建作品
-        </Button>
-      </header>
+      </WindowTitleBar>
 
       <main className="flex-1 overflow-auto p-8">
         {isLoading ? (

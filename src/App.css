@@ -161,6 +161,13 @@ html[data-window-chrome="macos-tauri"] [data-app-shell] {
 .window-title-bar {
   -webkit-app-region: drag;
   app-region: drag;
+  cursor: default;
+}
+
+/* Nested nodes must participate in Tauri's data-tauri-drag-region hit-testing. */
+.window-title-bar [data-tauri-drag-region] {
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 /* Interactive controls inside the title bar must not initiate window drag. */

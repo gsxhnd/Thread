@@ -4,6 +4,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -26,6 +27,7 @@ export function WorldPage() {
   const [kind, setKind] = useState<EntryKind>("location");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const { data = [] } = useQuery({
     queryKey: ["world", projectId, kind],
@@ -73,7 +75,10 @@ export function WorldPage() {
       return itemDelete(id);
     },
     onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "删除失败"),
   });
+
+  const pendingName = data.find((e) => e.id === pendingDeleteId)?.name ?? "该词条";
 
   return (
     <div className="flex h-full flex-col">
@@ -137,7 +142,7 @@ export function WorldPage() {
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() => delMut.mutate(e.id)}
+                onClick={() => setPendingDeleteId(e.id)}
               >
                 <Trash2 className="size-4" />
               </Button>
@@ -148,6 +153,20 @@ export function WorldPage() {
           )}
         </ul>
       </div>
+
+      <ConfirmDialog
+        open={pendingDeleteId !== null}
+        title="删除词条"
+        description={`确定删除「${pendingName}」？此操作不可撤销。`}
+        destructive
+        confirmLabel="删除"
+        onConfirm={() => {
+          if (pendingDeleteId) delMut.mutate(pendingDeleteId);
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      />
     </div>
   );
 }

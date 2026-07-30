@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { save } from "@tauri-apps/plugin-dialog";
 import { useParams } from "@tanstack/react-router";
 import { Download, KeyRound } from "lucide-react";
@@ -17,6 +17,7 @@ import type { ExportFormat } from "@/lib/api/types";
 
 export function SettingsPage() {
   const { projectId } = useParams({ from: "/project/$projectId/settings" });
+  const qc = useQueryClient();
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com");
   const [model, setModel] = useState("gpt-4o-mini");
   const [apiKey, setApiKey] = useState("");
@@ -33,22 +34,22 @@ export function SettingsPage() {
     if (aiCfg.model) setModel(aiCfg.model);
   }, [aiCfg]);
 
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    void onExportProgress((p) => setProgress(p.percent)).then((fn) => {
-      unlisten = fn;
-    });
-    return () => unlisten?.();
-  }, []);
+  useEffect(() => onExportProgress((p) => setProgress(p.percent)), []);
 
   const saveAi = useMutation({
     mutationFn: () => aiConfigSet({ baseUrl, apiKey, model }),
     onSuccess: () => {
       setApiKey("");
+      void qc.invalidateQueries({ queryKey: ["aiConfig"] });
       toast.success("AI 配置已保存（Key 不会回传前端）");
     },
     onError: (e) => toast.error(e instanceof ApiError ? e.message : "失败"),
   });
+
+  const canSaveAi =
+    !!baseUrl.trim() &&
+    !!model.trim() &&
+    (!!apiKey.trim() || !!aiCfg?.hasKey);
 
   const doExport = async (format: ExportFormat) => {
     const ext =
@@ -105,13 +106,13 @@ export function SettingsPage() {
           <Input
             type="password"
             placeholder={
-              aiCfg?.hasKey ? "已配置 Key（输入以更新）" : "API Key"
+              aiCfg?.hasKey ? "已配置 Key（留空则保留原 Key）" : "API Key"
             }
             value={apiKey}
             onChange={(e) => setApiKey(e.target.value)}
           />
           <Button
-            disabled={!apiKey.trim() || !baseUrl.trim() || !model.trim()}
+            disabled={!canSaveAi || saveAi.isPending}
             onClick={() => saveAi.mutate()}
           >
             保存 AI 配置

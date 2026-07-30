@@ -4,6 +4,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -23,6 +24,7 @@ export function CharactersPage() {
   const [fromId, setFromId] = useState("");
   const [toId, setToId] = useState("");
   const [relType, setRelType] = useState("");
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const { data: characters = [] } = useQuery({
     queryKey: ["characters", projectId],
@@ -68,7 +70,11 @@ export function CharactersPage() {
   const delMut = useMutation({
     mutationFn: (id: string) => characterDelete(id),
     onSuccess: invalidate,
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "删除失败"),
   });
+
+  const pendingName =
+    characters.find((c) => c.id === pendingDeleteId)?.name ?? "该人物";
 
   return (
     <div className="flex h-full flex-col">
@@ -116,7 +122,7 @@ export function CharactersPage() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => delMut.mutate(c.id)}
+                  onClick={() => setPendingDeleteId(c.id)}
                 >
                   <Trash2 className="size-4" />
                 </Button>
@@ -158,11 +164,16 @@ export function CharactersPage() {
               ))}
             </select>
             <Button
-              disabled={!fromId || !toId || !relType.trim()}
+              disabled={
+                !fromId || !toId || fromId === toId || !relType.trim()
+              }
               onClick={() => relMut.mutate()}
             >
               添加关系
             </Button>
+            {fromId && toId && fromId === toId && (
+              <p className="text-xs text-destructive">不能与自己建立关系</p>
+            )}
           </div>
           <ul className="space-y-2">
             {(graph?.edges ?? []).map((e) => {
@@ -184,6 +195,20 @@ export function CharactersPage() {
           </ul>
         </section>
       </div>
+
+      <ConfirmDialog
+        open={pendingDeleteId !== null}
+        title="删除人物"
+        description={`确定删除「${pendingName}」？此操作不可撤销。`}
+        destructive
+        confirmLabel="删除"
+        onConfirm={() => {
+          if (pendingDeleteId) delMut.mutate(pendingDeleteId);
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      />
     </div>
   );
 }

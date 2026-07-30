@@ -4,6 +4,7 @@ import { Plus, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { eventCreate, eventDelete, timelineList } from "@/lib/api";
@@ -15,6 +16,7 @@ export function TimelinePage() {
   const [title, setTitle] = useState("");
   const [storyTime, setStoryTime] = useState("");
   const [description, setDescription] = useState("");
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const { data = [] } = useQuery({
     queryKey: ["timeline", projectId],
@@ -43,7 +45,11 @@ export function TimelinePage() {
     mutationFn: (id: string) => eventDelete(id),
     onSuccess: () =>
       void qc.invalidateQueries({ queryKey: ["timeline", projectId] }),
+    onError: (e) => toast.error(e instanceof ApiError ? e.message : "删除失败"),
   });
+
+  const pendingTitle =
+    data.find((ev) => ev.id === pendingDeleteId)?.title ?? "该事件";
 
   return (
     <div className="flex h-full flex-col">
@@ -91,7 +97,7 @@ export function TimelinePage() {
                 <Button
                   size="sm"
                   variant="ghost"
-                  onClick={() => delMut.mutate(ev.id)}
+                  onClick={() => setPendingDeleteId(ev.id)}
                 >
                   <Trash2 className="size-4" />
                 </Button>
@@ -103,6 +109,20 @@ export function TimelinePage() {
           )}
         </ol>
       </div>
+
+      <ConfirmDialog
+        open={pendingDeleteId !== null}
+        title="删除事件"
+        description={`确定删除「${pendingTitle}」？此操作不可撤销。`}
+        destructive
+        confirmLabel="删除"
+        onConfirm={() => {
+          if (pendingDeleteId) delMut.mutate(pendingDeleteId);
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      />
     </div>
   );
 }

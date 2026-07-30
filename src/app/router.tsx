@@ -5,16 +5,16 @@ import {
   Outlet,
   redirect,
 } from "@tanstack/react-router";
-import { BookshelfPage } from "@/features/bookshelf/bookshelf-page";
-import { ProjectLayout } from "@/features/project/project-layout";
-import { WritePage } from "@/features/chapters/write-page";
-import { OutlinePage } from "@/features/outline/outline-page";
-import { CharactersPage } from "@/features/characters/characters-page";
-import { WorldPage } from "@/features/worldbuilding/world-page";
-import { TimelinePage } from "@/features/timeline/timeline-page";
-import { ForeshadowingPage } from "@/features/foreshadowing/foreshadowing-page";
-import { StatsPage } from "@/features/stats/stats-page";
-import { SettingsPage } from "@/features/settings/settings-page";
+import { ProjectLayout } from "@/layout/project-layout";
+import { BookshelfPage } from "@/pages/bookshelf-page";
+import { WritePage } from "@/pages/write-page";
+import { OutlinePage } from "@/pages/outline-page";
+import { CharactersPage } from "@/pages/characters-page";
+import { WorldPage } from "@/pages/world-page";
+import { TimelinePage } from "@/pages/timeline-page";
+import { ForeshadowingPage } from "@/pages/foreshadowing-page";
+import { StatsPage } from "@/pages/stats-page";
+import { SettingsPage } from "@/pages/settings-page";
 
 const rootRoute = createRootRoute({
   component: () => <Outlet />,
