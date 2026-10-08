@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local npm cache used when the global cache is unavailable
+.npm-cache

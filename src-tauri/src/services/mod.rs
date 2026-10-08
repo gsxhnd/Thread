@@ -1,15 +1,6 @@
-pub mod ai;
-pub mod chapter;
-pub mod export;
-pub mod foreshadowing;
-pub mod project;
-pub mod stats;
-pub mod story;
+//! Service layer: HTTP execution, history, variables, secrets.
 
-pub use ai::*;
-pub use chapter::*;
-pub use export::*;
-pub use foreshadowing::*;
-pub use project::*;
-pub use stats::*;
-pub use story::*;
+pub mod history;
+pub mod http;
+pub mod secrets;
+pub mod variables;

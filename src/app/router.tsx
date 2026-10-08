@@ -5,117 +5,36 @@ import {
   Outlet,
   redirect,
 } from "@tanstack/react-router";
-import { ProjectLayout } from "@/layout/project-layout";
-import { BookshelfPage } from "@/pages/bookshelf-page";
-import { WritePage } from "@/pages/write-page";
-import { OutlinePage } from "@/pages/outline-page";
-import { CharactersPage } from "@/pages/characters-page";
-import { WorldPage } from "@/pages/world-page";
-import { TimelinePage } from "@/pages/timeline-page";
-import { ForeshadowingPage } from "@/pages/foreshadowing-page";
-import { StatsPage } from "@/pages/stats-page";
-import { SettingsPage } from "@/pages/settings-page";
+import { WelcomePage } from "@/pages/welcome-page";
+import { WorkspacePage } from "@/pages/workspace-page";
+import { useAppStore } from "@/stores/app-store";
 
 const rootRoute = createRootRoute({
   component: () => <Outlet />,
 });
 
-const indexRoute = createRoute({
+const welcomeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  component: BookshelfPage,
+  component: WelcomePage,
 });
 
-const projectRoute = createRoute({
+const workspaceRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/project/$projectId",
-  component: ProjectLayout,
-});
-
-const projectIndexRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/",
-  beforeLoad: ({ params }) => {
-    throw redirect({
-      to: "/project/$projectId/write",
-      params: { projectId: params.projectId },
-    });
+  path: "/workspace",
+  beforeLoad: () => {
+    if (!useAppStore.getState().snapshot) {
+      throw redirect({ to: "/" });
+    }
   },
+  component: WorkspacePage,
 });
 
-const writeRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/write",
-  component: WritePage,
-});
-
-const writeChapterRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/write/$chapterId",
-  component: WritePage,
-});
-
-const outlineRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/outline",
-  component: OutlinePage,
-});
-
-const charactersRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/characters",
-  component: CharactersPage,
-});
-
-const worldRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/world",
-  component: WorldPage,
-});
-
-const timelineRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/timeline",
-  component: TimelinePage,
-});
-
-const foreshadowingRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/foreshadowing",
-  component: ForeshadowingPage,
-});
-
-const statsRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/stats",
-  component: StatsPage,
-});
-
-const settingsRoute = createRoute({
-  getParentRoute: () => projectRoute,
-  path: "/settings",
-  component: SettingsPage,
-});
-
-const routeTree = rootRoute.addChildren([
-  indexRoute,
-  projectRoute.addChildren([
-    projectIndexRoute,
-    writeRoute,
-    writeChapterRoute,
-    outlineRoute,
-    charactersRoute,
-    worldRoute,
-    timelineRoute,
-    foreshadowingRoute,
-    statsRoute,
-    settingsRoute,
-  ]),
-]);
+const routeTree = rootRoute.addChildren([welcomeRoute, workspaceRoute]);
 
 export const router = createRouter({
   routeTree,
-  defaultPreload: "intent",
+  defaultPreload: false,
 });
 
 declare module "@tanstack/react-router" {

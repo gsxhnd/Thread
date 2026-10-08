@@ -1,4 +1,7 @@
 //! Application error type serialized as `{ code, message }` for IPC.
+//!
+//! 应用统一错误类型。所有 command 返回 `AppResult<T>`，错误序列化为
+//! `{ code, message }`（见 docs/04.ipc-api.md §7）。
 
 use serde::Serialize;
 
@@ -10,12 +13,24 @@ pub enum AppError {
     Validation(String),
     #[error("db error: {0}")]
     Db(String),
-    #[error("ai error: {0}")]
-    Ai(String),
-    #[error("ai key not configured")]
-    AiNoKey,
+    #[error("network error: {0}")]
+    Network(String),
+    #[error("tls error: {0}")]
+    Tls(String),
+    #[error("timeout: {0}")]
+    Timeout(String),
     #[error("io error: {0}")]
     Io(String),
+    /// Reserved for Phase 2 (gRPC/proto parsing).
+    #[allow(dead_code)]
+    #[error("proto error: {0}")]
+    Proto(String),
+    /// Reserved for Phase 3–4 (proxy engine).
+    #[allow(dead_code)]
+    #[error("proxy error: {0}")]
+    Proxy(String),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl AppError {
@@ -24,10 +39,18 @@ impl AppError {
             Self::NotFound(_) => "NOT_FOUND",
             Self::Validation(_) => "VALIDATION",
             Self::Db(_) => "DB_ERROR",
-            Self::Ai(_) => "AI_ERROR",
-            Self::AiNoKey => "AI_NO_KEY",
+            Self::Network(_) => "NETWORK_ERROR",
+            Self::Tls(_) => "TLS_ERROR",
+            Self::Timeout(_) => "TIMEOUT",
             Self::Io(_) => "IO_ERROR",
+            Self::Proto(_) => "PROTO_ERROR",
+            Self::Proxy(_) => "PROXY_ERROR",
+            Self::Cancelled => "CANCELLED",
         }
+    }
+
+    pub fn cancelled() -> Self {
+        Self::Cancelled
     }
 }
 
@@ -69,10 +92,51 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-impl From<zip::result::ZipError> for AppError {
-    fn from(value: zip::result::ZipError) -> Self {
-        Self::Io(value.to_string())
+impl From<reqwest::Error> for AppError {
+    fn from(value: reqwest::Error) -> Self {
+        if value.is_timeout() {
+            return Self::Timeout(value.to_string());
+        }
+        if is_tls_error(&value) {
+            return Self::Tls(value.to_string());
+        }
+        Self::Network(value.to_string())
     }
 }
 
+/// Best-effort detection of TLS/certificate failures inside a reqwest error chain.
+fn is_tls_error(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = source {
+        let text = current.to_string().to_lowercase();
+        if text.contains("certificate")
+            || text.contains("tls")
+            || text.contains("ssl")
+            || text.contains("handshake")
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_payload_exposes_code_and_message() {
+        let error = AppError::NotFound("request.json".into());
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["code"], "NOT_FOUND");
+        assert_eq!(json["message"], "not found: request.json");
+    }
+
+    #[test]
+    fn cancelled_maps_to_its_own_code() {
+        assert_eq!(AppError::cancelled().code(), "CANCELLED");
+    }
+}

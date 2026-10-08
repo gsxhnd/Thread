@@ -30,6 +30,10 @@ function parseError(err: unknown): AppError {
   return { code: "UNKNOWN", message: String(err) };
 }
 
+/**
+ * 统一调用入口：所有 command 的入参都包在 `payload` 里
+ * （Rust 侧约定见 docs/04.ipc-api.md §1.2）。
+ */
 export async function invokeCmd<T>(cmd: string, payload?: unknown): Promise<T> {
   try {
     if (payload === undefined) {
@@ -39,4 +43,8 @@ export async function invokeCmd<T>(cmd: string, payload?: unknown): Promise<T> {
   } catch (err) {
     throw new ApiError(parseError(err));
   }
+}
+
+export function isApiError(error: unknown): error is ApiError {
+  return error instanceof ApiError;
 }

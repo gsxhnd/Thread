@@ -1,38 +1,8 @@
 {
-  "app": {
-    "name": "Thread",
-    "tagline": "Subtle threads that run through the story"
-  },
-  "actions": {
-    "settings": "Settings",
-    "close": "Close",
-    "save": "Save",
-    "cancel": "Cancel",
-    "confirm": "Confirm"
-  },
-  "theme": {
-    "light": "Light",
-    "dark": "Dark",
-    "system": "System"
-  },
-  "window": {
-    "minimize": "Minimize",
-    "maximize": "Maximize",
-    "restore": "Restore",
-    "close": "Close"
-  },
   "errorBoundary": {
     "title": "Something went wrong",
-    "description": "The interface hit an unexpected render error. You can retry or reload the app.",
-    "retry": "Try again",
+    "description": "An unexpected error occurred while rendering. You can retry or reload the app.",
+    "retry": "Retry",
     "reload": "Reload"
-  },
-  "bootstrapFailed": {
-    "title": "Startup failed",
-    "description": "The app could not load persisted configuration, so it cannot start."
-  },
-  "configRecovered": {
-    "title": "Configuration reset",
-    "description": "A corrupted configuration file was detected. The original was backed up and defaults were restored."
   }
 }

@@ -1,215 +1,320 @@
-/** Shared domain types matching Rust IPC models (camelCase). */
+/**
+ * IPC 类型定义 —— 与 Rust 侧 serde 结构一一对应（camelCase）。
+ *
+ * 约定：所有 command 走 `invokeCmd`（DTO 放在 `payload` 里），
+ * 组件禁止直接调用 `invoke`（见 docs/04.ipc-api.md §6）。
+ */
 
 export interface AppError {
   code: string;
   message: string;
 }
 
-export interface Project {
-  id: string;
-  title: string;
-  synopsis?: string | null;
-  author?: string | null;
-  coverPath?: string | null;
-  createdAt: number;
-  updatedAt: number;
+export type Protocol = "http" | "grpc" | "websocket" | "graphql" | "mqtt";
+
+export interface KeyValue {
+  key: string;
+  value: string;
+  enabled: boolean;
+  description?: string | null;
 }
 
-export interface Volume {
-  id: string;
-  projectId: string;
-  title: string;
-  sortOrder: number;
-  createdAt: number;
-  updatedAt: number;
+export interface RequestSettings {
+  timeoutMs?: number | null;
+  followRedirects?: boolean | null;
+  verifySsl?: boolean | null;
 }
 
-export interface Chapter {
-  id: string;
-  volumeId: string;
-  projectId: string;
-  title: string;
+export type AuthType = "inherit" | "none" | "bearer" | "basic" | "apiKey" | "oauth2";
+
+export interface AuthSpec {
+  type: AuthType | string;
+  token?: string | null;
+  username?: string | null;
+  password?: string | null;
+  key?: string | null;
+  value?: string | null;
+  in?: "header" | "query" | null;
+}
+
+export interface HttpBodyField {
+  key: string;
+  value: string;
+  kind: "text" | "file";
+  enabled: boolean;
+  filePath?: string | null;
+  contentType?: string | null;
+}
+
+export type HttpBodyType =
+  | "none"
+  | "json"
+  | "raw"
+  | "formUrlencoded"
+  | "multipart"
+  | "binary";
+
+export interface HttpBody {
+  type: HttpBodyType | string;
   content: string;
-  summary?: string | null;
-  wordCount: number;
-  status: "draft" | "done" | string;
-  sortOrder: number;
-  createdAt: number;
-  updatedAt: number;
+  contentType?: string | null;
+  fields?: HttpBodyField[];
+  filePath?: string | null;
 }
 
-export interface ChapterSummary {
-  id: string;
-  volumeId: string;
-  projectId: string;
-  title: string;
-  summary?: string | null;
-  wordCount: number;
-  status: string;
-  sortOrder: number;
-  updatedAt: number;
+export interface HttpRequestConfig {
+  method: string;
+  url: string;
+  queryParams: KeyValue[];
+  headers: KeyValue[];
+  body: HttpBody;
+  auth: AuthSpec;
+  settings: RequestSettings;
 }
 
-export interface VolumeWithChapters extends Volume {
-  chapters: ChapterSummary[];
-}
-
-export interface Plotline {
-  id: string;
-  projectId: string;
+/** 工作区文件里保存的请求文档（原样读写，不丢字段）。 */
+export interface RequestDocument extends Partial<HttpRequestConfig> {
+  version?: number;
+  id?: string;
+  protocol: Protocol | string;
   name: string;
-  color?: string | null;
-  description?: string | null;
-  sortOrder: number;
-  createdAt: number;
-  updatedAt: number;
+  method?: string;
+  url?: string;
+  [key: string]: unknown;
 }
 
-export interface OutlineNode {
-  chapterId: string;
-  chapterTitle: string;
-  volumeId: string;
-  volumeTitle: string;
-  summary?: string | null;
-  sortOrder: number;
-  plotlines: Plotline[];
-}
-
-export interface Character {
+export interface RequestDetail {
   id: string;
-  projectId: string;
   name: string;
-  alias?: string | null;
-  avatarPath?: string | null;
-  bio?: string | null;
-  attributes?: string | null;
-  createdAt: number;
-  updatedAt: number;
+  protocol: Protocol | string;
+  path: string;
+  collectionPath: string;
+  collectionName: string;
+  inheritedHeaders: KeyValue[];
+  inheritedAuth: AuthSpec;
+  raw: RequestDocument;
+  http?: HttpRequestConfig | null;
+  error?: string | null;
 }
 
-export interface CharacterRelation {
+export interface RequestNode {
   id: string;
-  projectId: string;
-  fromCharId: string;
-  toCharId: string;
-  relationType: string;
-  description?: string | null;
-  createdAt: number;
-  updatedAt: number;
-}
-
-export interface RelationGraph {
-  nodes: Character[];
-  edges: CharacterRelation[];
-}
-
-export interface Location {
-  id: string;
-  projectId: string;
   name: string;
-  description?: string | null;
-  parentId?: string | null;
-  createdAt: number;
-  updatedAt: number;
+  protocol: Protocol | string;
+  path: string;
+  method?: string | null;
+  url?: string | null;
+  error?: string | null;
 }
 
-export interface Faction {
+export interface CollectionNode {
   id: string;
-  projectId: string;
   name: string;
+  path: string;
   description?: string | null;
-  createdAt: number;
-  updatedAt: number;
+  hasMeta: boolean;
+  requests: RequestNode[];
+  children: CollectionNode[];
 }
 
-export interface Item {
+export interface EnvironmentSummary {
   id: string;
-  projectId: string;
   name: string;
-  description?: string | null;
-  createdAt: number;
-  updatedAt: number;
+  path: string;
+  variableCount: number;
+  secretCount: number;
+  /** 变量名（非机密）：用于 `{{variable}}` 自动补全。 */
+  variableNames: string[];
+  /** 值为本地存储（界面掩码显示）的变量名。 */
+  secretVariableNames: string[];
+  isGlobal: boolean;
+  isActive: boolean;
 }
 
-export interface WorldEntry {
+export interface WorkspaceIndex {
   id: string;
-  entryType: string;
   name: string;
-  description?: string | null;
-  parentId?: string | null;
-  updatedAt: number;
+  version: number;
+  root: string;
+  activeEnvironment?: string | null;
+  collections: CollectionNode[];
+  environments: EnvironmentSummary[];
+  collectionCount: number;
+  requestCount: number;
+  warnings: string[];
+  scannedAt: number;
+  digest: string;
 }
 
-export interface EventLink {
+export interface ProxySettings {
+  port: number;
+  autoStart: boolean;
+}
+
+export interface WorkspaceConfig {
+  version: number;
+  id?: string | null;
+  name: string;
+  activeEnvironment?: string | null;
+  proxy: ProxySettings;
+  settings: RequestSettings;
+}
+
+export interface WorkspaceSnapshot {
+  index: WorkspaceIndex;
+  config: WorkspaceConfig;
+  warnings: string[];
+}
+
+export interface CollectionDetail {
   id: string;
-  eventId: string;
-  entityType: string;
-  entityId: string;
-  createdAt: number;
-}
-
-export interface TimelineEvent {
-  id: string;
-  projectId: string;
-  title: string;
+  name: string;
+  path: string;
   description?: string | null;
-  storyTime?: string | null;
-  sortKey: number;
-  createdAt: number;
-  updatedAt: number;
-  links: EventLink[];
+  hasMeta: boolean;
+  auth: AuthSpec;
+  headers: KeyValue[];
+  preScript: string;
+  postScript: string;
+  parentPath?: string | null;
+  requestCount: number;
+  childCount: number;
 }
 
-export interface Foreshadowing {
-  id: string;
-  projectId: string;
-  title: string;
+export interface EnvVariableView {
+  key: string;
+  value: string;
+  enabled: boolean;
+  secret: boolean;
   description?: string | null;
-  status: "planted" | "resolved" | string;
-  setupChapterId?: string | null;
-  payoffChapterId?: string | null;
-  importance: number;
+  hasStoredValue: boolean;
+}
+
+export interface EnvironmentDetail {
+  id: string;
+  name: string;
+  path: string;
+  isGlobal: boolean;
+  isActive: boolean;
+  variables: EnvVariableView[];
+}
+
+export interface SearchHit {
+  id: string;
+  name: string;
+  protocol: Protocol | string;
+  path: string;
+  collectionPath: string;
+  collectionName: string;
+  method?: string | null;
+  url?: string | null;
+}
+
+export interface Timing {
+  dnsMs: number;
+  tcpMs: number;
+  tlsMs: number;
+  ttfbMs: number;
+  downloadMs: number;
+  totalMs: number;
+}
+
+export interface HttpResponse {
+  taskId: string;
+  url: string;
+  statusCode: number;
+  statusText: string;
+  headers: Record<string, string[]>;
+  body: string | null;
+  bodyFilePath?: string | null;
+  bodySize: number;
+  contentType?: string | null;
+  timing: Timing;
+  redirectCount: number;
+  unresolvedVariables: string[];
+}
+
+export interface HistorySummary {
+  id: string;
+  protocol: string;
+  name?: string | null;
+  method?: string | null;
+  url?: string | null;
+  statusCode?: number | null;
+  durationMs?: number | null;
   createdAt: number;
-  updatedAt: number;
+  requestFilePath?: string | null;
+  hasBodyFile: boolean;
 }
 
-export interface ChapterSaveResult {
-  savedAt: number;
-  wordCount: number;
+export interface HistoryDetail extends HistorySummary {
+  workspacePath: string;
+  requestSnapshot: {
+    protocol?: string;
+    name?: string;
+    document?: RequestDocument;
+    resolved?: {
+      method?: string;
+      url?: string;
+      headers?: KeyValue[];
+      bodyKind?: string;
+      bodyPreview?: string | null;
+    };
+  };
+  responseSnapshot?: Record<string, unknown> | null;
+  responseBody?: string | null;
+  responseBodyFilePath?: string | null;
 }
 
-export interface StatsOverview {
-  totalWords: number;
-  chapterCount: number;
-  volumeCount: number;
-  characterCount: number;
-  unresolvedForeshadowings: number;
-  wordsToday: number;
+export interface HistoryPage {
+  items: HistorySummary[];
+  total: number;
 }
 
-export interface DayCount {
-  date: string;
-  words: number;
+export interface AppSettings {
+  defaultTimeoutMs: number;
+  followRedirects: boolean;
+  verifySsl: boolean;
+  maxInlineBodyBytes: number;
+  historyLimit: number;
+  historyBodyStorage: string;
 }
 
-export interface Streak {
-  current: number;
-  longest: number;
+export interface RecentWorkspace {
+  path: string;
+  name: string;
+  lastOpenedAt: number;
 }
 
-export interface Goal {
-  projectId: string;
-  dailyWords?: number | null;
-  totalWords?: number | null;
-  updatedAt: number;
+export interface SessionData {
+  lastWorkspacePath?: string | null;
+  recentWorkspaces: RecentWorkspace[];
 }
 
-export interface AiConfigPublic {
-  baseUrl: string;
-  model: string;
-  hasKey: boolean;
+export interface AppPaths {
+  configDir: string;
+  configFile: string;
+  dataDir: string;
+  dbFile: string;
 }
 
-export type AiMode = "continue" | "polish" | "inspire" | "ask";
+export interface TrashResult {
+  trashedPath: string;
+}
 
-export type ExportFormat = "txt" | "md" | "epub" | "docx";
+export interface VariablePreview {
+  resolved: string;
+  missing: string[];
+}
+
+export interface WorkspaceChangedEvent {
+  reason: string;
+  requestCount: number;
+  collectionCount: number;
+  digest: string;
+}
+
+export interface WorkspaceOpenedEvent {
+  path: string;
+  name: string;
+}

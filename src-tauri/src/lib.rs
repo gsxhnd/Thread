@@ -1,27 +1,25 @@
 //! Tauri application entry point and command registry.
+//!
+//! Thread / 灰线 —— local-first API 调试工具的 Rust 侧：
+//! 工作区文件（集合/请求/环境）是真相，本地 SQLite 只存历史等运行数据。
 
 mod atomic_file;
 mod commands;
-mod config;
-mod connections_window;
-mod db;
-mod desktop_menu;
-mod editor_window;
-mod error;
-#[cfg(target_os = "macos")]
-mod macos_menu;
-mod models;
-mod runtime;
-mod services;
-mod settings_window;
 mod sync_mutex;
-mod themes;
+
+// Public so integration tests (`tests/`) can exercise the service layer directly.
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod services;
+pub mod workspace;
 
 use std::sync::Arc;
 
 use config::ThreadConfigStore;
-use db::{db_path, DbState};
-use services::AiState;
+use db::{DbState, db_path};
+use services::http::HttpTaskRegistry;
+use workspace::WorkspaceState;
 
 /// Applies the translucent vibrancy material to a macOS window.
 #[cfg(target_os = "macos")]
@@ -49,24 +47,27 @@ fn init_tracing() {
         .try_init();
 }
 
-#[cfg(target_os = "macos")]
-fn configure_macos_window(app: &tauri::App) {
+/// Re-opens the workspace that was active when the app last exited.
+fn reopen_last_workspace(app: &tauri::AppHandle) {
     use tauri::Manager;
 
-    if let Some(window) = app.get_webview_window("main") {
-        apply_macos_window_effects(&window);
+    let store = app.state::<Arc<ThreadConfigStore>>();
+    let workspace = app.state::<Arc<WorkspaceState>>();
+    let Some(path) = store.session().last_workspace_path else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if !path.is_dir() {
+        return;
     }
-}
-
-#[tauri::command]
-fn apply_macos_window_chrome(app: tauri::AppHandle, label: String) -> Result<(), String> {
-    use tauri::Manager;
-
-    let window = app
-        .get_webview_window(&label)
-        .ok_or_else(|| format!("window not found: {label}"))?;
-    apply_macos_window_effects(&window);
-    Ok(())
+    match workspace.open(&path) {
+        Ok(snapshot) => tracing::info!(
+            workspace = %path.display(),
+            requests = snapshot.index.request_count,
+            "reopened last workspace"
+        ),
+        Err(error) => tracing::warn!(?error, "failed to reopen last workspace"),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -74,133 +75,84 @@ pub fn run() {
     init_tracing();
 
     let config_store = Arc::new(ThreadConfigStore::new());
-    let db = Arc::new(
-        DbState::open(db_path()).unwrap_or_else(|e| {
-            panic!("failed to open database at {:?}: {e}", db_path());
-        }),
-    );
-    let ai_state = Arc::new(AiState::new());
+    let db = Arc::new(DbState::open(db_path()).unwrap_or_else(|error| {
+        panic!("failed to open database at {:?}: {error}", db_path());
+    }));
+    let workspace = Arc::new(WorkspaceState::new());
+    let http_tasks = Arc::new(HttpTaskRegistry::new());
 
-    let mut builder = tauri::Builder::default()
+    tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(config_store)
+        .manage(config_store.clone())
         .manage(db)
-        .manage(ai_state)
-        .setup(|app| {
+        .manage(workspace.clone())
+        .manage(http_tasks)
+        .setup(move |app| {
             #[cfg(target_os = "macos")]
-            configure_macos_window(app);
+            if let Some(window) = {
+                use tauri::Manager;
+                app.get_webview_window("main")
+            } {
+                apply_macos_window_effects(&window);
+            }
 
+            workspace::watcher::spawn(app.handle().clone(), workspace.clone());
+            reopen_last_workspace(app.handle());
             Ok(())
-        });
-
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder
-            .enable_macos_default_menu(false)
-            .menu(|app| macos_menu::build_app_menu(app))
-            .on_menu_event(|app, event| {
-                macos_menu::handle_menu_event(app, event);
-            });
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        builder = builder
-            .menu(|app| desktop_menu::build_app_menu(app))
-            .on_menu_event(|app, event| {
-                desktop_menu::handle_menu_event(app, event);
-            });
-    }
-
-    builder
+        })
         .invoke_handler(tauri::generate_handler![
-            config::get_config_dir,
-            config::get_config_file_path,
+            // App
+            commands::app_paths,
             config::get_config_load_warnings,
             config::load_config_sections,
-            config::get_config_section,
             config::set_config_section,
-            config::remove_config_section,
-            themes::get_themes_dir,
-            themes::list_color_themes_command,
-            themes::read_color_theme_css_command,
-            apply_macos_window_chrome,
-            settings_window::open_settings_window,
-            connections_window::open_connections_window,
-            editor_window::open_editor_window,
-            // Project
-            commands::project_create,
-            commands::project_update,
-            commands::project_delete,
-            commands::project_list,
-            commands::project_get,
-            // Volume / Chapter
-            commands::volume_create,
-            commands::volume_update,
-            commands::volume_delete,
-            commands::volume_reorder,
-            commands::chapter_create,
-            commands::chapter_get,
-            commands::chapter_save,
-            commands::chapter_update_status,
-            commands::chapter_delete,
-            commands::chapter_reorder,
-            commands::chapter_tree,
-            // Plotline
-            commands::plotline_create,
-            commands::plotline_update,
-            commands::plotline_delete,
-            commands::plotline_attach,
-            commands::plotline_detach,
-            commands::outline_list,
-            // Character
-            commands::character_create,
-            commands::character_update,
-            commands::character_delete,
-            commands::character_list,
-            commands::relation_create,
-            commands::relation_delete,
-            commands::relation_graph,
-            // Worldbuilding
-            commands::location_create,
-            commands::location_update,
-            commands::location_delete,
-            commands::faction_create,
-            commands::faction_update,
-            commands::faction_delete,
-            commands::item_create,
-            commands::item_update,
-            commands::item_delete,
-            commands::worldbuilding_list,
-            // Timeline
-            commands::event_create,
-            commands::event_update,
-            commands::event_delete,
-            commands::event_reorder,
-            commands::event_link,
-            commands::event_unlink,
-            commands::timeline_list,
-            // Foreshadowing
-            commands::foreshadowing_create,
-            commands::foreshadowing_update,
-            commands::foreshadowing_delete,
-            commands::foreshadowing_link,
-            commands::foreshadowing_list,
-            commands::foreshadowing_unresolved,
-            // Stats
-            commands::stats_overview,
-            commands::stats_calendar,
-            commands::stats_streak,
-            commands::goal_set,
-            commands::goal_get,
-            // AI
-            commands::ai_config_set,
-            commands::ai_config_get,
-            commands::ai_complete,
-            commands::ai_cancel,
-            // Export
-            commands::export_run,
+            config::app_settings_get,
+            config::app_settings_set,
+            config::session_get,
+            config::session_forget_workspace,
+            // Workspace
+            commands::workspace::workspace_create,
+            commands::workspace::workspace_init,
+            commands::workspace::workspace_open,
+            commands::workspace::workspace_current,
+            commands::workspace::workspace_close,
+            commands::workspace::workspace_refresh,
+            commands::workspace::workspace_update_settings,
+            commands::workspace::workspace_search,
+            // Collection
+            commands::collection::collection_create,
+            commands::collection::collection_get,
+            commands::collection::collection_update,
+            commands::collection::collection_delete,
+            // Request
+            commands::request::request_create,
+            commands::request::request_get,
+            commands::request::request_update,
+            commands::request::request_update_config,
+            commands::request::request_delete,
+            commands::request::request_duplicate,
+            // Environment
+            commands::environment::environment_list,
+            commands::environment::environment_get,
+            commands::environment::environment_create,
+            commands::environment::environment_update,
+            commands::environment::environment_delete,
+            commands::environment::environment_activate,
+            commands::environment::env_variable_set,
+            commands::environment::env_variable_delete,
+            commands::environment::env_variable_reveal,
+            commands::environment::variables_preview,
+            // HTTP
+            commands::http::http_send,
+            commands::http::http_cancel,
+            commands::http::http_active_tasks,
+            // History
+            commands::history::history_list,
+            commands::history::history_get,
+            commands::history::history_delete,
+            commands::history::history_clear,
+            commands::history::history_save_to_collection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

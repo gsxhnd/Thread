@@ -1,12 +1,10 @@
 //! Unified on-disk configuration store backed by `config.toml`.
 //!
-//! 应用的统一配置中心。前端各类 UI 状态以 section 为单位保存在
-//! `~/.config/thread/config.toml`。每个 section 以不透明的 `serde_json::Value`
-//! 存储，因此无需在 Rust 侧重复定义前端的状态结构。这是一个可复用的通用
-//! 配置骨架：新增业务 section 时，只需在 `ConfigFile` 与相关辅助函数中扩展即可。
-
-use crate::atomic_file::{atomic_write, backup_corrupt_file};
-use crate::sync_mutex::lock_or_recover;
+//! 应用级配置（与工作区无关）：HTTP 默认设置、UI 布局、最近打开的工作区。
+//! 集合/请求/环境属于工作区文件，不在这里（见 workspace 模块）。
+//!
+//! 配置文件位于 `~/.config/thread/config.toml`；每个 section 以不透明的
+//! `serde_json::Value` 保存，新增 section 时只需扩展 `ConfigFile` 与映射函数。
 
 use std::collections::HashMap;
 use std::fs;
@@ -17,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, State};
 
+use crate::atomic_file::{atomic_write, backup_corrupt_file};
+use crate::db::now_ms;
+use crate::sync_mutex::lock_or_recover;
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 const CONFIG_VERSION: u32 = 1;
 const APP_DIR_NAME: &str = "thread";
@@ -24,13 +26,75 @@ const CONFIG_CHANGED_EVENT: &str = "thread:config-changed";
 
 pub const SECTION_APP_SETTINGS: &str = "app_settings";
 pub const SECTION_UI_LAYOUT: &str = "ui_layout";
+pub const SECTION_SESSION: &str = "session";
 
 const UI_SECTIONS: [&str; 2] = [SECTION_APP_SETTINGS, SECTION_UI_LAYOUT];
 
+/// HTTP defaults used when a request/collection does not override them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppSettings {
+    #[serde(default = "default_timeout_ms")]
+    pub default_timeout_ms: u64,
+    #[serde(default = "default_true")]
+    pub follow_redirects: bool,
+    #[serde(default = "default_true")]
+    pub verify_ssl: bool,
+    /// Responses larger than this are streamed to a file instead of being inlined.
+    #[serde(default = "default_max_inline_body_bytes")]
+    pub max_inline_body_bytes: u64,
+    /// 0 disables automatic history trimming.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: i64,
+    #[serde(default = "default_history_body_storage")]
+    pub history_body_storage: String,
+}
+
+fn default_timeout_ms() -> u64 {
+    30_000
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_inline_body_bytes() -> u64 {
+    1024 * 1024
+}
+fn default_history_limit() -> i64 {
+    1000
+}
+fn default_history_body_storage() -> String {
+    "inline".to_string()
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: default_timeout_ms(),
+            follow_redirects: default_true(),
+            verify_ssl: default_true(),
+            max_inline_body_bytes: default_max_inline_body_bytes(),
+            history_limit: default_history_limit(),
+            history_body_storage: default_history_body_storage(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentWorkspace {
+    pub path: String,
+    pub name: String,
+    pub last_opened_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionData {
+    pub last_workspace_path: Option<String>,
+    pub recent_workspaces: Vec<RecentWorkspace>,
+}
+
 /// Typed representation of the whole `config.toml` file.
-///
-/// `config.toml` 文件的强类型映射。各 UI 区段以不透明的 `serde_json::Value`
-/// 存储；缺省字段在序列化时被跳过，使配置文件保持精简。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigFile {
@@ -40,13 +104,14 @@ pub struct ConfigFile {
     pub app_settings: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_layout: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Value>,
 }
 
 fn default_config_version() -> u32 {
     CONFIG_VERSION
 }
 
-/// Returns the platform config directory with a `thread` subfolder.
 pub fn config_dir() -> PathBuf {
     let dir = dirs::config_dir()
         .or_else(dirs::data_dir)
@@ -61,10 +126,6 @@ pub fn config_file_path() -> PathBuf {
 }
 
 /// Thread-safe, in-memory cache of the config file with write-through saves.
-///
-/// 配置文件的线程安全内存缓存。整个配置在内存中由 `Mutex` 保护，任何写操作
-/// 都会立即回写磁盘（write-through）；作为 Tauri 的全局 state 在多个命令与
-/// 窗口间共享。
 pub struct ThreadConfigStore {
     path: PathBuf,
     config: Mutex<ConfigFile>,
@@ -98,23 +159,81 @@ impl ThreadConfigStore {
         save_config(&self.path, &config)
     }
 
-    pub fn remove_section(&self, section: &str) -> Result<(), String> {
-        let mut config = lock_or_recover(&self.config);
-        set_section_value(&mut config, section, None)?;
-        save_config(&self.path, &config)
-    }
-
     pub fn load_ui_sections(&self) -> HashMap<String, String> {
         let config = lock_or_recover(&self.config);
         let mut sections = HashMap::new();
         for section in UI_SECTIONS {
-            if let Some(value) = section_value(&config, section) {
-                if let Ok(serialized) = serde_json::to_string(value) {
-                    sections.insert(section.to_string(), serialized);
-                }
+            if let Some(value) = section_value(&config, section)
+                && let Ok(serialized) = serde_json::to_string(value)
+            {
+                sections.insert(section.to_string(), serialized);
             }
         }
         sections
+    }
+
+    pub fn app_settings(&self) -> AppSettings {
+        let config = lock_or_recover(&self.config);
+        config
+            .app_settings
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<AppSettings>(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn set_app_settings(&self, settings: &AppSettings) -> Result<(), String> {
+        let value = serde_json::to_value(settings).map_err(|error| error.to_string())?;
+        let mut config = lock_or_recover(&self.config);
+        set_section_value(&mut config, SECTION_APP_SETTINGS, Some(value))?;
+        save_config(&self.path, &config)
+    }
+
+    pub fn session(&self) -> SessionData {
+        let config = lock_or_recover(&self.config);
+        config
+            .session
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<SessionData>(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    fn set_session(&self, session: &SessionData) -> Result<(), String> {
+        let value = serde_json::to_value(session).map_err(|error| error.to_string())?;
+        let mut config = lock_or_recover(&self.config);
+        set_section_value(&mut config, SECTION_SESSION, Some(value))?;
+        save_config(&self.path, &config)
+    }
+
+    /// Records a successful workspace open in the recent list (deduplicated, newest first).
+    pub fn touch_recent_workspace(&self, path: &str, name: &str) -> Result<(), String> {
+        let mut session = self.session();
+        session.last_workspace_path = Some(path.to_string());
+        session.recent_workspaces.retain(|item| item.path != path);
+        session.recent_workspaces.insert(
+            0,
+            RecentWorkspace {
+                path: path.to_string(),
+                name: name.to_string(),
+                last_opened_at: now_ms(),
+            },
+        );
+        session.recent_workspaces.truncate(10);
+        self.set_session(&session)
+    }
+
+    pub fn forget_recent_workspace(&self, path: &str) -> Result<(), String> {
+        let mut session = self.session();
+        session.recent_workspaces.retain(|item| item.path != path);
+        if session.last_workspace_path.as_deref() == Some(path) {
+            session.last_workspace_path = None;
+        }
+        self.set_session(&session)
+    }
+}
+
+impl Default for ThreadConfigStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -122,6 +241,7 @@ fn section_value<'a>(config: &'a ConfigFile, section: &str) -> Option<&'a Value>
     match section {
         SECTION_APP_SETTINGS => config.app_settings.as_ref(),
         SECTION_UI_LAYOUT => config.ui_layout.as_ref(),
+        SECTION_SESSION => config.session.as_ref(),
         _ => None,
     }
 }
@@ -134,6 +254,7 @@ fn set_section_value(
     match section {
         SECTION_APP_SETTINGS => config.app_settings = value,
         SECTION_UI_LAYOUT => config.ui_layout = value,
+        SECTION_SESSION => config.session = value,
         _ => {
             return Err(format!("unknown config section: {section}"));
         }
@@ -186,51 +307,116 @@ pub fn get_config_load_warnings(store: State<'_, Arc<ThreadConfigStore>>) -> Vec
 }
 
 #[tauri::command]
-pub fn get_config_dir() -> String {
-    config_dir().to_string_lossy().into_owned()
-}
-
-#[tauri::command]
-pub fn get_config_file_path() -> String {
-    config_file_path().to_string_lossy().into_owned()
-}
-
-#[tauri::command]
 pub fn load_config_sections(store: State<'_, Arc<ThreadConfigStore>>) -> HashMap<String, String> {
     store.load_ui_sections()
 }
 
-#[tauri::command]
-pub fn get_config_section(
-    store: State<'_, Arc<ThreadConfigStore>>,
-    section: String,
-) -> Option<String> {
-    store.get_section(&section)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionPayload {
+    pub section: String,
+    pub value: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForgetWorkspacePayload {
+    pub path: String,
 }
 
 #[tauri::command]
 pub fn set_config_section(
     app: AppHandle,
     store: State<'_, Arc<ThreadConfigStore>>,
-    section: String,
-    value: String,
+    payload: SectionPayload,
 ) -> Result<(), String> {
-    store.set_section(&section, &value)?;
-    if let Err(error) = app.emit(CONFIG_CHANGED_EVENT, section) {
+    store.set_section(&payload.section, &payload.value)?;
+    if let Err(error) = app.emit(CONFIG_CHANGED_EVENT, payload.section) {
         tracing::warn!(?error, "failed to emit {CONFIG_CHANGED_EVENT}");
     }
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_config_section(
-    app: AppHandle,
+pub fn app_settings_get(store: State<'_, Arc<ThreadConfigStore>>) -> AppSettings {
+    store.app_settings()
+}
+
+#[tauri::command]
+pub fn app_settings_set(
     store: State<'_, Arc<ThreadConfigStore>>,
-    section: String,
-) -> Result<(), String> {
-    store.remove_section(&section)?;
-    if let Err(error) = app.emit(CONFIG_CHANGED_EVENT, section) {
-        tracing::warn!(?error, "failed to emit {CONFIG_CHANGED_EVENT}");
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    store.set_app_settings(&settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn session_get(store: State<'_, Arc<ThreadConfigStore>>) -> SessionData {
+    store.session()
+}
+
+#[tauri::command]
+pub fn session_forget_workspace(
+    store: State<'_, Arc<ThreadConfigStore>>,
+    payload: ForgetWorkspacePayload,
+) -> Result<SessionData, String> {
+    store.forget_recent_workspace(&payload.path)?;
+    Ok(store.session())
+}
+
+pub fn app_data_paths() -> crate::commands::AppPaths {
+    crate::commands::AppPaths {
+        config_dir: config_dir().to_string_lossy().into_owned(),
+        config_file: config_file_path().to_string_lossy().into_owned(),
+        data_dir: crate::db::data_dir().to_string_lossy().into_owned(),
+        db_file: crate::db::db_path().to_string_lossy().into_owned(),
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_defaults_are_stable() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.default_timeout_ms, 30_000);
+        assert!(settings.follow_redirects);
+        assert!(settings.verify_ssl);
+        assert_eq!(settings.max_inline_body_bytes, 1_048_576);
+    }
+
+    #[test]
+    fn partial_app_settings_json_uses_defaults() {
+        let settings: AppSettings = serde_json::from_str(r#"{"defaultTimeoutMs": 5000}"#).unwrap();
+        assert_eq!(settings.default_timeout_ms, 5000);
+        assert!(settings.verify_ssl);
+    }
+
+    #[test]
+    fn recent_workspaces_are_deduplicated_and_capped() {
+        let store = ThreadConfigStore {
+            path: std::env::temp_dir().join(format!("thread-cfg-{}.toml", std::process::id())),
+            config: Mutex::new(ConfigFile::default()),
+            load_warnings: Mutex::new(Vec::new()),
+        };
+        for index in 0..12 {
+            store
+                .touch_recent_workspace(&format!("/tmp/ws-{index}"), &format!("ws-{index}"))
+                .unwrap();
+        }
+        store.touch_recent_workspace("/tmp/ws-5", "ws-5").unwrap();
+        let session = store.session();
+        assert_eq!(session.recent_workspaces.len(), 10);
+        assert_eq!(session.recent_workspaces[0].path, "/tmp/ws-5");
+        assert_eq!(
+            session
+                .recent_workspaces
+                .iter()
+                .filter(|item| item.path == "/tmp/ws-5")
+                .count(),
+            1
+        );
+    }
 }

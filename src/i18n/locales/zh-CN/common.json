@@ -1,38 +1,8 @@
 {
-  "app": {
-    "name": "Thread",
-    "tagline": "草蛇灰线，伏脉千里"
-  },
-  "actions": {
-    "settings": "设置",
-    "close": "关闭",
-    "save": "保存",
-    "cancel": "取消",
-    "confirm": "确定"
-  },
-  "theme": {
-    "light": "浅色",
-    "dark": "深色",
-    "system": "跟随系统"
-  },
-  "window": {
-    "minimize": "最小化",
-    "maximize": "最大化",
-    "restore": "还原",
-    "close": "关闭"
-  },
   "errorBoundary": {
     "title": "应用出现错误",
     "description": "界面渲染时发生意外错误，你可以重试或重新加载应用。",
     "retry": "重试",
     "reload": "重新加载"
-  },
-  "bootstrapFailed": {
-    "title": "启动失败",
-    "description": "应用配置加载失败，无法启动。"
-  },
-  "configRecovered": {
-    "title": "配置已恢复默认",
-    "description": "检测到配置文件损坏，已备份原文件并使用默认设置。"
   }
 }

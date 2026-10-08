@@ -1,16 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ThemeProvider as NextThemesProvider } from "next-themes";
 import { useEffect, type ReactNode } from "react";
-import { I18nextProvider } from "react-i18next";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
-import i18n from "@/i18n";
 import { getPlatform, isTauri } from "@/lib/platform";
+import { ensureVariableCompletion } from "@/lib/editor/monaco";
+import { collectVariableSuggestions } from "@/lib/variables";
+import { useAppStore } from "@/stores/app-store";
+import { useUiStore } from "@/stores/ui-store";
 
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      staleTime: 30_000,
+      staleTime: 5_000,
       retry: 1,
       refetchOnWindowFocus: false,
     },
@@ -25,9 +27,6 @@ function applyWindowChrome() {
   } else {
     delete document.documentElement.dataset.windowChrome;
   }
-  document.querySelectorAll<HTMLElement>("[data-app-shell]").forEach((el) => {
-    el.dataset.platform = platform;
-  });
 }
 
 type AppProvidersProps = {
@@ -37,27 +36,27 @@ type AppProvidersProps = {
 export function AppProviders({ children }: AppProvidersProps) {
   useEffect(() => {
     applyWindowChrome();
-    const observer = new MutationObserver(() => applyWindowChrome());
-    observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
+    void useUiStore.getState().hydrate();
+    // Rust 侧启动时会尝试恢复上次的工作区，这里把状态同步到前端。
+    void useAppStore.getState().bootstrap();
+    // Monaco Body 编辑器中的 {{变量}} 补全。
+    ensureVariableCompletion(() => collectVariableSuggestions(useAppStore.getState().snapshot));
   }, []);
 
   return (
-    <I18nextProvider i18n={i18n}>
-      <QueryClientProvider client={queryClient}>
-        <NextThemesProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <TooltipProvider delay={300}>
-            {children}
-            <Toaster position="bottom-right" />
-          </TooltipProvider>
-        </NextThemesProvider>
-      </QueryClientProvider>
-    </I18nextProvider>
+    <QueryClientProvider client={queryClient}>
+      <NextThemesProvider
+        attribute="class"
+        defaultTheme="system"
+        enableSystem
+        disableTransitionOnChange
+      >
+        <TooltipProvider delay={300}>
+          {children}
+          <Toaster position="bottom-right" />
+        </TooltipProvider>
+      </NextThemesProvider>
+    </QueryClientProvider>
   );
 }
 
