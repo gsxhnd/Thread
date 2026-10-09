@@ -29,7 +29,7 @@ import {
   requestGet,
   requestUpdate,
 } from "@/lib/api";
-import type { CollectionNode, RequestNode } from "@/lib/api";
+import type { CollectionNode, Protocol, RequestNode } from "@/lib/api";
 import { methodColor } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
@@ -399,7 +399,7 @@ function TreeDialogs({
   onClose: () => void;
 }) {
   const refresh = useAppStore((state) => state.refresh);
-  const [protocol, setProtocol] = useState<"http">("http");
+  const [protocol, setProtocol] = useState<Protocol>("http");
 
   if (!action) return null;
 
@@ -492,13 +492,18 @@ function TreeDialogs({
       onConfirm={handleConfirm}
       extra={
         action.kind === "new-request" ? (
-          <label className="block space-y-1.5">
+          <label className="flex flex-col gap-1.5">
             <span className="text-xs font-medium text-muted-foreground">协议</span>
             <SelectField
               className="w-full"
               value={protocol}
-              onValueChange={() => setProtocol("http")}
-              options={[{ value: "http", label: "HTTP（阶段 1）" }]}
+              onValueChange={(value) => setProtocol(value as Protocol)}
+              options={[
+                { value: "http", label: "HTTP" },
+                { value: "graphql", label: "GraphQL" },
+                { value: "websocket", label: "WebSocket" },
+                { value: "grpc", label: "gRPC" },
+              ]}
             />
           </label>
         ) : null

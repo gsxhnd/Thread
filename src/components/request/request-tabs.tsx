@@ -1,4 +1,4 @@
-import { SendIcon, XIcon, Loader2Icon, SaveIcon } from "lucide-react";
+import { SendIcon, XIcon, Loader2Icon } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { SelectField } from "@/components/ui/select-field";
@@ -15,10 +15,15 @@ import { useResponseStore } from "@/stores/response-store";
 import { useTabsStore, type RequestTab } from "@/stores/tabs-store";
 import { patchDocument } from "@/lib/request-config";
 import { VariableInput } from "./variable-input";
-import { useSaveRequest } from "./use-save-request";
 import { useSendRequest } from "./use-send-request";
+import { GraphqlActionBar, GrpcActionBar, SaveRequestButton, WebsocketActionBar } from "./protocol-bar";
 
-/** 请求标签页条。 */
+function protocolBadge(protocol: string) {
+  if (protocol === "graphql") return "GQL";
+  if (protocol === "websocket") return "WS";
+  if (protocol === "grpc") return "gRPC";
+  return protocol;
+}
 export function RequestTabs() {
   const tabs = useTabsStore((state) => state.tabs);
   const activeKey = useTabsStore((state) => state.activeKey);
@@ -55,7 +60,7 @@ export function RequestTabs() {
                   methodColor(tab.document.method),
                 )}
               >
-                {tab.protocol === "http" ? (tab.document.method ?? "GET") : tab.protocol}
+                {tab.protocol === "http" ? (tab.document.method ?? "GET") : protocolBadge(tab.protocol)}
               </span>
               <span className="truncate">{tab.name}</span>
               {tab.dirty ? (
@@ -87,20 +92,22 @@ export function RequestTabs() {
   );
 }
 
-/** 激活标签页的 URL 操作栏（方法 / URL / 发送 / 保存）。 */
+/** 激活标签页的操作栏。HTTP 保留方法/URL；其他协议各自连接或发送。 */
 export function RequestActionBar({ tab }: { tab: RequestTab }) {
+  if (tab.protocol === "graphql") return <GraphqlActionBar tab={tab} />;
+  if (tab.protocol === "websocket") return <WebsocketActionBar tab={tab} />;
+  if (tab.protocol === "grpc") return <GrpcActionBar tab={tab} />;
+  return <HttpActionBar tab={tab} />;
+}
+
+function HttpActionBar({ tab }: { tab: RequestTab }) {
   const { send, cancel } = useSendRequest();
-  const save = useSaveRequest();
   const responseState = useResponseStore((state) => state.byTab[tab.key]);
   const sending = responseState?.status === "loading";
   const document = tab.document;
 
   const update = (patch: Parameters<typeof patchDocument>[1]) => {
     useTabsStore.getState().updateDocument(tab.key, patchDocument(document, patch));
-  };
-
-  const handleSave = async () => {
-    await save(tab.key);
   };
 
   const handleSend = async () => {
@@ -158,15 +165,7 @@ export function RequestActionBar({ tab }: { tab: RequestTab }) {
         {sending ? "取消" : "发送"}
       </Button>
 
-      <Button
-        variant="outline"
-        onClick={() => void handleSave()}
-        disabled={!tab.dirty}
-        title="保存到工作区文件（Ctrl/Cmd+S）"
-      >
-        <SaveIcon data-icon="inline-start" />
-        保存
-      </Button>
+      <SaveRequestButton tab={tab} />
     </div>
   );
 }

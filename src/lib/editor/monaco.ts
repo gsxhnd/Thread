@@ -55,6 +55,20 @@ export function ensureMonacoThemes() {
       "editorGutter.background": "#00000000",
     },
   });
+  monaco.languages.register({ id: "graphql" });
+  monaco.languages.setMonarchTokensProvider("graphql", {
+    tokenizer: {
+      root: [
+        [/#.*$/, "comment"],
+        [/"([^"\\]|\\.)*"/, "string"],
+        [/\b(query|mutation|subscription|fragment|on|true|false|null)\b/, "keyword"],
+        [/\$[A-Za-z_]\w*/, "variable"],
+        [/[{}()[\]:!@]/, "delimiter"],
+        [/\d+/, "number"],
+        [/[A-Za-z_]\w*/, "identifier"],
+      ],
+    },
+  });
 }
 
 export function currentMonacoTheme(): string {

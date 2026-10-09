@@ -5,10 +5,14 @@
 //! 与 `services::*`。
 
 pub mod collection;
+pub mod context;
 pub mod environment;
+pub mod graphql;
+pub mod grpc;
 pub mod history;
 pub mod http;
 pub mod request;
+pub mod websocket;
 pub mod workspace;
 
 use serde::Serialize;

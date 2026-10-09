@@ -6,6 +6,7 @@ import { BrandMark } from "@/components/brand-mark";
 import { Button } from "@/components/ui/button";
 import { WindowTitleBar } from "@/components/window-title-bar";
 import { onWorkspaceChanged } from "@/lib/api";
+import { startProtocolSessions } from "@/lib/protocol-session";
 import { useAppStore } from "@/stores/app-store";
 import { useTabsStore } from "@/stores/tabs-store";
 import { useUiStore } from "@/stores/ui-store";
@@ -24,6 +25,8 @@ export function WorkspacePage() {
   const view = useUiStore((state) => state.view);
   const navigate = useNavigate();
   const warnings = snapshot?.index.warnings ?? [];
+
+  useEffect(() => startProtocolSessions(), []);
 
   // 外部修改 / Git 切换分支：后端轮询到变化后推送事件，这里重新拉取索引。
   useEffect(

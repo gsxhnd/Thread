@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import type { RequestDocument } from "@/lib/api";
+import { createProtocolDocument } from "@/lib/request-config";
+import { useSessionStore } from "@/stores/session-store";
 
 export interface RequestTab {
   /** 稳定 key：已保存请求用相对路径，未保存草稿用 `draft:<uuid>`。 */
@@ -70,18 +72,7 @@ export const useTabsStore = create<TabsState>((set, get) => ({
 
   openDraft: ({ collectionPath, name, protocol = "http" }) => {
     const key = `draft:${crypto.randomUUID()}`;
-    const document: RequestDocument = {
-      version: 1,
-      protocol,
-      name,
-      method: "GET",
-      url: "",
-      queryParams: [],
-      headers: [],
-      body: { type: "none", content: "" },
-      auth: { type: "inherit" },
-      settings: {},
-    };
+    const document = createProtocolDocument(name, protocol);
     const tab: RequestTab = {
       key,
       path: null,
@@ -143,7 +134,8 @@ export const useTabsStore = create<TabsState>((set, get) => ({
       ),
     })),
 
-  markSaved: (key, path, name) =>
+  markSaved: (key, path, name) => {
+    useSessionStore.getState().rekey(key, path);
     set((state) => {
       const tabs = state.tabs.map((tab) =>
         tab.key === key
@@ -159,7 +151,8 @@ export const useTabsStore = create<TabsState>((set, get) => ({
       );
       const activeKey = state.activeKey === key ? path : state.activeKey;
       return { tabs, activeKey };
-    }),
+    });
+  },
 
   renameTab: (key, name) =>
     set((state) => ({

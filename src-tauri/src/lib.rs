@@ -18,7 +18,10 @@ use std::sync::Arc;
 
 use config::ThreadConfigStore;
 use db::{DbState, db_path};
+use services::graphql::SubscriptionRegistry;
+use services::grpc::ProtoCatalog;
 use services::http::HttpTaskRegistry;
+use services::websocket::WsRegistry;
 use workspace::WorkspaceState;
 
 /// Applies the translucent vibrancy material to a macOS window.
@@ -37,6 +40,11 @@ pub(crate) fn apply_macos_window_effects(window: &tauri::WebviewWindow) {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn apply_macos_window_effects(_window: &tauri::WebviewWindow) {}
+
+fn install_crypto_provider() {
+    // hyper、tonic 与 tungstenite 共用这一份 rustls。重复安装会失败，忽略即可。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
 
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -72,6 +80,7 @@ fn reopen_last_workspace(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_crypto_provider();
     init_tracing();
 
     let config_store = Arc::new(ThreadConfigStore::new());
@@ -80,6 +89,9 @@ pub fn run() {
     }));
     let workspace = Arc::new(WorkspaceState::new());
     let http_tasks = Arc::new(HttpTaskRegistry::new());
+    let websockets = Arc::new(WsRegistry::new());
+    let graphql_subscriptions = Arc::new(SubscriptionRegistry::new());
+    let proto_catalog = Arc::new(ProtoCatalog::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -88,6 +100,9 @@ pub fn run() {
         .manage(db)
         .manage(workspace.clone())
         .manage(http_tasks)
+        .manage(websockets)
+        .manage(graphql_subscriptions)
+        .manage(proto_catalog)
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             if let Some(window) = {
@@ -147,6 +162,24 @@ pub fn run() {
             commands::http::http_send,
             commands::http::http_cancel,
             commands::http::http_active_tasks,
+            // GraphQL
+            commands::graphql::graphql_send,
+            commands::graphql::graphql_introspect,
+            commands::graphql::graphql_subscribe,
+            commands::graphql::graphql_unsubscribe,
+            // WebSocket
+            commands::websocket::ws_connect,
+            commands::websocket::ws_send,
+            commands::websocket::ws_disconnect,
+            commands::websocket::ws_list_connections,
+            // gRPC
+            commands::grpc::grpc_load_proto,
+            commands::grpc::grpc_reflect,
+            commands::grpc::grpc_invoke,
+            commands::grpc::grpc_open_stream,
+            commands::grpc::grpc_stream_send,
+            commands::grpc::grpc_stream_close,
+            commands::grpc::grpc_cancel_stream,
             // History
             commands::history::history_list,
             commands::history::history_get,

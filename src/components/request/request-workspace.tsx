@@ -2,19 +2,25 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FilePlus2Icon, FolderPlusIcon, SendIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { collectionCreate, requestCreate, requestGet } from "@/lib/api";
+import { collectionCreate, requestCreate, requestGet, type ProtoServiceInfo, type RequestDetail } from "@/lib/api";
 import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { useAppStore } from "@/stores/app-store";
-import { useTabsStore } from "@/stores/tabs-store";
+import { useTabsStore, type RequestTab } from "@/stores/tabs-store";
 import { useUiStore } from "@/stores/ui-store";
 import { ResponsePanel } from "@/components/response/response-panel";
 import { RequestEditor } from "./request-editor";
+import { GraphqlEditor } from "./graphql-editor";
+import { WebsocketEditor } from "./websocket-editor";
+import { GrpcEditor } from "./grpc-editor";
+import { SessionLog } from "./session-log";
 import { RequestActionBar, RequestTabs } from "./request-tabs";
 import { useSaveRequest } from "./use-save-request";
+import { docString, findProtoMethod, graphqlOperation } from "@/lib/protocol";
+import { useSessionStore } from "@/stores/session-store";
 
 /** 主工作区：请求标签页 + 编辑面板 + 响应面板。 */
 export function RequestWorkspace() {
@@ -23,6 +29,9 @@ export function RequestWorkspace() {
   const [editorTab, setEditorTab] = useState("params");
   const save = useSaveRequest();
   const activeTab = tabs.find((tab) => tab.key === activeKey) ?? null;
+  const liveServices = useSessionStore((state) =>
+    activeKey ? state.byTab[activeKey]?.services : undefined,
+  );
 
   const { data: detail } = useQuery({
     queryKey: ["request-detail", activeTab?.path],
@@ -54,20 +63,64 @@ export function RequestWorkspace() {
       <RequestActionBar tab={activeTab} />
       <ResizablePanelGroup orientation="vertical" className="min-h-0 flex-1">
         <ResizablePanel defaultSize={55} minSize={20}>
-          <RequestEditor
+          <ProtocolEditor
             tab={activeTab}
             detail={detail ?? null}
-            activeTab={editorTab}
-            onActiveTabChange={setEditorTab}
+            editorTab={editorTab}
+            onEditorTabChange={setEditorTab}
           />
         </ResizablePanel>
         <ResizableHandle className="h-1.5 bg-border transition-colors hover:bg-primary/40" />
         <ResizablePanel defaultSize={45} minSize={15}>
-          <ResponsePanel tabKey={activeTab.key} />
+          {usesLiveLog(activeTab, liveServices ?? []) ? (
+            <SessionLog key={activeTab.key} tab={activeTab} />
+          ) : (
+            <ResponsePanel tabKey={activeTab.key} />
+          )}
         </ResizablePanel>
       </ResizablePanelGroup>
     </div>
   );
+}
+
+function ProtocolEditor({
+  tab,
+  detail,
+  editorTab,
+  onEditorTabChange,
+}: {
+  tab: RequestTab;
+  detail: RequestDetail | null;
+  editorTab: string;
+  onEditorTabChange: (value: string) => void;
+}) {
+  if (tab.protocol === "graphql") return <GraphqlEditor key={tab.key} tab={tab} detail={detail} />;
+  if (tab.protocol === "websocket") return <WebsocketEditor key={tab.key} tab={tab} />;
+  if (tab.protocol === "grpc") return <GrpcEditor key={tab.key} tab={tab} />;
+  return (
+    <RequestEditor
+      tab={tab}
+      detail={detail}
+      activeTab={editorTab}
+      onActiveTabChange={onEditorTabChange}
+    />
+  );
+}
+
+function usesLiveLog(tab: RequestTab, services: ProtoServiceInfo[]) {
+  if (tab.protocol === "websocket") return true;
+  if (tab.protocol === "graphql") {
+    return graphqlOperation(docString(tab.document, "query")) === "subscription";
+  }
+  if (tab.protocol === "grpc") {
+    const method = findProtoMethod(
+      services,
+      docString(tab.document, "service"),
+      docString(tab.document, "method"),
+    );
+    return !!method && (method.clientStreaming || method.serverStreaming);
+  }
+  return false;
 }
 
 function EmptyWorkspace() {

@@ -234,6 +234,93 @@ export interface HttpResponse {
   unresolvedVariables: string[];
 }
 
+export interface GraphqlResponse {
+  statusCode: number;
+  statusText: string;
+  headers: Record<string, string[]>;
+  body: string;
+  durationMs: number;
+  unresolvedVariables: string[];
+}
+
+export interface GraphqlTypeRef {
+  kind?: string | null;
+  name?: string | null;
+  ofType?: GraphqlTypeRef | null;
+}
+
+export interface GraphqlField {
+  name: string;
+  args?: { name: string; type?: GraphqlTypeRef | null }[];
+  type?: GraphqlTypeRef | null;
+}
+
+export interface GraphqlSchema {
+  queryType?: { name?: string | null } | null;
+  mutationType?: { name?: string | null } | null;
+  subscriptionType?: { name?: string | null } | null;
+  types?: {
+    kind?: string;
+    name?: string;
+    fields?: GraphqlField[] | null;
+  }[];
+}
+
+export interface ProtoMethodInfo {
+  name: string;
+  fullName: string;
+  clientStreaming: boolean;
+  serverStreaming: boolean;
+  requestType: string;
+  responseType: string;
+  requestTemplate: string;
+}
+
+export interface ProtoServiceInfo {
+  name: string;
+  methods: ProtoMethodInfo[];
+}
+
+export interface ProtoDefinition {
+  poolId: string;
+  services: ProtoServiceInfo[];
+}
+
+export interface GrpcResult {
+  service: string;
+  method: string;
+  response: unknown;
+  durationMs: number;
+}
+
+export interface WsMessageEvent {
+  connectionId: string;
+  direction: "in" | "out" | string;
+  isBinary: boolean;
+  payload: string;
+  timestamp: number;
+}
+
+export interface WsStatusEvent {
+  connectionId: string;
+  status: string;
+  reason?: string | null;
+}
+
+export interface SubscriptionEvent {
+  subscriptionId: string;
+  event: string;
+  data?: unknown;
+}
+
+export interface GrpcStreamEvent {
+  streamId: string;
+  direction: string;
+  data?: unknown;
+  done: boolean;
+  error?: string | null;
+}
+
 export interface HistorySummary {
   id: string;
   protocol: string;

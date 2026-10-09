@@ -451,6 +451,9 @@ pub struct GraphqlRequestDoc {
     pub headers: Vec<KeyValue>,
     #[serde(default)]
     pub auth: AuthSpec,
+    /// Optional operation name when the document contains more than one operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

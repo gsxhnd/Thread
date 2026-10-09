@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import { toast } from "sonner";
-import { requestCreate, requestUpdateConfig } from "@/lib/api";
+import { requestCreate, requestUpdateConfig, type Protocol } from "@/lib/api";
 import { useAppStore } from "@/stores/app-store";
 import { useTabsStore } from "@/stores/tabs-store";
 
@@ -25,12 +25,18 @@ export function useSaveRequest() {
           const created = await requestCreate({
             collectionPath: tab.collectionPath,
             name: tab.name,
-            protocol: "http",
+            protocol: asProtocol(tab.protocol),
           });
-          await requestUpdateConfig({ path: created.path, document: tab.document });
+          await requestUpdateConfig({
+            path: created.path,
+            document: { ...tab.document, protocol: tab.protocol, name: tab.name },
+          });
           useTabsStore.getState().markSaved(tab.key, created.path, tab.name);
         } else {
-          await requestUpdateConfig({ path: tab.path, document: tab.document });
+          await requestUpdateConfig({
+            path: tab.path,
+            document: { ...tab.document, protocol: tab.protocol, name: tab.name },
+          });
           useTabsStore.getState().markSaved(tab.key, tab.path, tab.name);
         }
         await refresh();
@@ -41,4 +47,17 @@ export function useSaveRequest() {
     },
     [refresh],
   );
+}
+
+function asProtocol(value: string): Protocol {
+  if (
+    value === "http" ||
+    value === "graphql" ||
+    value === "websocket" ||
+    value === "grpc" ||
+    value === "mqtt"
+  ) {
+    return value;
+  }
+  return "http";
 }

@@ -25,7 +25,7 @@ import {
   historySaveToCollection,
   requestGet,
 } from "@/lib/api";
-import type { HistorySummary } from "@/lib/api";
+import type { HistoryDetail, HistorySummary } from "@/lib/api";
 import { formatBytes, formatDuration, formatRelativeTime, methodColor, statusSurface } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
@@ -84,7 +84,7 @@ export function HistoryView() {
           document: current.raw,
         });
         setView("request");
-        await send(current.path);
+        if (current.protocol === "http") await send(current.path);
         return;
       } catch {
         // 文件已被删除/移动，退回到快照方式。
@@ -96,16 +96,18 @@ export function HistoryView() {
       return;
     }
 
+    const protocol = typeof document.protocol === "string" ? document.protocol : "http";
     useTabsStore.getState().openDraft({
       collectionPath: selectedCollectionPath ?? "",
       name: snapshot.name ?? entry.name ?? "History Replay",
+      protocol,
     });
     const opened = useTabsStore.getState().tabs;
     const draft = opened[opened.length - 1];
     if (!draft) return;
-    useTabsStore.getState().updateDocument(draft.key, { ...document, name: draft.name });
+    useTabsStore.getState().updateDocument(draft.key, { ...document, name: draft.name, protocol });
     setView("request");
-    await send(draft.key);
+    if (protocol === "http") await send(draft.key);
   };
 
   const handleSaveToCollection = async (entry: HistorySummary) => {
@@ -272,10 +274,7 @@ export function HistoryView() {
               <div className="flex flex-col gap-1">
                 <p className="text-xs font-medium text-muted-foreground">响应</p>
                 <CodeEditor
-                  value={
-                    detail.responseBody ??
-                    JSON.stringify(detail.responseSnapshot ?? {}, null, 2)
-                  }
+                  value={historyResponseText(detail)}
                   language={detail.responseBody ? "plaintext" : "json"}
                   readOnly
                   minHeight={180}
@@ -287,4 +286,11 @@ export function HistoryView() {
       </Dialog>
     </div>
   );
+}
+
+function historyResponseText(detail: HistoryDetail) {
+  if (detail.responseBody) return detail.responseBody;
+  const body = detail.responseSnapshot?.body;
+  if (typeof body === "string") return body;
+  return JSON.stringify(detail.responseSnapshot ?? {}, null, 2);
 }

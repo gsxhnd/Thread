@@ -89,6 +89,48 @@ export function normalizeSettings(value: unknown): RequestSettings {
 }
 
 export function createDraftDocument(name: string): RequestDocument {
+  return createProtocolDocument(name, "http");
+}
+
+export function createProtocolDocument(name: string, protocol: string): RequestDocument {
+  if (protocol === "graphql") {
+    return {
+      version: 1,
+      protocol: "graphql",
+      name,
+      endpoint: "",
+      query: "query {\n  \n}\n",
+      variables: "{}",
+      headers: [],
+      auth: { type: "inherit" },
+    };
+  }
+  if (protocol === "websocket") {
+    return {
+      version: 1,
+      protocol: "websocket",
+      name,
+      url: "",
+      headers: [],
+      protocols: [],
+      autoReconnect: false,
+    };
+  }
+  if (protocol === "grpc") {
+    return {
+      version: 1,
+      protocol: "grpc",
+      name,
+      host: "",
+      service: "",
+      method: "",
+      protoSource: "file",
+      metadata: [],
+      payload: "{}",
+      tlsEnabled: false,
+      timeoutMs: 30_000,
+    };
+  }
   return {
     version: 1,
     protocol: "http",

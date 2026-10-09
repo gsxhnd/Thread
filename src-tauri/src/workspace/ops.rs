@@ -289,6 +289,7 @@ fn default_graphql(name: &str) -> super::formats::GraphqlRequestDoc {
         variables: String::new(),
         headers: Vec::new(),
         auth: AuthSpec::default(),
+        operation_name: None,
     }
 }
 

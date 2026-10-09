@@ -92,33 +92,24 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-impl From<reqwest::Error> for AppError {
-    fn from(value: reqwest::Error) -> Self {
-        if value.is_timeout() {
-            return Self::Timeout(value.to_string());
+impl AppError {
+    /// Classifies a hyper / rustls failure. Timeouts raised by `tokio::time::timeout`
+    /// are reported separately by the caller.
+    pub fn from_transport(error: &(dyn std::error::Error + 'static)) -> Self {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            let text = current.to_string().to_lowercase();
+            if text.contains("certificate")
+                || text.contains("tls")
+                || text.contains("ssl")
+                || text.contains("handshake")
+            {
+                return Self::Tls(error.to_string());
+            }
+            source = std::error::Error::source(current);
         }
-        if is_tls_error(&value) {
-            return Self::Tls(value.to_string());
-        }
-        Self::Network(value.to_string())
+        Self::Network(error.to_string())
     }
-}
-
-/// Best-effort detection of TLS/certificate failures inside a reqwest error chain.
-fn is_tls_error(error: &reqwest::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        let text = current.to_string().to_lowercase();
-        if text.contains("certificate")
-            || text.contains("tls")
-            || text.contains("ssl")
-            || text.contains("handshake")
-        {
-            return true;
-        }
-        source = current.source();
-    }
-    false
 }
 
 pub type AppResult<T> = Result<T, AppError>;

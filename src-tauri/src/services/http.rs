@@ -11,14 +11,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use reqwest::redirect::Policy;
-use reqwest::{Client, Method};
+use http::Method;
+use http::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -302,63 +300,47 @@ async fn run(
     // Preflight timing probe (best effort, never fails the request).
     let (dns_ms, tcp_ms) = probe_timings(&final_url).await;
 
-    let redirects = Arc::new(AtomicUsize::new(0));
-    let mut builder = Client::builder()
-        .timeout(Duration::from_millis(settings.timeout_ms))
-        .connect_timeout(Duration::from_millis(settings.timeout_ms.min(30_000)))
-        .danger_accept_invalid_certs(!settings.verify_ssl)
-        .user_agent(concat!("Thread/", env!("CARGO_PKG_VERSION")));
-
-    if settings.follow_redirects {
-        let counter = redirects.clone();
-        builder = builder.redirect(Policy::custom(move |attempt| {
-            if attempt.previous().len() >= MAX_REDIRECTS {
-                attempt.stop()
-            } else {
-                counter.fetch_add(1, Ordering::SeqCst);
-                attempt.follow()
-            }
-        }));
-    } else {
-        builder = builder.redirect(Policy::none());
-    }
-
-    let client = builder
-        .build()
-        .map_err(|error| AppError::Network(error.to_string()))?;
-
     let method = Method::from_bytes(config.method.to_uppercase().as_bytes())
         .map_err(|_| AppError::Validation(format!("invalid HTTP method: {}", config.method)))?;
-
-    let mut request = client.request(method, &final_url);
-    request = request.header(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
+    let mut header_map = HeaderMap::new();
+    header_map.insert(ACCEPT, HeaderValue::from_static("*/*"));
     for header in &headers {
         let name = HeaderName::from_bytes(header.key.as_bytes())
             .map_err(|_| AppError::Validation(format!("invalid header name: {}", header.key)))?;
         let value = HeaderValue::from_str(&header.value).map_err(|_| {
             AppError::Validation(format!("invalid header value for {}", header.key))
         })?;
-        request = request.header(name, value);
-    }
-    if let Some(bytes) = body_bytes {
-        request = request.body(bytes);
+        header_map.insert(name, value);
     }
 
     let send_started = Instant::now();
-    let response = request.send().await.map_err(AppError::from)?;
+    let response = super::transport::exchange(super::transport::Exchange {
+        method,
+        url: final_url,
+        headers: header_map,
+        body: body_bytes.map(Bytes::from),
+        timeout: Duration::from_millis(settings.timeout_ms),
+        verify_ssl: settings.verify_ssl,
+        max_redirects: if settings.follow_redirects {
+            MAX_REDIRECTS
+        } else {
+            0
+        },
+    })
+    .await?;
     let ttfb = send_started.elapsed();
 
-    let status = response.status();
-    let response_url = response.url().to_string();
-    let header_map: HeaderMap = response.headers().clone();
-    let headers_out = collect_headers(&header_map);
-    let content_type = header_map
-        .get(reqwest::header::CONTENT_TYPE)
+    let status = response.status;
+    let response_url = response.final_url;
+    let headers_out = collect_headers(&response.headers);
+    let content_type = response
+        .headers
+        .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
 
     let (body, body_file_path, body_size) =
-        read_body(response, settings.max_inline_body_bytes, &bodies_dir).await?;
+        read_body(response.body, settings.max_inline_body_bytes, &bodies_dir).await?;
     let total = started.elapsed();
 
     let response = HttpResponse {
@@ -379,7 +361,7 @@ async fn run(
             download_ms: round_ms((send_started.elapsed() - ttfb).as_secs_f64() * 1000.0),
             total_ms: round_ms(total.as_secs_f64() * 1000.0),
         },
-        redirect_count: redirects.load(Ordering::SeqCst),
+        redirect_count: response.redirect_count,
         unresolved_variables: missing,
     };
 
@@ -404,17 +386,16 @@ fn collect_headers(headers: &HeaderMap) -> BTreeMap<String, Vec<String>> {
 }
 
 async fn read_body(
-    response: reqwest::Response,
+    mut stream: http_body_util::BodyDataStream<hyper::body::Incoming>,
     max_inline: u64,
     bodies_dir: &Path,
 ) -> AppResult<(Option<String>, Option<String>, u64)> {
-    let mut stream = response.bytes_stream();
     let mut buffer: Vec<u8> = Vec::new();
     let mut total: u64 = 0;
     let mut file: Option<(PathBuf, fs::File)> = None;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(AppError::from)?;
+        let chunk = chunk.map_err(|error| AppError::from_transport(&error))?;
         total += chunk.len() as u64;
         if total > MAX_DOWNLOAD_BYTES {
             return Err(AppError::Network(format!(
@@ -630,7 +611,7 @@ fn guess_content_type(path: &str) -> Option<String> {
     Some(guessed.to_string())
 }
 
-fn apply_auth(
+pub(crate) fn apply_auth(
     auth: &AuthSpec,
     variables: &BTreeMap<String, String>,
     missing: &mut Vec<String>,
@@ -692,8 +673,8 @@ fn apply_auth(
 
 /// Adds `http://` when the substituted URL has no scheme.
 ///
-/// `localhost:3000/users` and `example.com/api` are otherwise rejected by
-/// reqwest as a relative URL without a base. Values that already contain
+/// `localhost:3000/users` and `example.com/api` are otherwise rejected as a
+/// relative URL without a base. Values that already contain
 /// `://`, or that still contain an unresolved `{{variable}}`, are left alone.
 fn ensure_absolute_url(url: &str) -> String {
     let trimmed = url.trim();
