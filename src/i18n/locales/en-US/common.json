@@ -1,8 +1,0 @@
-{
-  "errorBoundary": {
-    "title": "Something went wrong",
-    "description": "An unexpected error occurred while rendering. You can retry or reload the app.",
-    "retry": "Retry",
-    "reload": "Reload"
-  }
-}

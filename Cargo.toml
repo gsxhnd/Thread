@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+thread-core = { path = "crates/core" }
+
+# Shared third-party versions so the UI and the domain layer never drift apart.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs", "time", "net"] }
+parking_lot = "0.12.5"
+tracing = "0.1"
+thiserror = "2.0.19"
+uuid = { version = "1.24.0", features = ["v4"] }
+chrono = { version = "0.4.45", features = ["clock"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"

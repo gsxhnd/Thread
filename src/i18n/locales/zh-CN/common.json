@@ -1,8 +1,0 @@
-{
-  "errorBoundary": {
-    "title": "应用出现错误",
-    "description": "界面渲染时发生意外错误，你可以重试或重新加载应用。",
-    "retry": "重试",
-    "reload": "重新加载"
-  }
-}

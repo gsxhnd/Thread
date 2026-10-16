@@ -15,34 +15,39 @@
 ## 当前状态
 
 阶段 0（重构基线与存储验证）与阶段 1（HTTP MVP）已实现：工作区文件为真相（可 Git 跟踪），
-Rust 侧执行 HTTP/HTTPS 请求，Monaco 编辑请求体与只读展示响应，
-环境变量 `{{variable}}` 替换、请求历史、集合/文件夹管理均可使用。
-实现记录与验收对照见 [docs/08.refactor-baseline.md](docs/08.refactor-baseline.md)。
+Rust 侧执行 HTTP/HTTPS 请求，工作区 + 集合树 + HTTP 闭环（发送/取消/历史）可用，
+环境变量 `{{variable}}` 替换、请求历史、代理控制台、CA 证书管理均可使用。
+
+**UI 已从 Tauri + React 一次性全量重写为 [gpui-kit](https://gpui-kit.com/)（GPUI，纯 Rust）**，
+Cargo workspace 分两层：
+
+- `crates/core`（`thread-core`）：纯领域层，无 UI 依赖
+- `crates/app`（`thread` 二进制）：GPUI 桌面应用
 
 ## 技术栈
 
-Tauri v2（Rust） · React · TypeScript · shadcn/ui · Tailwind CSS · Monaco Editor · SQLite（本地数据）
+Rust · gpui-kit / GPUI（桌面 UI） · tokio · reqwest · hyper（代理） · rcgen + rustls（MITM CA） · SQLite（本地运行数据）
 
 ## 开发
 
 ```bash
-# 安装依赖（仓库使用 package-lock.json，pnpm install 亦可）
-npm install
-
-# 启动桌面开发（前端 + Rust）
-npm run dev
-
-# 仅前端调试 / 类型检查 / 前端构建
-npm run web:dev
-npm run typecheck
-npm run web:build
-
-# 打包
-npm run build
+# 运行桌面应用（debug）
+cargo run -p thread-app
 
 # Rust 侧验证
-cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# 打包
+cargo build --release -p thread-app
 ```
+
+系统依赖（GPUI 原生渲染，无需 WebView）：
+
+- **macOS**：Xcode Command Line Tools。
+- **Linux**：`libxkbcommon`、`fontconfig`、`openssl` 等（GPUI 常规依赖）。
+- **Windows**：标准 MSVC 工具链。
 
 ## 文档
 
