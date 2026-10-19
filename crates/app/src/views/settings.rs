@@ -163,35 +163,55 @@ impl SettingsWindow {
                 ),
                 h_flex()
                     .w_full()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .overflow_hidden()
+                    .flex_wrap()
+                    .gap_2()
                     .children(ThemePreference::ALL.map(|preference| {
                         let selected = theme_pref == preference;
-                        h_flex()
-                            .id(match preference {
-                                ThemePreference::System => "theme-pref-system",
-                                ThemePreference::Light => "theme-pref-light",
-                                ThemePreference::Dark => "theme-pref-dark",
-                            })
-                            .flex_1()
-                            .h(px(32.))
-                            .items_center()
-                            .justify_center()
-                            .text_sm()
+                        let (background, foreground, accent) = preference.swatch();
+                        v_flex()
+                            .id(SharedString::from(format!(
+                                "theme-pref-{}",
+                                preference.code()
+                            )))
+                            .w(px(150.))
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
                             .cursor_pointer()
                             .when(selected, |this| {
-                                this.bg(cx.theme().primary)
-                                    .text_color(cx.theme().primary_foreground)
-                                    .font_weight(FontWeight::MEDIUM)
+                                this.border_color(cx.theme().primary)
+                                    .bg(cx.theme().accent)
                             })
                             .when(!selected, |this| {
-                                this.text_color(cx.theme().muted_foreground)
+                                this.border_color(cx.theme().border)
                                     .hover(|this| this.bg(cx.theme().muted))
                             })
-                            .child(preference.label(cx))
+                            .child(
+                                h_flex()
+                                    .h(px(28.))
+                                    .w_full()
+                                    .rounded_sm()
+                                    .overflow_hidden()
+                                    .bg(gpui_kit::rgb(background))
+                                    .border_1()
+                                    .border_color(gpui_kit::rgb(foreground))
+                                    .child(div().w(px(10.)).h_full().bg(gpui_kit::rgb(accent)))
+                                    .child(
+                                        div()
+                                            .ml_2()
+                                            .w(px(40.))
+                                            .h(px(4.))
+                                            .rounded_sm()
+                                            .bg(gpui_kit::rgb(foreground)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
+                                    .child(preference.label(cx)),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Some(app) = this.app.upgrade() {
                                     app.update(cx, |view, cx| {

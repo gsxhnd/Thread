@@ -2,6 +2,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::switch::Switch;
@@ -403,6 +404,8 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
 
     let request_body = body_text(cx, &detail.request_body);
     let response_body = body_text(cx, &detail.response_body);
+    // JSON 响应体与响应面板保持一致：默认美化展示，复制按钮复制展示文本。
+    let response_display = pretty_if_json(&response_body, detail.summary.content_type.as_deref());
 
     v_flex()
         .id("proxy-detail")
@@ -436,10 +439,23 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                 )),
         )
         .child(
-            div()
-                .text_xs()
-                .text_ellipsis_start()
-                .child(detail.summary.url.clone()),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_ellipsis_start()
+                        .child(detail.summary.url.clone()),
+                )
+                .child(
+                    Clipboard::new("copy-proxy-url")
+                        .small()
+                        .value(detail.summary.url.clone())
+                        .tooltip(tr!(cx, "复制 URL", "Copy URL")),
+                ),
         )
         .when(
             !detail.summary.decrypted && detail.summary.mode == "tunnel",
@@ -474,6 +490,7 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         ))
         .when(!request_body.is_empty(), |this| {
             this.child(body_block(
+                cx,
                 tr!(cx, "请求体", "Request body"),
                 &request_body,
                 &theme,
@@ -481,8 +498,9 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         })
         .when(!response_body.is_empty(), |this| {
             this.child(body_block(
+                cx,
                 tr!(cx, "响应体", "Response body"),
-                &response_body,
+                &response_display,
                 &theme,
             ))
         })
@@ -531,16 +549,28 @@ fn header_table(
         .into_any_element()
 }
 
-fn body_block(title: &str, text: &str, theme: &gpui_kit::component::Theme) -> AnyElement {
+fn body_block(cx: &App, title: &str, text: &str, theme: &gpui_kit::component::Theme) -> AnyElement {
     let mono = theme.mono_font_family.clone();
     let text = text.to_string();
     v_flex()
         .gap_1()
         .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title.to_string()),
+            h_flex()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title.to_string()),
+                )
+                .when(!text.is_empty(), |this| {
+                    this.child(
+                        Clipboard::new(SharedString::from(format!("copy-proxy-body-{title}")))
+                            .small()
+                            .value(text.clone())
+                            .tooltip(tr!(cx, "复制", "Copy")),
+                    )
+                }),
         )
         .child(
             div()
@@ -555,6 +585,18 @@ fn body_block(title: &str, text: &str, theme: &gpui_kit::component::Theme) -> An
                 .child(text),
         )
         .into_any_element()
+}
+
+/// Content-Type 是 JSON 时美化展示；解析失败原样返回。
+fn pretty_if_json(text: &str, content_type: Option<&str>) -> String {
+    let looks_json = text.starts_with('{') || text.starts_with('[');
+    if !looks_json || !content_type.map(|ct| ct.contains("json")).unwrap_or(false) {
+        return text.to_string();
+    }
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| text.to_string())
 }
 
 fn filter_input(

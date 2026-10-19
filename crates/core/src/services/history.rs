@@ -264,6 +264,19 @@ pub fn delete(db: &DbState, id: &str) -> AppResult<Option<String>> {
     Ok(body_path)
 }
 
+/// The newest history row for one saved request, including its snapshots.
+pub fn latest_for_request(
+    db: &DbState,
+    workspace_path: &str,
+    request_path: &str,
+) -> AppResult<Option<HistoryDetail>> {
+    let items = list_for_request(db, workspace_path, request_path, 1)?;
+    match items.first() {
+        Some(item) => get(db, &item.id).map(Some),
+        None => Ok(None),
+    }
+}
+
 /// History rows that belong to one saved request, newest first.
 pub fn list_for_request(
     db: &DbState,

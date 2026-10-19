@@ -15,8 +15,8 @@ use gpui_kit::component::tree::{TreeItem, tree};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, PromptLevel,
-    Render, SharedString, Styled as _, WeakEntity, Window, div, px,
+    App, AppContext as _, Context, FontWeight, IntoElement, MouseButton, ParentElement as _,
+    PromptLevel, Render, SharedString, Styled as _, WeakEntity, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::{AppError, AppResult};
@@ -26,21 +26,30 @@ use crate::app::AppView;
 use crate::state::MainView;
 
 /// 由索引构建集合树（集合可嵌套，请求作为叶子）。
-fn build_items(collections: &[CollectionNode]) -> Vec<TreeItem> {
-    collections.iter().map(collection_item).collect()
+fn build_items(
+    collections: &[CollectionNode],
+    collapsed: &std::collections::HashSet<String>,
+) -> Vec<TreeItem> {
+    collections
+        .iter()
+        .map(|node| collection_item(node, collapsed))
+        .collect()
 }
 
-fn collection_item(node: &CollectionNode) -> TreeItem {
+fn collection_item(
+    node: &CollectionNode,
+    collapsed: &std::collections::HashSet<String>,
+) -> TreeItem {
     let mut item = TreeItem::new(
         SharedString::from(format!("coll:{}", node.path)),
         node.name.clone(),
     )
-    .expanded(true);
+    .expanded(!collapsed.contains(&node.path));
     for request in &node.requests {
         item = item.child(request_item(request));
     }
     for child in &node.children {
-        item = item.child(collection_item(child));
+        item = item.child(collection_item(child, collapsed));
     }
     item
 }
@@ -58,7 +67,7 @@ pub fn rebuild_tree(this: &mut AppView, cx: &mut Context<AppView>) {
         .workspace
         .read(cx)
         .index()
-        .map(|index| build_items(&index.collections))
+        .map(|index| build_items(&index.collections, &this.collapsed_collections))
         .unwrap_or_default();
     this.tree.update(cx, |state, cx| state.set_items(items, cx));
 }
@@ -85,6 +94,7 @@ pub fn render(
     let weak: WeakEntity<AppView> = cx.entity().downgrade();
     let menu_weak = weak.clone();
     let header_weak = weak.clone();
+    let open_collection = this.open_collection.clone();
 
     let tree = tree(&this.tree, move |ix, entry, selected, _, _| {
         let item = entry.item();
@@ -108,14 +118,58 @@ pub fn render(
             IconName::Folder
         };
 
+        let folder = !is_request && entry.is_folder();
+        let expanded = entry.is_expanded();
+        let open_here = open_collection.as_deref() == id.strip_prefix("coll:");
         let mut row = ListItem::new(ix)
-            .selected(selected)
+            .selected(selected || open_here)
             .pl(px(8.) + px(12.) * entry.depth() as f32)
             .child(
                 h_flex()
                     .gap_2()
                     .min_w_0()
                     .flex_1()
+                    .when(folder, |row| {
+                        let toggle_id = id.clone();
+                        let toggle_weak = weak.clone();
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("coll-toggle-{id}")))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_4()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .child(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .xsmall(),
+                                )
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let Some(path) = toggle_id.strip_prefix("coll:") else {
+                                        return;
+                                    };
+                                    let path = path.to_string();
+                                    let Some(view) = toggle_weak.upgrade() else {
+                                        return;
+                                    };
+                                    view.update(cx, |view, cx| {
+                                        if !view.collapsed_collections.remove(&path) {
+                                            view.collapsed_collections.insert(path);
+                                        }
+                                        rebuild_tree(view, cx);
+                                    });
+                                })
+                                .on_click(|_, _, cx| {
+                                    cx.stop_propagation();
+                                }),
+                        )
+                    })
                     .child(Icon::new(icon).xsmall())
                     .child(div().text_sm().text_ellipsis().child(item.label.clone())),
             );
@@ -162,6 +216,23 @@ pub fn render(
                     })
                 },
             );
+        } else {
+            let weak = weak.clone();
+            let click_id = id.clone();
+            row = row
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(move |_, _, cx| {
+                    let Some(path) = click_id.strip_prefix("coll:") else {
+                        return;
+                    };
+                    let path = path.to_string();
+                    let Some(view) = weak.upgrade() else {
+                        return;
+                    };
+                    view.update(cx, |view, cx| view.open_collection(path, cx));
+                });
         }
         let drop_weak = weak.clone();
         let drop_id = id.clone();

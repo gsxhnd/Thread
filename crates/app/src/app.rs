@@ -4,6 +4,7 @@
 //! `cx.listener`，没有跨实体路由。渲染函数按视图拆在 `views/` 下，
 //! 处理器以 `impl AppView` 的形式分布在各视图文件里。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -68,8 +69,17 @@ pub struct RequestTab {
     pub local_runs: Vec<LocalRun>,
     pub params: Vec<views::request::KvRow>,
     pub headers: Vec<views::request::KvRow>,
-    /// 表单请求体，和查询参数分开存。
+    /// 表单请求体，和查询参数分开存。文件字段带本地路径。
     pub form_fields: Vec<views::request::KvRow>,
+    /// `inherit` / `none` / `bearer` / `basic` / `apiKey`。
+    pub auth_kind: String,
+    pub auth_token: Entity<InputState>,
+    pub auth_username: Entity<InputState>,
+    pub auth_password: Entity<InputState>,
+    pub auth_key: Entity<InputState>,
+    pub auth_value: Entity<InputState>,
+    /// API 密钥放在 `header` 或 `query`。
+    pub auth_in: String,
     pub body_kind: Entity<SelectState<Vec<&'static str>>>,
     pub body: Entity<EditorState>,
     /// GraphQL variables，或其它协议暂未使用的第二块编辑器。
@@ -147,6 +157,10 @@ pub struct AppView {
     pub core: Arc<AppCore>,
     pub workspace: Entity<WorkspaceModel>,
     pub view: MainView,
+    /// 侧边栏点开的集合。有值时主区域显示集合页，而不是请求标签。
+    pub open_collection: Option<String>,
+    /// 侧边栏里收起的集合路径。点箭头切换，点文件夹本身打开集合页。
+    pub collapsed_collections: HashSet<String>,
     pub theme: ThemePreference,
     pub sidebar_collapsed: bool,
     pub editor_layout: crate::theme::EditorLayout,
@@ -286,6 +300,8 @@ impl AppView {
             core,
             workspace,
             view: MainView::Request,
+            open_collection: None,
+            collapsed_collections: HashSet::new(),
             theme: theme_pref,
             sidebar_collapsed,
             editor_layout,
@@ -481,6 +497,13 @@ impl AppView {
         self.workspace.update(cx, |model, cx| model.close(cx));
     }
 
+    /// 侧边栏里点了一个集合：主区域换成这个集合的页面。
+    pub fn open_collection(&mut self, path: String, cx: &mut Context<Self>) {
+        self.view = crate::state::MainView::Request;
+        self.open_collection = Some(path);
+        cx.notify();
+    }
+
     /// 侧边栏里点了一个请求：已打开则聚焦，未打开则新建标签页。
     pub fn open_request(
         &mut self,
@@ -495,6 +518,7 @@ impl AppView {
         {
             // 标签已经开着时也要回到请求页。停在环境页时再点同一个请求，
             // 只改 active_tab 会让主区域继续停在环境页。
+            self.open_collection = None;
             self.view = crate::state::MainView::Request;
             self.active_tab = Some(existing);
             cx.notify();
@@ -505,16 +529,32 @@ impl AppView {
         };
         let path = node.path.clone();
         let read_path = path.clone();
+        let history_path = path.clone();
+        let workspace_key = root.to_string_lossy().into_owned();
+        let db = self.core.db.clone();
         let core = self.core.clone();
-        let receiver =
-            core.spawn(async move { thread_core::workspace::ops::read_request(&root, &read_path) });
+        let receiver = core.spawn(async move {
+            let loaded = thread_core::workspace::ops::read_request(&root, &read_path);
+            let latest = thread_core::services::history::latest_for_request(
+                &db,
+                &workspace_key,
+                &history_path,
+            )
+            .ok()
+            .flatten();
+            (loaded, latest)
+        });
         let task = cx.spawn(async move |this, cx| {
-            let loaded = receiver
+            let (loaded, latest) = receiver
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))
-                .and_then(|result| result);
+                .unwrap_or_else(|error| (Err(error), None));
             this.update_in(cx, |view, window, cx| {
-                let tab = RequestTab::from_file(path, loaded, window, cx);
+                let mut tab = RequestTab::from_file(path, loaded, window, cx);
+                if let Some(detail) = latest.as_ref() {
+                    tab.restore_last_run(detail, window, cx);
+                }
+                view.open_collection = None;
                 view.view = crate::state::MainView::Request;
                 view.tabs.push(tab);
                 view.active_tab = Some(view.tabs.len() - 1);
@@ -542,6 +582,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_collection = None;
         self.view = crate::state::MainView::Request;
         self.tabs.push(RequestTab::draft(protocol, window, cx));
         self.active_tab = Some(self.tabs.len() - 1);
@@ -600,17 +641,15 @@ impl AppView {
                 })
                 .footer(
                     DialogFooter::new()
-                        .child(
-                            Button::new("unsaved-cancel")
-                                .label(cancel_label)
-                                .on_click(move |_, window, cx| {
-                                    let _ = weak_cancel.update(cx, |view, cx| {
-                                        view.closing_tab = None;
-                                        cx.notify();
-                                    });
-                                    window.close_dialog(cx);
-                                }),
-                        )
+                        .child(Button::new("unsaved-cancel").label(cancel_label).on_click(
+                            move |_, window, cx| {
+                                let _ = weak_cancel.update(cx, |view, cx| {
+                                    view.closing_tab = None;
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                            },
+                        ))
                         .child(
                             Button::new("unsaved-discard")
                                 .label(discard_label)
@@ -892,6 +931,7 @@ impl AppView {
 
     /// 切换视图（侧边栏导航）。
     pub fn switch_view(&mut self, view: MainView, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_collection = None;
         self.view = view;
         match view {
             MainView::History => self.reload_history(cx),
@@ -977,18 +1017,8 @@ impl AppView {
         }
     }
 
-    /// 顶部标题栏右侧按钮组：主题切换 + 关闭工作区。
+    /// 顶部标题栏右侧按钮组：布局切换、设置、关闭工作区。主题在设置页里选。
     fn titlebar_trailing(&mut self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
-        let next = match self.theme {
-            ThemePreference::System => ThemePreference::Light,
-            ThemePreference::Light => ThemePreference::Dark,
-            ThemePreference::Dark => ThemePreference::System,
-        };
-        let theme_icon = match self.theme {
-            ThemePreference::System => IconName::Monitor,
-            ThemePreference::Light => IconName::Sun,
-            ThemePreference::Dark => IconName::Moon,
-        };
         let open = self.workspace.read(cx).is_open();
         let layout_icon = match self.editor_layout {
             theme::EditorLayout::Stacked => IconName::Rows2,
@@ -1020,21 +1050,6 @@ impl AppView {
                 }))
                 .into_any_element(),
         );
-        buttons.push(
-            Button::new("theme-toggle")
-                .ghost()
-                .icon(theme_icon)
-                .tooltip(tr!(
-                    cx,
-                    format!("主题：{}", self.theme.label(cx)),
-                    format!("Theme: {}", self.theme.label(cx))
-                ))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.set_theme(next, window, cx);
-                }))
-                .into_any_element(),
-        );
-
         if open {
             buttons.push(
                 Button::new("close-workspace")

@@ -2,6 +2,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -231,11 +232,29 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                     format_relative_time(detail.summary.created_at, cx),
                 )),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_ellipsis_start()
-                .child(detail.summary.url.clone().unwrap_or_default()),
+        .when_some(
+            detail.summary.url.clone().filter(|url| !url.is_empty()),
+            |this, url| {
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_ellipsis_start()
+                                .child(url.clone()),
+                        )
+                        .child(
+                            Clipboard::new("copy-history-url")
+                                .small()
+                                .value(url)
+                                .tooltip(tr!(cx, "复制 URL", "Copy URL")),
+                        ),
+                )
+            },
         )
         .when(
             detail.summary.has_body_file && this.history.body.is_none(),
@@ -255,11 +274,23 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         .child(
             v_flex()
                 .gap_1()
-                .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(tr!(
-                    cx,
-                    "响应体",
-                    "Response body"
-                )))
+                .child(
+                    h_flex()
+                        .justify_between()
+                        .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(tr!(
+                            cx,
+                            "响应体",
+                            "Response body"
+                        )))
+                        .when(!body.is_empty(), |this| {
+                            this.child(
+                                Clipboard::new("copy-history-body")
+                                    .small()
+                                    .value(pretty_body(&body))
+                                    .tooltip(tr!(cx, "复制响应体", "Copy response body")),
+                            )
+                        }),
+                )
                 .child(
                     div()
                         .rounded_md()

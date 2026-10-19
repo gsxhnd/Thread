@@ -387,6 +387,7 @@ impl AppCore {
             "protocol": "http",
             "name": name.clone(),
             "document": document,
+            "sent": &payload.config,
             "resolved": {
                 "method": resolved.method,
                 "url": resolved.url,

@@ -3,7 +3,9 @@
 #[macro_use]
 mod i18n;
 mod app;
+mod curl;
 mod format;
+mod json_fold;
 mod state;
 mod theme;
 mod views;
@@ -17,7 +19,7 @@ use thread_core::AppCore;
 
 use app::AppView;
 
-gpui_kit::actions!(thread_app, [Quit, OpenSettings, SaveRequest]);
+gpui_kit::actions!(thread_app, [Quit, OpenSettings, SaveRequest, ToggleSidebar]);
 
 fn quit(_: &Quit, cx: &mut App) {
     cx.quit();
@@ -39,9 +41,18 @@ fn save_request(_: &SaveRequest, cx: &mut App) {
     let _ = app.update_in(cx, |view, window, cx| view.save_active_tab(window, cx));
 }
 
+fn toggle_sidebar(_: &ToggleSidebar, cx: &mut App) {
+    let Some(main) = cx.try_global::<app::MainApp>() else {
+        return;
+    };
+    let app = main.0.clone();
+    let _ = app.update(cx, |view, cx| view.toggle_sidebar(cx));
+}
+
 pub(crate) fn install_menus(cx: &mut App) {
     cx.set_menus([Menu::new("Thread").items([
         MenuItem::action(tr!(cx, "保存", "Save"), SaveRequest),
+        MenuItem::action(tr!(cx, "切换侧边栏", "Toggle Sidebar"), ToggleSidebar),
         MenuItem::action(tr!(cx, "设置…", "Settings…"), OpenSettings),
         MenuItem::separator(),
         MenuItem::action(tr!(cx, "退出 Thread", "Quit Thread"), Quit),
@@ -74,6 +85,7 @@ fn main() {
                 KeyBinding::new("cmd-,", OpenSettings, None),
                 KeyBinding::new("cmd-s", SaveRequest, None),
                 KeyBinding::new("ctrl-s", SaveRequest, None),
+                KeyBinding::new("cmd-b", ToggleSidebar, None),
             ]);
             install_menus(cx);
 

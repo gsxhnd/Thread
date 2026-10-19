@@ -68,7 +68,7 @@ impl Default for HttpRequestConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Timing {
     pub dns_ms: f64,

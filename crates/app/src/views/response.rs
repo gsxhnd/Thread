@@ -1,6 +1,7 @@
 //! 响应面板：状态行 + 响应体/响应头/Cookie/耗时。
 
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString,
@@ -277,17 +278,32 @@ fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> An
     v_flex()
         .min_h_0()
         .flex_1()
-        .id("response-body")
-        .overflow_y_scroll()
-        .rounded_md()
-        .bg(theme.muted)
-        .p_3()
+        .gap_1()
+        .child(
+            // 复制的是展示文本：看到的 JSON 就是拿到的 JSON。
+            h_flex().justify_end().child(
+                Clipboard::new("copy-response-body")
+                    .small()
+                    .value(display.clone())
+                    .tooltip(tr!(cx, "复制响应体", "Copy response body")),
+            ),
+        )
         .child(
             div()
-                .text_xs()
-                .whitespace_normal()
-                .font_family(mono)
-                .child(display),
+                .min_h_0()
+                .flex_1()
+                .id("response-body")
+                .overflow_y_scroll()
+                .rounded_md()
+                .bg(theme.muted)
+                .p_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .whitespace_normal()
+                        .font_family(mono)
+                        .child(display),
+                ),
         )
         .into_any_element()
 }
@@ -302,11 +318,25 @@ fn headers_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &
             .into_any_element();
     }
     let muted = theme.muted_foreground;
+    // 复制成 `k: v` 行，方便贴进 issue 或日志。
+    let copy_text: String = headers
+        .iter()
+        .flat_map(|(name, values)| values.iter().map(move |value| format!("{name}: {value}")))
+        .collect::<Vec<_>>()
+        .join("\n");
     v_flex()
         .id("response-headers")
         .overflow_y_scroll()
         .flex_1()
         .gap_1()
+        .child(
+            h_flex().justify_end().child(
+                Clipboard::new("copy-response-headers")
+                    .small()
+                    .value(copy_text)
+                    .tooltip(tr!(cx, "复制响应头", "Copy headers")),
+            ),
+        )
         .children(
             headers
                 .iter()

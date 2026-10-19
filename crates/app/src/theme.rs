@@ -1,14 +1,18 @@
-//! 外观偏好：light / dark 两档，跟随系统由启动时决定。
+//! 外观偏好：跟随系统、浅色/深色，以及若干内置配色主题。
 //!
 //! 选择写入 `config.toml` 的 `ui_layout` section（沿用核心提供的
 //! `ThreadConfigStore::set_section`），下次启动时恢复。
 
+use std::rc::Rc;
+
+use gpui_kit::component::theme::{ThemeConfig, ThemeRegistry};
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{App, WindowAppearance};
+use gpui_kit::{App, SharedString, WindowAppearance};
 use thread_core::config::{SECTION_UI_LAYOUT, ThreadConfigStore};
 
 use serde::{Deserialize, Serialize};
 
+/// 设置页里可选的外观。`System` / `Light` / `Dark` 使用内置默认配色，其余是内置的命名主题。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreference {
@@ -16,27 +20,126 @@ pub enum ThemePreference {
     System,
     Light,
     Dark,
+    Solarized,
+    Nord,
+    Dracula,
+}
+
+/// 命名主题的配色。只覆盖常用颜色，其余由默认主题补齐。
+struct Palette {
+    name: &'static str,
+    dark: bool,
+    background: u32,
+    foreground: u32,
+    sidebar: u32,
+    border: u32,
+    muted: u32,
+    muted_foreground: u32,
+    primary: u32,
+    primary_foreground: u32,
+    accent: u32,
 }
 
 impl ThemePreference {
+    pub const ALL: [ThemePreference; 6] = [
+        ThemePreference::System,
+        ThemePreference::Light,
+        ThemePreference::Dark,
+        ThemePreference::Solarized,
+        ThemePreference::Nord,
+        ThemePreference::Dracula,
+    ];
+
     pub fn label(self, cx: &App) -> &'static str {
         match self {
             Self::System => crate::tr!(cx, "跟随系统", "System"),
             Self::Light => crate::tr!(cx, "浅色", "Light"),
             Self::Dark => crate::tr!(cx, "深色", "Dark"),
+            Self::Solarized => crate::tr!(cx, "Solarized 浅色", "Solarized Light"),
+            Self::Nord => crate::tr!(cx, "Nord 深色", "Nord"),
+            Self::Dracula => crate::tr!(cx, "Dracula 深色", "Dracula"),
         }
     }
 
-    pub const ALL: [ThemePreference; 3] = [
-        ThemePreference::System,
-        ThemePreference::Light,
-        ThemePreference::Dark,
-    ];
-
-    fn resolve(self, system_dark: bool) -> ThemeMode {
+    /// 写入配置文件的稳定标识。
+    pub fn code(self) -> &'static str {
         match self {
-            Self::Dark => ThemeMode::Dark,
-            Self::Light => ThemeMode::Light,
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+            Self::Solarized => "solarized",
+            Self::Nord => "nord",
+            Self::Dracula => "dracula",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preference| preference.code() == code)
+    }
+
+    /// 设置页色块用的代表色：背景、文字、强调色。
+    pub fn swatch(self) -> (u32, u32, u32) {
+        match self.palette() {
+            Some(palette) => (palette.background, palette.foreground, palette.primary),
+            None => match self {
+                Self::Dark => (0x1e1f22, 0xe6e6e6, 0x5b8def),
+                _ => (0xffffff, 0x1f2328, 0x2563c9),
+            },
+        }
+    }
+
+    fn palette(self) -> Option<Palette> {
+        Some(match self {
+            Self::Solarized => Palette {
+                name: "Thread Solarized Light",
+                dark: false,
+                background: 0xfdf6e3,
+                foreground: 0x586e75,
+                sidebar: 0xeee8d5,
+                border: 0xd9d1b8,
+                muted: 0xeee8d5,
+                muted_foreground: 0x839496,
+                primary: 0x268bd2,
+                primary_foreground: 0xfdf6e3,
+                accent: 0xe6dfc8,
+            },
+            Self::Nord => Palette {
+                name: "Thread Nord",
+                dark: true,
+                background: 0x2e3440,
+                foreground: 0xd8dee9,
+                sidebar: 0x3b4252,
+                border: 0x4c566a,
+                muted: 0x3b4252,
+                muted_foreground: 0x81a1c1,
+                primary: 0x88c0d0,
+                primary_foreground: 0x2e3440,
+                accent: 0x434c5e,
+            },
+            Self::Dracula => Palette {
+                name: "Thread Dracula",
+                dark: true,
+                background: 0x282a36,
+                foreground: 0xf8f8f2,
+                sidebar: 0x21222c,
+                border: 0x44475a,
+                muted: 0x343746,
+                muted_foreground: 0x6272a4,
+                primary: 0xbd93f9,
+                primary_foreground: 0x282a36,
+                accent: 0x44475a,
+            },
+            Self::System | Self::Light | Self::Dark => return None,
+        })
+    }
+
+    /// 解析成要用的明暗模式。`System` 跟随系统外观。
+    fn mode(self, system_dark: bool) -> ThemeMode {
+        match self {
+            Self::Dark | Self::Nord | Self::Dracula => ThemeMode::Dark,
+            Self::Light | Self::Solarized => ThemeMode::Light,
             Self::System => {
                 if system_dark {
                     ThemeMode::Dark
@@ -53,6 +156,69 @@ fn system_dark(cx: &App) -> bool {
         cx.window_appearance(),
         WindowAppearance::Dark | WindowAppearance::VibrantDark
     )
+}
+
+/// 命名主题序列化成一个单条目的主题集 JSON，供注册表加载。
+fn theme_set_json(palette: &Palette) -> String {
+    let hex = |value: u32| format!("#{value:06x}");
+    let config = serde_json::json!({
+        "name": palette.name,
+        "mode": if palette.dark { "dark" } else { "light" },
+        "colors": {
+            "background": hex(palette.background),
+            "foreground": hex(palette.foreground),
+            "sidebar.background": hex(palette.sidebar),
+            "border": hex(palette.border),
+            "muted.background": hex(palette.muted),
+            "muted.foreground": hex(palette.muted_foreground),
+            "primary.background": hex(palette.primary),
+            "primary.foreground": hex(palette.primary_foreground),
+            "accent.background": hex(palette.accent),
+        }
+    });
+    serde_json::json!({ "name": palette.name, "themes": [config] }).to_string()
+}
+
+/// 把命名主题登记进主题注册表，返回可以直接套用的配置。
+fn register(palette: &Palette, cx: &mut App) -> Option<Rc<ThemeConfig>> {
+    let set = theme_set_json(palette);
+    let registry = ThemeRegistry::global_mut(cx);
+    if let Err(error) = registry.load_themes_from_str(&set) {
+        tracing::warn!(%error, "failed to register theme");
+    }
+    ThemeRegistry::global(cx)
+        .themes()
+        .get(&SharedString::from(palette.name))
+        .cloned()
+}
+
+/// 套用一个外观：先换上对应的浅色/深色配置，再切到目标模式。
+fn apply(preference: ThemePreference, cx: &mut App) {
+    let dark = system_dark(cx);
+    let mode = preference.mode(dark);
+    let (mut light, mut dark_config) = {
+        let registry = ThemeRegistry::global(cx);
+        (
+            registry.default_light_theme().clone(),
+            registry.default_dark_theme().clone(),
+        )
+    };
+    if let Some(palette) = preference.palette()
+        && let Some(config) = register(&palette, cx)
+    {
+        if palette.dark {
+            dark_config = config;
+        } else {
+            light = config;
+        }
+    }
+    // 第一次切换会创建全局主题，之后再换配置并重新套用当前模式。
+    Theme::change(mode, None, cx);
+    Theme::update(cx, |theme| {
+        theme.light_theme = light;
+        theme.dark_theme = dark_config;
+    });
+    Theme::change(mode, None, cx);
 }
 
 /// `ui_layout` section. Theme and locale share one JSON object so saving one
@@ -85,8 +251,7 @@ pub(crate) fn save_layout(config: &ThreadConfigStore, layout: &UiLayout) {
 /// Reads the stored preference and applies the theme before the first window opens.
 pub fn init(config: &ThreadConfigStore, cx: &mut App) {
     let preference = stored(config);
-    let dark = system_dark(cx);
-    Theme::change(preference.resolve(dark), None, cx);
+    apply(preference, cx);
 }
 
 /// Current persisted preference (falls back to System).
@@ -94,33 +259,18 @@ pub fn stored(config: &ThreadConfigStore) -> ThemePreference {
     load_layout(config)
         .theme
         .as_deref()
-        .and_then(|name| match name {
-            "light" => Some(ThemePreference::Light),
-            "dark" => Some(ThemePreference::Dark),
-            _ => None,
-        })
+        .and_then(ThemePreference::from_code)
         .unwrap_or_default()
 }
 
 /// Switches the theme and persists the choice.
 pub fn set(config: &ThreadConfigStore, preference: ThemePreference, cx: &mut App) {
-    let dark = system_dark(cx);
-    Theme::change(preference.resolve(dark), None, cx);
+    apply(preference, cx);
 
     let mut layout = load_layout(config);
-    layout.theme = Some(
-        match preference {
-            ThemePreference::System => "system",
-            ThemePreference::Light => "light",
-            ThemePreference::Dark => "dark",
-        }
-        .to_string(),
-    );
+    layout.theme = Some(preference.code().to_string());
     save_layout(config, &layout);
-    tracing::info!(
-        theme = layout.theme.as_deref().unwrap_or("system"),
-        "theme changed"
-    );
+    tracing::info!(theme = preference.code(), "theme changed");
 }
 
 /// 请求编辑区和响应区的摆放。
@@ -160,4 +310,53 @@ pub fn store_sidebar_collapsed(config: &ThreadConfigStore, collapsed: bool) {
     let mut stored = load_layout(config);
     stored.sidebar_collapsed = Some(collapsed);
     save_layout(config, &stored);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::component::theme::ThemeSet;
+
+    /// 命名主题的 JSON 必须能被 gpui-kit 的主题集 schema 原样解析，
+    /// 否则设置页选了主题也只会静默失效（register 里只记 warn）。
+    #[test]
+    fn palette_json_matches_theme_schema() {
+        for preference in ThemePreference::ALL {
+            let Some(palette) = preference.palette() else {
+                continue;
+            };
+            let set: ThemeSet =
+                serde_json::from_str(&theme_set_json(&palette)).expect("valid theme set json");
+            assert_eq!(set.themes.len(), 1);
+            let theme = &set.themes[0];
+            assert_eq!(theme.name, palette.name);
+            assert_eq!(theme.mode.is_dark(), palette.dark);
+            let hex = |value: u32| format!("#{value:06x}");
+            assert_eq!(
+                theme.colors.background.as_deref(),
+                Some(hex(palette.background).as_str())
+            );
+            assert_eq!(
+                theme.colors.primary.as_deref(),
+                Some(hex(palette.primary).as_str())
+            );
+            assert_eq!(
+                theme.colors.muted_foreground.as_deref(),
+                Some(hex(palette.muted_foreground).as_str())
+            );
+        }
+    }
+
+    /// 配置文件里的旧值（light/dark/system）和新值都要能读回来。
+    #[test]
+    fn preference_codes_round_trip() {
+        for preference in ThemePreference::ALL {
+            assert_eq!(
+                ThemePreference::from_code(preference.code()),
+                Some(preference)
+            );
+        }
+        assert_eq!(ThemePreference::from_code("nonsense"), None);
+        assert_eq!(ThemePreference::from_code(""), None);
+    }
 }

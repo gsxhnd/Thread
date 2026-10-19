@@ -18,7 +18,13 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
         .id("content")
         .overflow_hidden()
         .child(match view {
-            MainView::Request => views::request::render(this, window, cx),
+            MainView::Request => {
+                if this.open_collection.is_some() {
+                    views::collection::render(this, window, cx)
+                } else {
+                    views::request::render(this, window, cx)
+                }
+            }
             MainView::History => views::history::render(this, window, cx),
             MainView::Proxy => views::proxy::render(this, window, cx),
             MainView::Certificates => views::certificates::render(this, window, cx),

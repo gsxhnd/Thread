@@ -2,6 +2,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -11,13 +12,16 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Window, div, px,
+    PathPromptOptions, SharedString, Styled as _, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
+use std::collections::BTreeMap;
+
 use thread_core::error::AppError;
-use thread_core::services::http::HttpRequestConfig;
+use thread_core::services::history::HistoryDetail;
+use thread_core::services::http::{HttpRequestConfig, HttpResponse, Timing};
 use thread_core::workspace::formats::{
-    GraphqlRequestDoc, GrpcRequestDoc, HttpBody, HttpBodyField, HttpRequestDoc, KeyValue,
+    AuthSpec, GraphqlRequestDoc, GrpcRequestDoc, HttpBody, HttpBodyField, HttpRequestDoc, KeyValue,
     RequestFile, WsRequestDoc,
 };
 use uuid::Uuid;
@@ -31,19 +35,27 @@ use crate::widgets;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RequestSection {
     Params,
+    Auth,
     Headers,
     Body,
     Timeline,
 }
 
 impl RequestSection {
-    pub fn all() -> [RequestSection; 4] {
-        [Self::Params, Self::Headers, Self::Body, Self::Timeline]
+    pub fn all() -> [RequestSection; 5] {
+        [
+            Self::Params,
+            Self::Auth,
+            Self::Headers,
+            Self::Body,
+            Self::Timeline,
+        ]
     }
 
     fn label(self, cx: &App) -> &'static str {
         match self {
             Self::Params => tr!(cx, "参数", "Params"),
+            Self::Auth => tr!(cx, "认证", "Auth"),
             Self::Headers => tr!(cx, "请求头", "Headers"),
             Self::Body => tr!(cx, "请求体", "Body"),
             Self::Timeline => tr!(cx, "时间线", "Timeline"),
@@ -109,13 +121,16 @@ pub enum KvKind {
     Form,
 }
 
-pub const BODY_KINDS: [&str; 4] = ["none", "json", "raw", "form"];
+pub const BODY_KINDS: [&str; 5] = ["none", "json", "raw", "form", "form-data"];
 
 /// 一行键值编辑（参数 / 请求头 / 表单字段共用）。
 pub struct KvRow {
     pub key: Entity<InputState>,
     pub value: Entity<InputState>,
     pub enabled: bool,
+    /// form-data 里这一行选的是本地文件，而不是文本。
+    pub file: bool,
+    pub file_path: Option<String>,
 }
 
 impl KvRow {
@@ -138,6 +153,8 @@ impl KvRow {
                     .default_value(value)
             }),
             enabled,
+            file: false,
+            file_path: None,
         }
     }
 
@@ -183,6 +200,17 @@ impl RequestTab {
             params: Vec::new(),
             headers: Vec::new(),
             form_fields: Vec::new(),
+            auth_kind: "inherit".into(),
+            auth_token: cx
+                .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "令牌", "Token"))),
+            auth_username: cx
+                .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "用户名", "Username"))),
+            auth_password: cx
+                .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "密码", "Password"))),
+            auth_key: cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "键", "Key"))),
+            auth_value: cx
+                .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "值", "Value"))),
+            auth_in: "header".into(),
             body_kind: cx.new(|cx| {
                 SelectState::new(
                     BODY_KINDS.to_vec(),
@@ -192,20 +220,28 @@ impl RequestTab {
                 )
             }),
             body: cx.new(|cx| {
-                EditorState::new(window, cx)
+                let mut state = EditorState::new(window, cx)
                     .language("json")
+                    .folding(true)
                     .tab_size(TabSize {
                         tab_size: 2,
                         hard_tabs: false,
-                    })
+                    });
+                // 括号折叠：没有 tree-sitter 语法时由 json_fold 给出范围。
+                state.set_highlighter_factory(crate::json_fold::factory(), cx);
+                state
             }),
             variables: cx.new(|cx| {
-                EditorState::new(window, cx)
+                let mut state = EditorState::new(window, cx)
                     .language("json")
+                    .folding(true)
                     .tab_size(TabSize {
                         tab_size: 2,
                         hard_tabs: false,
-                    })
+                    });
+                // GraphQL variables 同样是 JSON，折叠行为与请求体一致。
+                state.set_highlighter_factory(crate::json_fold::factory(), cx);
+                state
             }),
             service: cx.new(|cx| InputState::new(window, cx).placeholder("Service")),
             rpc_method: cx.new(|cx| InputState::new(window, cx).placeholder("Method")),
@@ -273,64 +309,241 @@ impl RequestTab {
             return tab;
         };
 
-        tab.name = doc.name.clone();
-        let method = doc.method.to_ascii_uppercase();
+        tab.apply_http_doc(&doc, window, cx);
+        tab
+    }
+
+    /// 用文件里的 HTTP 文档填这一页。
+    pub fn apply_http_doc(
+        &mut self,
+        doc: &HttpRequestDoc,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) {
+        self.fill_http(
+            &doc.name,
+            &doc.method,
+            &doc.url,
+            &doc.query_params,
+            &doc.headers,
+            &doc.body,
+            &doc.auth,
+            window,
+            cx,
+        );
+    }
+
+    /// 用上一次实际发出的配置填这一页，并带回当时的响应。
+    pub fn restore_last_run(
+        &mut self,
+        detail: &HistoryDetail,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) {
+        if self.protocol != Protocol::Http {
+            return;
+        }
+        let snapshot = &detail.request_snapshot;
+        let restored = snapshot
+            .get("sent")
+            .and_then(|sent| serde_json::from_value::<HttpRequestConfig>(sent.clone()).ok())
+            .map(|config| {
+                let name = self.name.clone();
+                self.fill_http(
+                    &name,
+                    &config.method,
+                    &config.url,
+                    &config.query_params,
+                    &config.headers,
+                    &config.body,
+                    &config.auth,
+                    window,
+                    cx,
+                );
+            })
+            .is_some()
+            || snapshot
+                .get("document")
+                .and_then(|document| {
+                    serde_json::from_value::<HttpRequestDoc>(document.clone()).ok()
+                })
+                .map(|doc| self.apply_http_doc(&doc, window, cx))
+                .is_some()
+            || snapshot
+                .get("document")
+                .and_then(|document| {
+                    serde_json::from_value::<HttpRequestConfig>(document.clone()).ok()
+                })
+                .map(|config| {
+                    let name = snapshot
+                        .get("name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(&self.name)
+                        .to_string();
+                    self.fill_http(
+                        &name,
+                        &config.method,
+                        &config.url,
+                        &config.query_params,
+                        &config.headers,
+                        &config.body,
+                        &config.auth,
+                        window,
+                        cx,
+                    );
+                })
+                .is_some();
+        if !restored {
+            return;
+        }
+        if let Some(response) = response_from_history(detail) {
+            self.response = Some(response);
+        }
+        self.dirty = false;
+    }
+
+    fn fill_http(
+        &mut self,
+        name: &str,
+        method: &str,
+        url: &str,
+        params: &[KeyValue],
+        headers: &[KeyValue],
+        body: &HttpBody,
+        auth: &AuthSpec,
+        window: &mut Window,
+        cx: &mut Context<AppView>,
+    ) {
+        if !name.is_empty() {
+            self.name = name.to_string();
+        }
+        let method_name = method.to_ascii_uppercase();
         if let Some(ix) = HTTP_METHODS
             .iter()
-            .position(|candidate| *candidate == method)
+            .position(|candidate| *candidate == method_name)
         {
-            let method = tab.method.clone();
+            let method = self.method.clone();
             method.update(cx, |state, cx| {
                 state.set_selected_index(Some(IndexPath::default().row(ix)), window, cx);
             });
         }
-        let url = tab.url.clone();
-        url.update(cx, |state, cx| {
-            state.set_value(doc.url.clone(), window, cx);
-        });
-        for pair in &doc.query_params {
-            tab.params
+        set_input(&self.url, url, window, cx);
+        self.params.clear();
+        for pair in params {
+            self.params
                 .push(KvRow::new(window, cx, &pair.key, &pair.value, pair.enabled));
         }
-        for pair in &doc.headers {
-            tab.headers
+        self.headers.clear();
+        for pair in headers {
+            self.headers
                 .push(KvRow::new(window, cx, &pair.key, &pair.value, pair.enabled));
         }
-        let kind = match doc.body.kind.as_str() {
-            "formUrlencoded" | "multipart" | "formData" => "form".to_string(),
-            other => other.to_string(),
+        let ui_kind = match body.kind.as_str() {
+            "form" | "formUrlencoded" => "form",
+            "multipart" | "formData" => "form-data",
+            other => other,
         };
-        if let Some(ix) = BODY_KINDS.iter().position(|candidate| *candidate == kind) {
-            let body_kind = tab.body_kind.clone();
+        if let Some(ix) = BODY_KINDS
+            .iter()
+            .position(|candidate| *candidate == ui_kind)
+        {
+            let body_kind = self.body_kind.clone();
             body_kind.update(cx, |state, cx| {
                 state.set_selected_index(Some(IndexPath::default().row(ix)), window, cx);
             });
         }
-        let form = matches!(
-            doc.body.kind.as_str(),
-            "form" | "formUrlencoded" | "multipart" | "formData"
-        );
+        let form = matches!(ui_kind, "form" | "form-data");
+        let body_entity = self.body.clone();
+        body_entity.update(cx, |state, cx| {
+            state.set_placeholder(body_placeholder(ui_kind, cx), window, cx)
+        });
+        self.form_fields.clear();
         if form {
-            for field in &doc.body.fields {
+            for field in &body.fields {
+                let shown = if field.kind == "file" {
+                    field.file_path.clone().unwrap_or_default()
+                } else {
+                    field.value.clone()
+                };
+                let mut row = KvRow::new(window, cx, &field.key, &shown, field.enabled);
                 if field.kind == "file" {
-                    continue;
+                    row.file = true;
+                    row.file_path = field.file_path.clone();
                 }
-                tab.form_fields.push(KvRow::new(
-                    window,
-                    cx,
-                    &field.key,
-                    &field.value,
-                    field.enabled,
-                ));
+                self.form_fields.push(row);
             }
-        } else if !doc.body.content.is_empty() {
-            let body = tab.body.clone();
-            let content = doc.body.content.clone();
-            body.update(cx, |state, cx| {
-                state.set_value(content, window, cx);
-            });
+        } else {
+            let content = if ui_kind == "json" {
+                pretty_json(&body.content).unwrap_or_else(|| body.content.clone())
+            } else {
+                body.content.clone()
+            };
+            set_editor(&self.body, &content, window, cx);
         }
-        tab
+        self.apply_auth(auth, window, cx);
+    }
+
+    fn apply_auth(&mut self, auth: &AuthSpec, window: &mut Window, cx: &mut Context<AppView>) {
+        self.auth_kind = match auth.kind.as_str() {
+            "none" | "bearer" | "basic" | "apiKey" | "inherit" => auth.kind.clone(),
+            "oauth2" => "bearer".into(),
+            _ => "inherit".into(),
+        };
+        self.auth_in = if auth.location.as_deref() == Some("query") {
+            "query".into()
+        } else {
+            "header".into()
+        };
+        set_input(
+            &self.auth_token,
+            auth.token.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        set_input(
+            &self.auth_username,
+            auth.username.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        set_input(
+            &self.auth_password,
+            auth.password.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        set_input(
+            &self.auth_key,
+            auth.key.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+        set_input(
+            &self.auth_value,
+            auth.value.as_deref().unwrap_or(""),
+            window,
+            cx,
+        );
+    }
+
+    fn auth_spec(&self, cx: &App) -> AuthSpec {
+        let text = |input: &Entity<InputState>| {
+            let value = input.read(cx).value().trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        };
+        AuthSpec {
+            kind: self.auth_kind.clone(),
+            token: text(&self.auth_token),
+            username: text(&self.auth_username),
+            password: text(&self.auth_password),
+            key: text(&self.auth_key),
+            value: text(&self.auth_value),
+            location: if self.auth_kind == "apiKey" {
+                Some(self.auth_in.clone())
+            } else {
+                None
+            },
+        }
     }
 
     /// 按文件里的协议打开标签页。解析失败时仍打开一个带错误说明的页。
@@ -432,19 +645,38 @@ impl RequestTab {
 
         let body = match body_kind {
             "none" => HttpBody::default(),
-            "form" => HttpBody {
-                kind: "formUrlencoded".into(),
+            "form" | "form-data" => HttpBody {
+                kind: if body_kind == "form-data" {
+                    "multipart".into()
+                } else {
+                    "formUrlencoded".into()
+                },
                 fields: self
                     .form_fields
                     .iter()
                     .filter(|row| row.enabled && !row.is_empty(cx))
-                    .map(|row| HttpBodyField {
-                        key: row.key.read(cx).value().to_string(),
-                        value: row.value.read(cx).value().to_string(),
-                        kind: "text".into(),
-                        enabled: true,
-                        file_path: None,
-                        content_type: None,
+                    .filter_map(|row| {
+                        if body_kind == "form-data" && row.file {
+                            let file_path = row.file_path.clone().filter(|path| !path.is_empty());
+                            let file_path = file_path?;
+                            Some(HttpBodyField {
+                                key: row.key.read(cx).value().to_string(),
+                                value: String::new(),
+                                kind: "file".into(),
+                                enabled: true,
+                                file_path: Some(file_path),
+                                content_type: None,
+                            })
+                        } else {
+                            Some(HttpBodyField {
+                                key: row.key.read(cx).value().to_string(),
+                                value: row.value.read(cx).value().to_string(),
+                                kind: "text".into(),
+                                enabled: true,
+                                file_path: None,
+                                content_type: None,
+                            })
+                        }
                     })
                     .collect(),
                 ..HttpBody::default()
@@ -462,7 +694,7 @@ impl RequestTab {
             query_params: self.params.iter().map(|row| row.to_kv(cx)).collect(),
             headers: self.headers.iter().map(|row| row.to_kv(cx)).collect(),
             body,
-            auth: Default::default(),
+            auth: self.auth_spec(cx),
             settings: Default::default(),
         }
     }
@@ -555,9 +787,6 @@ fn set_editor(
     window: &mut Window,
     cx: &mut Context<AppView>,
 ) {
-    if value.is_empty() {
-        return;
-    }
     let value = value.to_string();
     editor.update(cx, |state, cx| state.set_value(value, window, cx));
 }
@@ -879,6 +1108,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
             .overflow_y_scroll()
             .child(kv_editor(this, active, KvKind::Headers, cx))
             .into_any_element(),
+        RequestSection::Auth => auth_editor(this, active, cx),
         RequestSection::Body => body_editor(this, active, &method, &body_kind, &body, cx),
         RequestSection::Timeline => crate::views::history::request_timeline(this, active, cx),
     };
@@ -908,6 +1138,33 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                                 .child(Select::new(&method).small()),
                         )
                         .child(crate::views::url_vars::field(this, active, &url, cx))
+                        .child(
+                            // 复制的是输入框当前内容，含未替换的 {{变量}}。
+                            Clipboard::new("copy-request-url")
+                                .small()
+                                .value_fn(move |_, cx| url.read(cx).value())
+                                .tooltip(tr!(cx, "复制 URL", "Copy URL")),
+                        )
+                        .child(
+                            // 点击时按当前表单导出 cURL，含请求体与认证。
+                            Clipboard::new("copy-curl")
+                                .small()
+                                .value_fn(move |_, cx| {
+                                    let Some(main) = cx.try_global::<crate::app::MainApp>() else {
+                                        return SharedString::default();
+                                    };
+                                    let Some(view) = main.0.upgrade() else {
+                                        return SharedString::default();
+                                    };
+                                    let Some(tab) = view.read(cx).tabs.get(active) else {
+                                        return SharedString::default();
+                                    };
+                                    SharedString::from(crate::curl::command(
+                                        &tab.collect_config(cx),
+                                    ))
+                                })
+                                .tooltip(tr!(cx, "复制为 cURL", "Copy as cURL")),
+                        )
                         .child(send_button)
                         .child(save_button),
                 ))
@@ -968,7 +1225,25 @@ fn section_label_with_count(
             .iter()
             .filter(|row| row.enabled && !row.is_empty(cx))
             .count(),
-        RequestSection::Body | RequestSection::Timeline => 0,
+        RequestSection::Body => {
+            // 有请求体时在标签上提示：表单按启用的字段计数，其它类型有内容记为 1。
+            match tab
+                .body_kind
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or("none")
+            {
+                "none" => 0,
+                "form" | "form-data" => tab
+                    .form_fields
+                    .iter()
+                    .filter(|row| row.enabled && !row.is_empty(cx))
+                    .count(),
+                _ => usize::from(!tab.body.read(cx).value().trim().is_empty()),
+            }
+        }
+        RequestSection::Auth | RequestSection::Timeline => 0,
     };
     if count == 0 {
         SharedString::from(section.label(cx))
@@ -985,7 +1260,19 @@ pub(crate) fn kv_editor(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
-    let rows: Vec<(Entity<InputState>, Entity<InputState>, bool)> = {
+    let form_files = kind == KvKind::Form
+        && this
+            .tabs
+            .get(active)
+            .and_then(|tab| tab.body_kind.read(cx).selected_value().copied())
+            == Some("form-data");
+    let rows: Vec<(
+        Entity<InputState>,
+        Entity<InputState>,
+        bool,
+        bool,
+        Option<String>,
+    )> = {
         let Some(tab) = this.tabs.get(active) else {
             return div().into_any_element();
         };
@@ -995,7 +1282,15 @@ pub(crate) fn kv_editor(
             KvKind::Form => &tab.form_fields,
         };
         rows.iter()
-            .map(|row| (row.key.clone(), row.value.clone(), row.enabled))
+            .map(|row| {
+                (
+                    row.key.clone(),
+                    row.value.clone(),
+                    row.enabled,
+                    row.file,
+                    row.file_path.clone(),
+                )
+            })
             .collect()
     };
     let empty_hint = match kind {
@@ -1032,39 +1327,77 @@ pub(crate) fn kv_editor(
         } else {
             v_flex()
                 .gap_1()
-                .children(
-                    rows.into_iter()
-                        .enumerate()
-                        .map(|(ix, (key, value, enabled))| {
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(kv_toggle(active, ix, kind, enabled, &theme, cx))
-                                .child(div().w(px(240.)).child(Input::new(&key).small()))
-                                .child(div().flex_1().child(Input::new(&value).small()))
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "kv-remove-{}-{ix}",
+                .children(rows.into_iter().enumerate().map(
+                    |(ix, (key, value, enabled, file, file_path))| {
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(kv_toggle(active, ix, kind, enabled, &theme, cx))
+                            .child(div().w(px(200.)).child(Input::new(&key).small()))
+                            .when(form_files, |row| {
+                                row.child(form_mode_button(active, ix, file, cx))
+                            })
+                            .child(if form_files && file {
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_ellipsis()
+                                            .text_color(theme.muted_foreground)
+                                            .child(file_path.unwrap_or_else(|| {
+                                                tr!(cx, "未选择文件", "No file chosen").to_string()
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(SharedString::from(format!(
+                                            "kv-file-{}-{ix}",
                                             kind_tag(kind)
                                         )))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size_5()
-                                        .rounded_sm()
-                                        .hover(|this| this.bg(theme.muted))
-                                        .cursor_pointer()
-                                        .child(Icon::new(IconName::Delete).xsmall())
-                                        .on_click(cx.listener(
-                                            move |this, _: &gpui_kit::ClickEvent, _, cx| {
-                                                this.remove_kv_row(active, ix, kind, cx);
-                                            },
-                                        )),
-                                )
-                                .into_any_element()
-                        }),
-                )
+                                        .outline()
+                                        .small()
+                                        .label(tr!(cx, "选择文件", "Choose file"))
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.pick_form_file(active, ix, window, cx);
+                                            }),
+                                        ),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .flex_1()
+                                    .child(Input::new(&value).small())
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "kv-remove-{}-{ix}",
+                                        kind_tag(kind)
+                                    )))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size_5()
+                                    .rounded_sm()
+                                    .hover(|this| this.bg(theme.muted))
+                                    .cursor_pointer()
+                                    .child(Icon::new(IconName::Delete).xsmall())
+                                    .on_click(cx.listener(
+                                        move |this, _: &gpui_kit::ClickEvent, _, cx| {
+                                            this.remove_kv_row(active, ix, kind, cx);
+                                        },
+                                    )),
+                            )
+                            .into_any_element()
+                    },
+                ))
                 .into_any_element()
         })
         .child(
@@ -1143,6 +1476,219 @@ fn kv_toggle(
         }))
 }
 
+fn form_mode_button(
+    active: usize,
+    ix: usize,
+    file: bool,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    Button::new(SharedString::from(format!("kv-mode-{ix}")))
+        .small()
+        .outline()
+        .label(if file {
+            tr!(cx, "文件", "File")
+        } else {
+            tr!(cx, "文本", "Text")
+        })
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_form_file_mode(active, ix, !file, cx);
+        }))
+}
+
+/// 认证：继承集合、无、Bearer、Basic、API 密钥。
+fn auth_editor(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let Some(tab) = this.tabs.get(active) else {
+        return div().into_any_element();
+    };
+    let kind = tab.auth_kind.clone();
+    let auth_in = tab.auth_in.clone();
+    let token = tab.auth_token.clone();
+    let username = tab.auth_username.clone();
+    let password = tab.auth_password.clone();
+    let key = tab.auth_key.clone();
+    let value = tab.auth_value.clone();
+    let choices = [
+        ("inherit", tr!(cx, "继承集合", "Inherit")),
+        ("none", tr!(cx, "无", "None")),
+        ("bearer", tr!(cx, "Bearer", "Bearer")),
+        ("basic", tr!(cx, "Basic", "Basic")),
+        ("apiKey", tr!(cx, "API 密钥", "API key")),
+    ];
+
+    v_flex()
+        .size_full()
+        .gap_3()
+        .id("request-auth")
+        .overflow_y_scroll()
+        .child(h_flex().gap_1().children(choices.map(|(id, label)| {
+            let selected = kind == id;
+            let button = Button::new(SharedString::from(format!("auth-kind-{id}")))
+                .small()
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_auth_kind(active, id, cx);
+                }));
+            if selected {
+                button.primary()
+            } else {
+                button.ghost()
+            }
+        })))
+        .child(match kind.as_str() {
+            "bearer" => labeled_input(cx, tr!(cx, "令牌", "Token"), &token),
+            "basic" => v_flex()
+                .gap_2()
+                .child(labeled_input(cx, tr!(cx, "用户名", "Username"), &username))
+                .child(labeled_input(cx, tr!(cx, "密码", "Password"), &password))
+                .into_any_element(),
+            "apiKey" => v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .children(["header", "query"].map(|location| {
+                            let selected = auth_in == location;
+                            let label = if location == "header" {
+                                tr!(cx, "请求头", "Header")
+                            } else {
+                                tr!(cx, "查询参数", "Query")
+                            };
+                            let button =
+                                Button::new(SharedString::from(format!("auth-in-{location}")))
+                                    .small()
+                                    .label(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.set_auth_in(active, location, cx);
+                                    }));
+                            if selected {
+                                button.primary()
+                            } else {
+                                button.ghost()
+                            }
+                        })),
+                )
+                .child(labeled_input(cx, tr!(cx, "键", "Key"), &key))
+                .child(labeled_input(cx, tr!(cx, "值", "Value"), &value))
+                .into_any_element(),
+            "none" => div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(tr!(
+                    cx,
+                    "这个请求不附带认证。",
+                    "This request sends no auth."
+                ))
+                .into_any_element(),
+            _ => div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(tr!(
+                    cx,
+                    "发送时使用所在集合的认证。",
+                    "Sending uses the collection's auth."
+                ))
+                .into_any_element(),
+        })
+        .into_any_element()
+}
+
+fn labeled_input(cx: &App, label: &'static str, input: &Entity<InputState>) -> AnyElement {
+    let theme = cx.theme().clone();
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label),
+        )
+        .child(Input::new(input).small())
+        .into_any_element()
+}
+
+fn pretty_json(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn compact_json(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    serde_json::to_string(&value).ok()
+}
+
+/// 请求体编辑器为空时的占位提示，随 body 类型切换。
+fn body_placeholder(kind: &str, cx: &App) -> SharedString {
+    match kind {
+        "json" => "{\"name\": \"value\"}".into(),
+        "raw" => tr!(cx, "输入原始文本内容", "Raw text content").into(),
+        _ => SharedString::default(),
+    }
+}
+
+fn response_from_history(detail: &HistoryDetail) -> Option<HttpResponse> {
+    let snap = detail.response_snapshot.as_ref()?;
+    let timing = snap
+        .get("timing")
+        .and_then(|value| serde_json::from_value::<Timing>(value.clone()).ok())
+        .unwrap_or_default();
+    let headers = snap
+        .get("headers")
+        .and_then(|value| {
+            serde_json::from_value::<BTreeMap<String, Vec<String>>>(value.clone()).ok()
+        })
+        .unwrap_or_default();
+    let body = detail.response_body.clone().or_else(|| {
+        snap.get("body")
+            .and_then(|value| value.as_str().map(str::to_string))
+    });
+    let unresolved = snap
+        .get("unresolvedVariables")
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+        .unwrap_or_default();
+    Some(HttpResponse {
+        task_id: detail.summary.id.clone(),
+        url: snap
+            .get("url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        status_code: snap
+            .get("statusCode")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u16,
+        status_text: snap
+            .get("statusText")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        headers,
+        body,
+        body_file_path: detail.response_body_file_path.clone(),
+        body_size: snap
+            .get("bodySize")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        content_type: snap
+            .get("contentType")
+            .and_then(|value| value.as_str().map(str::to_string)),
+        timing,
+        redirect_count: snap
+            .get("redirectCount")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as usize,
+        unresolved_variables: unresolved,
+    })
+}
+
 /// 请求体编辑器 + 类型选择。
 fn body_editor(
     this: &mut AppView,
@@ -1177,10 +1723,30 @@ fn body_editor(
                 )
                 .child(
                     div()
-                        .w(px(110.))
+                        .w(px(128.))
                         .flex_shrink_0()
                         .child(Select::new(&body_kind).small()),
-                ),
+                )
+                .when(kind == "json", |row| {
+                    row.child(
+                        Button::new("format-json")
+                            .ghost()
+                            .small()
+                            .label(tr!(cx, "格式化", "Format"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.format_json_body(active, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("compact-json")
+                            .ghost()
+                            .small()
+                            .label(tr!(cx, "压缩", "Compact"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.compact_json_body(active, window, cx);
+                            })),
+                    )
+                }),
         )
         .child(match kind {
             "none" => div()
@@ -1189,7 +1755,7 @@ fn body_editor(
                 .py_4()
                 .child(tr!(cx, "该请求没有请求体。", "This request has no body."))
                 .into_any_element(),
-            "form" => div()
+            "form" | "form-data" => div()
                 .flex_1()
                 .min_h_0()
                 .id("request-form")
@@ -1205,6 +1771,58 @@ fn body_editor(
                 .child(Editor::new(body).h_full())
                 .into_any_element(),
         })
+        .when(kind == "json", |column| {
+            column.child(json_status_line(&body.read(cx).value(), cx))
+        })
+        .into_any_element()
+}
+
+/// 请求体下方的一行状态：JSON 是否合法、顶层有几项。空内容不提示。
+fn json_status_line(text: &str, cx: &App) -> AnyElement {
+    let theme = cx.theme().clone();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return div().into_any_element();
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed);
+    let (line, color) = match &parsed {
+        Ok(serde_json::Value::Object(map)) => (
+            tr!(
+                cx,
+                format!("合法 JSON · 对象，{} 个键", map.len()),
+                format!("Valid JSON · object with {} keys", map.len())
+            )
+            .to_string(),
+            theme.success,
+        ),
+        Ok(serde_json::Value::Array(items)) => (
+            tr!(
+                cx,
+                format!("合法 JSON · 数组，{} 项", items.len()),
+                format!("Valid JSON · array with {} items", items.len())
+            )
+            .to_string(),
+            theme.success,
+        ),
+        Ok(_) => (
+            tr!(cx, "合法 JSON", "Valid JSON").to_string(),
+            theme.success,
+        ),
+        Err(error) => (
+            tr!(
+                cx,
+                format!("JSON 语法错误：{error}"),
+                format!("JSON syntax error: {error}")
+            )
+            .to_string(),
+            theme.danger,
+        ),
+    };
+    div()
+        .flex_shrink_0()
+        .text_xs()
+        .text_color(color)
+        .child(line)
         .into_any_element()
 }
 
@@ -1274,6 +1892,142 @@ impl AppView {
             tab.dirty = true;
             cx.notify();
         }
+    }
+
+    pub fn set_auth_kind(&mut self, tab_ix: usize, kind: &'static str, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        if tab.auth_kind == kind {
+            return;
+        }
+        tab.auth_kind = kind.to_string();
+        tab.dirty = true;
+        cx.notify();
+    }
+
+    pub fn set_auth_in(&mut self, tab_ix: usize, location: &'static str, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        if tab.auth_in == location {
+            return;
+        }
+        tab.auth_in = location.to_string();
+        tab.dirty = true;
+        cx.notify();
+    }
+
+    pub fn set_form_file_mode(
+        &mut self,
+        tab_ix: usize,
+        row_ix: usize,
+        file: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        let Some(row) = tab.form_fields.get_mut(row_ix) else {
+            return;
+        };
+        row.file = file;
+        if !file {
+            row.file_path = None;
+        }
+        tab.dirty = true;
+        cx.notify();
+    }
+
+    pub fn pick_form_file(
+        &mut self,
+        tab_ix: usize,
+        row_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择文件", "Choose a file").into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let text = path.to_string_lossy().into_owned();
+            view.update_in(cx, |view, window, cx| {
+                let Some(tab) = view.tabs.get_mut(tab_ix) else {
+                    return;
+                };
+                let Some(row) = tab.form_fields.get_mut(row_ix) else {
+                    return;
+                };
+                row.file = true;
+                row.file_path = Some(text.clone());
+                let input = row.value.clone();
+                input.update(cx, |state, cx| state.set_value(text, window, cx));
+                tab.dirty = true;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn format_json_body(&mut self, tab_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.rewrite_json_body(tab_ix, pretty_json, window, cx);
+    }
+
+    /// 压缩成单行 JSON，方便复制粘贴。
+    pub fn compact_json_body(
+        &mut self,
+        tab_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rewrite_json_body(tab_ix, compact_json, window, cx);
+    }
+
+    /// 用 `transform` 重写请求体；解析失败时在请求区显示错误，不改动原文。
+    fn rewrite_json_body(
+        &mut self,
+        tab_ix: usize,
+        transform: fn(&str) -> Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(tab_ix) else {
+            return;
+        };
+        let raw = tab.body.read(cx).value().to_string();
+        let rewritten = match transform(&raw) {
+            Some(text) => text,
+            None => {
+                let message = tr!(
+                    cx,
+                    "JSON 无法处理，请先改成合法的 JSON。",
+                    "Could not process JSON. Fix the syntax first."
+                )
+                .to_string();
+                if let Some(tab) = self.tabs.get_mut(tab_ix) {
+                    tab.error = Some(message);
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let body = tab.body.clone();
+        body.update(cx, |state, cx| state.set_value(rewritten, window, cx));
+        if let Some(tab) = self.tabs.get_mut(tab_ix) {
+            tab.error = None;
+            tab.dirty = true;
+        }
+        cx.notify();
     }
 
     /// 发送请求：tokio 上执行，回填响应。
@@ -1499,6 +2253,11 @@ pub fn watch_tab_edits(
         tab.rpc_method.clone(),
         tab.operation_name.clone(),
         tab.message.clone(),
+        tab.auth_token.clone(),
+        tab.auth_username.clone(),
+        tab.auth_password.clone(),
+        tab.auth_key.clone(),
+        tab.auth_value.clone(),
     ];
     for row in tab
         .params
@@ -1537,9 +2296,21 @@ pub fn watch_tab_edits(
         watches.push(cx.subscribe_in(
             &select,
             window,
-            |this, select, event: &SelectEvent<Vec<&'static str>>, _, cx| {
-                if matches!(event, SelectEvent::Confirm(_)) {
-                    mark_select_dirty(this, select, cx);
+            move |this, select, event: &SelectEvent<Vec<&'static str>>, window, cx| {
+                if !matches!(event, SelectEvent::Confirm(_)) {
+                    return;
+                }
+                mark_select_dirty(this, select, cx);
+                // 切换请求体类型时同步占位提示。
+                if let Some(tab) = this.tabs.get(tab_ix)
+                    && tab.body_kind == *select
+                {
+                    let kind = select.read(cx).selected_value().copied().unwrap_or("none");
+                    let placeholder = body_placeholder(kind, cx);
+                    let body = tab.body.clone();
+                    body.update(cx, |state, cx| {
+                        state.set_placeholder(placeholder, window, cx)
+                    });
                 }
             },
         ));
@@ -1566,6 +2337,11 @@ fn input_belongs(tab: &RequestTab, input: &Entity<InputState>) -> bool {
         || tab.rpc_method == *input
         || tab.operation_name == *input
         || tab.message == *input
+        || tab.auth_token == *input
+        || tab.auth_username == *input
+        || tab.auth_password == *input
+        || tab.auth_key == *input
+        || tab.auth_value == *input
         || tab
             .params
             .iter()

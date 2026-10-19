@@ -1,6 +1,7 @@
 //! 各主视图的渲染与交互，按视图拆分文件；处理器以 `impl AppView` 分布在各文件中。
 
 pub mod certificates;
+pub mod collection;
 pub mod content;
 pub mod environments;
 pub mod history;
