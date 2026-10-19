@@ -194,10 +194,19 @@ pub fn get(db: &DbState, id: &str) -> AppResult<HistoryDetail> {
         return Err(AppError::NotFound(format!("history entry not found: {id}")));
     };
 
+    let response_snapshot = response_snapshot
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
     let response_body = match response_body_path.as_deref() {
         Some(path) if Path::new(path).exists() => std::fs::read_to_string(path).ok(),
         _ => None,
     };
+    let response_body = response_body.or_else(|| {
+        response_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("body"))
+            .and_then(inline_snapshot_body)
+    });
 
     Ok(HistoryDetail {
         summary: HistorySummary {
@@ -215,12 +224,19 @@ pub fn get(db: &DbState, id: &str) -> AppResult<HistoryDetail> {
         workspace_path,
         request_snapshot: serde_json::from_str(&request_snapshot)
             .unwrap_or(Value::String(request_snapshot)),
-        response_snapshot: response_snapshot
-            .as_deref()
-            .and_then(|text| serde_json::from_str(text).ok()),
+        response_snapshot,
         response_body,
         response_body_file_path: response_body_path,
     })
+}
+
+/// 小响应正文写在快照的 `body` 里。文件里的大正文优先，不走这里。
+fn inline_snapshot_body(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// Deletes one entry and its response body file. Returns the removed body path.
@@ -246,6 +262,89 @@ pub fn delete(db: &DbState, id: &str) -> AppResult<Option<String>> {
         let _ = std::fs::remove_file(path);
     }
     Ok(body_path)
+}
+
+/// History rows that belong to one saved request, newest first.
+pub fn list_for_request(
+    db: &DbState,
+    workspace_path: &str,
+    request_path: &str,
+    limit: i64,
+) -> AppResult<Vec<HistorySummary>> {
+    let limit = limit.clamp(1, 200);
+    db.with_conn(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT id, protocol, name, method, url, status_code, duration_ms, created_at,
+                    request_file_path, response_body_path
+             FROM history_entries
+             WHERE workspace_path = ?1 AND request_file_path = ?2
+             ORDER BY created_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(params![workspace_path, request_path, limit], |row| {
+            let body_path: Option<String> = row.get(9)?;
+            Ok(HistorySummary {
+                id: row.get(0)?,
+                protocol: row.get(1)?,
+                name: row.get(2)?,
+                method: row.get(3)?,
+                url: row.get(4)?,
+                status_code: row.get(5)?,
+                duration_ms: row.get(6)?,
+                created_at: row.get(7)?,
+                request_file_path: row.get(8)?,
+                has_body_file: body_path.is_some(),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+}
+
+/// Points one request's history rows at its new file path after a move.
+pub fn retarget_request(
+    db: &DbState,
+    workspace_path: &str,
+    from: &str,
+    to: &str,
+) -> AppResult<i64> {
+    db.with_conn(|conn| {
+        let count = conn.execute(
+            "UPDATE history_entries
+             SET request_file_path = ?1
+             WHERE workspace_path = ?2 AND request_file_path = ?3",
+            params![to, workspace_path, from],
+        )?;
+        Ok(count as i64)
+    })
+}
+
+/// Deletes every history row for one request file. Other requests are left alone.
+pub fn clear_for_request(db: &DbState, workspace_path: &str, request_path: &str) -> AppResult<i64> {
+    let body_paths: Vec<String> = db.with_conn(|conn| {
+        let mut statement = conn.prepare(
+            "SELECT response_body_path FROM history_entries
+             WHERE workspace_path = ?1 AND request_file_path = ?2
+               AND response_body_path IS NOT NULL",
+        )?;
+        let rows = statement.query_map(params![workspace_path, request_path], |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })?;
+
+    let deleted = db.with_conn(|conn| {
+        let count = conn.execute(
+            "DELETE FROM history_entries
+             WHERE workspace_path = ?1 AND request_file_path = ?2",
+            params![workspace_path, request_path],
+        )?;
+        Ok(count as i64)
+    })?;
+
+    for path in body_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(deleted)
 }
 
 /// Clears entries, optionally only those older than `before_timestamp`.
@@ -364,6 +463,68 @@ mod tests {
         assert_eq!(detail.response_snapshot.unwrap()["statusCode"], 200);
 
         assert_eq!(get(&db, "missing").unwrap_err().code(), "NOT_FOUND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_and_clear_are_scoped_to_one_request() {
+        let (db, _dir) = temp_db("scoped");
+        let mut first = entry("/ws");
+        first.request_file_path = Some("api/a.http.json".into());
+        let mut second = entry("/ws");
+        second.request_file_path = Some("api/b.http.json".into());
+        insert(&db, &first).unwrap();
+        insert(&db, &second).unwrap();
+
+        let listed = list_for_request(&db, "/ws", "api/a.http.json", 20).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].request_file_path.as_deref(),
+            Some("api/a.http.json")
+        );
+
+        assert_eq!(
+            retarget_request(&db, "/ws", "api/a.http.json", "api/v2/a.http.json").unwrap(),
+            1
+        );
+        assert!(
+            list_for_request(&db, "/ws", "api/a.http.json", 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_for_request(&db, "/ws", "api/v2/a.http.json", 20)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            clear_for_request(&db, "/ws", "api/v2/a.http.json").unwrap(),
+            1
+        );
+        assert!(
+            list_for_request(&db, "/ws", "api/v2/a.http.json", 20)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_for_request(&db, "/ws", "api/b.http.json", 20)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reads_inline_response_body_from_snapshot() {
+        let (db, dir) = temp_db("inline-body");
+        let mut item = entry("/ws");
+        item.response_snapshot = Some(r#"{"statusCode":200,"body":"hello"}"#.into());
+        item.response_body_path = None;
+        let id = insert(&db, &item).unwrap();
+        let detail = get(&db, &id).unwrap();
+        assert_eq!(detail.response_body.as_deref(), Some("hello"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

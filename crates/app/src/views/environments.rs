@@ -56,47 +56,39 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
         .flex_1()
         .min_h_0()
         .gap_3()
-        .px_6()
-        .py_4()
-        .child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .child(
-                    div().text_xs().text_color(theme.muted_foreground).child(
-                        tr!(
-                            cx,
-                            "变量写入 environments/*.env.json；机密值加密保存在本地，不进 Git。",
-                            "Variables are written to environments/*.env.json. Secrets are encrypted locally and are not committed."
-                        ),
-                    ),
-                )
-                .child(
-                    Button::new("new-environment")
-                        .outline()
-                        .small()
-                        .icon(IconName::Plus)
-                        .label(tr!(cx, "新建环境", "New environment"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.create_environment(window, cx);
-                        })),
-                ),
-        )
-        .child(
-            h_flex()
-                .flex_1()
+        .px_4()
+        .py_3()
+        .child(widgets::page_header(
+            cx,
+            tr!(cx, "环境", "Environments"),
+            tr!(
+                cx,
+                "变量写入 environments/*.env.json；机密值加密保存在本地，不进 Git。",
+                "Variables are written to environments/*.env.json. Secrets are encrypted locally and are not committed."
+            ),
+            vec![Button::new("new-environment")
+                .outline()
+                .small()
+                .icon(IconName::Plus)
+                .label(tr!(cx, "新建环境", "New environment"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.create_environment(window, cx);
+                }))],
+        ))
+        .child({
+            let selected_path = this.environment.selected_path.clone();
+            widgets::horizontal_split(
+            "env-split",
+            280.,
+            v_flex()
+                .size_full()
                 .min_h_0()
-                .gap_3()
-                // 环境列表
-                .child(
-                    v_flex()
-                        .w(px(260.))
-                        .flex_shrink_0()
-                        .min_h_0()
-                        .id("env-list")
-                        .overflow_y_scroll()
-                        .gap_1()
-                        .children(summaries.into_iter().map(|(ix, summary)| {
+                .id("env-list")
+                .overflow_y_scroll()
+                .gap_0p5()
+                .pr_2()
+                .children(summaries.into_iter().map(|(ix, summary)| {
+                            let selected = selected_path.as_deref() == Some(summary.path.as_str());
                             v_flex()
                                 .id(SharedString::from(format!("env-item-{ix}")))
                                 .gap_0p5()
@@ -104,7 +96,8 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                                 .py_1p5()
                                 .rounded_md()
                                 .cursor_pointer()
-                                .hover(|this| this.bg(theme.muted))
+                                .when(selected, |this| this.bg(theme.accent))
+                                .when(!selected, |this| this.hover(|this| this.bg(theme.muted)))
                                 .child(
                                     h_flex()
                                         .justify_between()
@@ -143,17 +136,20 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                                         this.select_environment(ix, window, cx);
                                     },
                                 ))
-                        })),
-                )
-                // 详情
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .child(detail_view(this, cx)),
-                ),
-        )
+                        }))
+                        .into_any_element(),
+            div()
+                .size_full()
+                .min_h_0()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .p_3()
+                .child(detail_view(this, cx))
+                .into_any_element(),
+            )
+        })
         .into_any_element()
 }
 

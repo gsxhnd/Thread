@@ -112,6 +112,75 @@ pub fn update_collection(
     Ok(meta)
 }
 
+/// 把请求文件移到另一个集合目录，返回新的工作区相对路径。
+pub fn move_request_file(
+    root: &Path,
+    source_rel: &str,
+    dest_collection: &str,
+) -> AppResult<String> {
+    let source = layout::resolve_inside(root, source_rel)?;
+    if !source.is_file() {
+        return Err(AppError::NotFound(format!(
+            "request not found: {source_rel}"
+        )));
+    }
+    let dest_dir = if dest_collection.is_empty() {
+        root.to_path_buf()
+    } else {
+        layout::resolve_inside(root, dest_collection)?
+    };
+    if !dest_dir.is_dir() {
+        return Err(AppError::NotFound(format!(
+            "collection not found: {dest_collection}"
+        )));
+    }
+    let file_name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_name.clone());
+    let extension = Path::new(&file_name)
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+    let dest = layout::unique_path(&dest_dir, &stem, &extension);
+    fs::rename(&source, &dest).map_err(|error| AppError::Io(error.to_string()))?;
+    Ok(layout::to_relative_string(root, &dest))
+}
+
+/// 写入集合里请求的显示顺序。没有 `collection.json` 时会建一份。
+pub fn set_request_order(root: &Path, collection_rel: &str, order: &[String]) -> AppResult<()> {
+    let dir = if collection_rel.is_empty() {
+        root.to_path_buf()
+    } else {
+        layout::resolve_inside(root, collection_rel)?
+    };
+    if !dir.is_dir() {
+        return Err(AppError::NotFound(format!(
+            "collection not found: {collection_rel}"
+        )));
+    }
+    let meta_path = dir.join(layout::COLLECTION_FILE);
+    let folder_name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| collection_rel.to_string());
+    let mut meta = if meta_path.exists() {
+        files::read_json::<CollectionMeta>(&meta_path)?
+    } else {
+        CollectionMeta::new(&folder_name)
+    };
+    if meta.id.is_none() {
+        meta.id = Some(new_id());
+    }
+    meta.request_order = order.to_vec();
+    files::write_json(&meta_path, &meta)?;
+    Ok(())
+}
+
 pub fn delete_collection(root: &Path, rel: &str, trash_root: &Path) -> AppResult<String> {
     let dir = layout::resolve_inside(root, rel)?;
     if dir == root {

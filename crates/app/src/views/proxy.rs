@@ -63,6 +63,11 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
         .collect();
     let entry_count = entries.len();
     let total_count = this.proxy.entries.len();
+    let selected_id = this
+        .proxy
+        .selected
+        .as_ref()
+        .map(|detail| detail.summary.id.clone());
 
     // 列表展示为倒序（最新在上）。
     let rows: Vec<AnyElement> = entries
@@ -73,6 +78,7 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
             let status_color = status_color(entry.status_code.map(|code| code as i64), &colors);
             let label = format!("{}{}", entry.host, entry.path);
             let entry_id = entry.id.clone();
+            let selected = selected_id.as_deref() == Some(entry.id.as_str());
             h_flex()
                 .id(("proxy-entry", ix))
                 .items_center()
@@ -81,7 +87,8 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                 .py_1()
                 .rounded_sm()
                 .cursor_pointer()
-                .hover(|this| this.bg(theme.muted))
+                .when(selected, |this| this.bg(theme.accent))
+                .when(!selected, |this| this.hover(|this| this.bg(theme.muted)))
                 .child(
                     div()
                         .text_xs()
@@ -150,8 +157,8 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
         .flex_1()
         .min_h_0()
         .gap_3()
-        .px_6()
-        .py_4()
+        .px_4()
+        .py_3()
         .child(
             // 控制行
             h_flex()
@@ -333,41 +340,42 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                 ),
         )
         .child(
-            // 流量表 + 详情
-            h_flex()
-                .flex_1()
-                .min_h_0()
-                .gap_3()
-                .child(
-                    v_flex()
-                        .w(px(420.))
-                        .flex_shrink_0()
-                        .min_h_0()
-                        .id("proxy-entries")
-                        .overflow_y_scroll()
-                        .gap_0p5()
-                        .when(rows.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .py_4()
-                                    .child(tr!(
-                                        cx,
-                                        "还没有流量。把 HTTP 客户端指向本机代理即可抓包。",
-                                        "No traffic yet. Point an HTTP client at this proxy to capture it."
-                                    )),
-                            )
-                        })
-                        .children(rows),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .child(detail_view(this, cx)),
-                ),
+            widgets::horizontal_split(
+                "proxy-split",
+                460.,
+                v_flex()
+                    .size_full()
+                    .min_h_0()
+                    .id("proxy-entries")
+                    .overflow_y_scroll()
+                    .gap_0p5()
+                    .pr_2()
+                    .when(rows.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .py_4()
+                                .child(tr!(
+                                    cx,
+                                    "还没有流量。把 HTTP 客户端指向本机代理即可抓包。",
+                                    "No traffic yet. Point an HTTP client at this proxy to capture it."
+                                )),
+                        )
+                    })
+                    .children(rows)
+                    .into_any_element(),
+                div()
+                    .size_full()
+                    .min_h_0()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
+                    .p_3()
+                    .child(detail_view(this, cx))
+                    .into_any_element(),
+            ),
         )
         .into_any_element()
 }

@@ -24,9 +24,6 @@ pub fn render(this: &mut AppView, _: &mut Window, cx: &mut Context<AppView>) -> 
                 .gap_3()
                 .px_3()
                 .py_2()
-                .rounded_md()
-                .border_1()
-                .border_color(theme.border)
                 .hover(|this| this.bg(theme.accent))
                 .cursor_pointer()
                 .child(Icon::new(IconName::Folder).small())
@@ -135,7 +132,15 @@ pub fn render(this: &mut AppView, _: &mut Window, cx: &mut Context<AppView>) -> 
                                     .text_color(theme.muted_foreground)
                                     .child(tr!(cx, "最近打开", "Recent")),
                             )
-                            .child(v_flex().gap_2().children(recents)),
+                            .child(
+                                v_flex()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.secondary)
+                                    .overflow_hidden()
+                                    .children(recents),
+                            ),
                     )
                 })
                 .child(

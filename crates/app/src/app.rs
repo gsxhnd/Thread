@@ -9,11 +9,16 @@ use std::sync::Arc;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{EditorState, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::select::SelectState;
-use gpui_kit::component::{ActiveTheme as _, TitleBar, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex, h_resizable, resizable_panel,
+    v_flex,
+};
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Context, Entity, FontWeight, Global, IntoElement as _,
+    AnyWindowHandle, AppContext as _, Context, Entity, Global, IntoElement as _,
     ParentElement as _, PathPromptOptions, Render, Styled as _, Subscription, Task, WeakEntity,
     Window, div, px,
 };
@@ -34,8 +39,22 @@ pub struct SessionLine {
     pub text: String,
 }
 
+/// 还没写入历史库的一次发送，挂在临时请求的时间线上。
+#[derive(Clone, Debug)]
+pub struct LocalRun {
+    pub id: String,
+    pub at: i64,
+    pub status: u16,
+    pub duration_ms: i64,
+    pub url: String,
+}
+
 /// 一个打开的请求标签页（保存的请求或临时请求）。
 pub struct RequestTab {
+    /// 标签页自己的 id。关闭按钮用它，不用下标，避免关一个时把旁边的标签一起关掉。
+    pub id: String,
+    /// 编辑框的订阅。内容一变就标成未保存，关掉标签时一起释放。
+    pub edit_watches: Vec<Subscription>,
     /// 工作区相对路径；`None` 表示尚未保存的临时请求。
     pub path: Option<String>,
     pub name: String,
@@ -43,6 +62,10 @@ pub struct RequestTab {
     pub protocol: views::request::Protocol,
     pub method: Entity<SelectState<Vec<&'static str>>>,
     pub url: Entity<InputState>,
+    /// 地址栏变量补全的订阅，随标签页一起释放。
+    pub url_watch: Option<Subscription>,
+    /// 临时请求的时间线。保存进工作区之后改走历史库。
+    pub local_runs: Vec<LocalRun>,
     pub params: Vec<views::request::KvRow>,
     pub headers: Vec<views::request::KvRow>,
     /// 表单请求体，和查询参数分开存。
@@ -125,11 +148,21 @@ pub struct AppView {
     pub workspace: Entity<WorkspaceModel>,
     pub view: MainView,
     pub theme: ThemePreference,
-    #[allow(dead_code)] // 预留给折叠侧边栏
     pub sidebar_collapsed: bool,
+    pub editor_layout: crate::theme::EditorLayout,
+    /// 正在询问要不要关闭的标签。避免同一次点击弹出两次。
+    closing_tab: Option<String>,
+    /// 临时请求保存成功后要关掉的标签 id。
+    pub(crate) close_after_save: Option<String>,
     pub tree: Entity<gpui_kit::component::tree::TreeState>,
     pub tabs: Vec<RequestTab>,
     pub active_tab: Option<usize>,
+    pub url_assist: views::url_vars::UrlAssist,
+    /// 同一次点击里只关一个标签。
+    tab_close_armed: bool,
+    /// 当前请求时间线（历史库里属于这个文件的记录）。
+    pub timeline: Vec<thread_core::services::history::HistorySummary>,
+    pub timeline_for: Option<String>,
     pub proxy: ProxyPane,
     pub history: HistoryPane,
     pub environment: EnvironmentPane,
@@ -167,6 +200,7 @@ impl AppView {
                     WorkspaceEvent::Changed => {
                         // 打开/刷新/关闭后重建各页数据。
                         this.reload_after_workspace_change(cx);
+                        views::url_vars::resync_open_urls(this, window, cx);
                     }
                     WorkspaceEvent::Failed(message) => {
                         window.push_notification(
@@ -212,6 +246,8 @@ impl AppView {
         let workspace_root = workspace.read(cx).root();
 
         let theme_pref = theme::stored(&core.config);
+        let sidebar_collapsed = theme::sidebar_collapsed(&core.config);
+        let editor_layout = theme::editor_layout(&core.config);
 
         let mut view = Self {
             proxy: ProxyPane {
@@ -251,10 +287,17 @@ impl AppView {
             workspace,
             view: MainView::Request,
             theme: theme_pref,
-            sidebar_collapsed: false,
+            sidebar_collapsed,
+            editor_layout,
+            closing_tab: None,
+            close_after_save: None,
             tree,
             tabs: Vec::new(),
             active_tab: None,
+            url_assist: views::url_vars::UrlAssist::default(),
+            tab_close_armed: false,
+            timeline: Vec::new(),
+            timeline_for: None,
             _watch: None,
             _subscriptions: subscriptions,
         };
@@ -450,6 +493,9 @@ impl AppView {
             .iter()
             .position(|tab| tab.path.as_deref() == Some(&node.path))
         {
+            // 标签已经开着时也要回到请求页。停在环境页时再点同一个请求，
+            // 只改 active_tab 会让主区域继续停在环境页。
+            self.view = crate::state::MainView::Request;
             self.active_tab = Some(existing);
             cx.notify();
             return;
@@ -472,6 +518,11 @@ impl AppView {
                 view.view = crate::state::MainView::Request;
                 view.tabs.push(tab);
                 view.active_tab = Some(view.tabs.len() - 1);
+                if let Some(url) = view.tabs.last().map(|tab| tab.url.clone()) {
+                    views::url_vars::watch_request_url(view, url, window, cx);
+                }
+                let index = view.tabs.len() - 1;
+                views::request::watch_tab_edits(view, index, window, cx);
                 cx.notify();
             })
             .ok();
@@ -494,13 +545,126 @@ impl AppView {
         self.view = crate::state::MainView::Request;
         self.tabs.push(RequestTab::draft(protocol, window, cx));
         self.active_tab = Some(self.tabs.len() - 1);
+        if let Some(url) = self.tabs.last().map(|tab| tab.url.clone()) {
+            views::url_vars::watch_request_url(self, url, window, cx);
+        }
+        let index = self.tabs.len() - 1;
+        views::request::watch_tab_edits(self, index, window, cx);
         cx.notify();
     }
 
-    pub fn close_tab(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() {
+    pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_close_armed || index >= self.tabs.len() || self.closing_tab.is_some() {
             return;
         }
+        let tab_id = self.tabs[index].id.clone();
+        let dirty = self.tabs[index].dirty;
+        let has_path = self.tabs[index].path.is_some();
+        if !dirty {
+            self.finish_close_tab(index, cx);
+            return;
+        }
+        self.closing_tab = Some(tab_id.clone());
+        let name = self.tabs[index].name.clone();
+        let weak = cx.entity().downgrade();
+        let title = tr!(
+            cx,
+            format!("“{name}”还有未保存的修改"),
+            format!("“{name}” has unsaved changes")
+        );
+        let detail = tr!(
+            cx,
+            "保存后再关闭，或者放弃这些修改。",
+            "Save before closing, or discard the changes."
+        );
+        let save_label = tr!(cx, "保存并关闭", "Save and close");
+        let discard_label = tr!(cx, "不保存", "Don't save");
+        let cancel_label = tr!(cx, "取消", "Cancel");
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let weak_escape = weak.clone();
+            let weak_cancel = weak.clone();
+            let weak_discard = weak.clone();
+            let weak_save = weak.clone();
+            let discard_id = tab_id.clone();
+            let save_id = tab_id.clone();
+            alert
+                .title(title.to_string())
+                .description(detail)
+                .w(px(420.))
+                .on_cancel(move |_, _, cx| {
+                    let _ = weak_escape.update(cx, |view, cx| {
+                        view.closing_tab = None;
+                        cx.notify();
+                    });
+                    true
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("unsaved-cancel")
+                                .label(cancel_label)
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak_cancel.update(cx, |view, cx| {
+                                        view.closing_tab = None;
+                                        cx.notify();
+                                    });
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(
+                            Button::new("unsaved-discard")
+                                .label(discard_label)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = weak_discard.update(cx, |view, cx| {
+                                        view.closing_tab = None;
+                                        let Some(index) =
+                                            view.tabs.iter().position(|tab| tab.id == discard_id)
+                                        else {
+                                            return;
+                                        };
+                                        view.finish_close_tab(index, cx);
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("unsaved-save")
+                                .primary()
+                                .label(save_label)
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = weak_save.update(cx, |view, cx| {
+                                        view.closing_tab = None;
+                                        let Some(index) =
+                                            view.tabs.iter().position(|tab| tab.id == save_id)
+                                        else {
+                                            return;
+                                        };
+                                        if has_path {
+                                            view.save_request(index, window, cx);
+                                            view.finish_close_tab(index, cx);
+                                        } else {
+                                            view.close_after_save = Some(save_id.clone());
+                                            view.save_request_as(index, window, cx);
+                                        }
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+
+    pub(crate) fn finish_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.tab_close_armed || index >= self.tabs.len() {
+            return;
+        }
+        self.tab_close_armed = true;
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |view, _| {
+                view.tab_close_armed = false;
+            });
+        })
+        .detach();
         if let Some(task_id) = self.tabs[index].task_id.clone() {
             self.core.cancel_http(&task_id);
         }
@@ -517,6 +681,50 @@ impl AppView {
             Some(active) if active > index => Some(active - 1),
             other => other,
         };
+        cx.notify();
+    }
+
+    /// Ctrl/Cmd+S：保存当前请求。临时请求会写成工作区里的新文件。
+    pub fn save_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view != crate::state::MainView::Request {
+            return;
+        }
+        let Some(index) = self.active_tab else {
+            return;
+        };
+        if self
+            .tabs
+            .get(index)
+            .and_then(|tab| tab.path.as_ref())
+            .is_some()
+        {
+            self.save_request(index, window, cx);
+        } else if index < self.tabs.len() {
+            self.save_request_as(index, window, cx);
+        }
+    }
+
+    pub fn set_editor_layout(
+        &mut self,
+        layout: crate::theme::EditorLayout,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_layout = layout;
+        theme::store_editor_layout(&self.core.config, layout);
+        cx.notify();
+    }
+
+    pub fn toggle_editor_layout(&mut self, cx: &mut Context<Self>) {
+        let next = match self.editor_layout {
+            theme::EditorLayout::Stacked => theme::EditorLayout::Columns,
+            theme::EditorLayout::Columns => theme::EditorLayout::Stacked,
+        };
+        self.set_editor_layout(next, cx);
+    }
+
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        theme::store_sidebar_collapsed(&self.core.config, self.sidebar_collapsed);
         cx.notify();
     }
 
@@ -782,7 +990,27 @@ impl AppView {
             ThemePreference::Dark => IconName::Moon,
         };
         let open = self.workspace.read(cx).is_open();
-        let mut buttons = vec![
+        let layout_icon = match self.editor_layout {
+            theme::EditorLayout::Stacked => IconName::Rows2,
+            theme::EditorLayout::Columns => IconName::Columns2,
+        };
+        let mut buttons = Vec::new();
+        if open {
+            buttons.push(
+                Button::new("editor-layout")
+                    .ghost()
+                    .icon(layout_icon)
+                    .tooltip(match self.editor_layout {
+                        theme::EditorLayout::Stacked => tr!(cx, "上下布局", "Stacked layout"),
+                        theme::EditorLayout::Columns => tr!(cx, "左右布局", "Side by side layout"),
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_editor_layout(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        buttons.push(
             Button::new("open-settings")
                 .ghost()
                 .icon(IconName::Settings)
@@ -791,6 +1019,8 @@ impl AppView {
                     this.open_settings(window, cx);
                 }))
                 .into_any_element(),
+        );
+        buttons.push(
             Button::new("theme-toggle")
                 .ghost()
                 .icon(theme_icon)
@@ -803,7 +1033,7 @@ impl AppView {
                     this.set_theme(next, window, cx);
                 }))
                 .into_any_element(),
-        ];
+        );
 
         if open {
             buttons.push(
@@ -821,6 +1051,74 @@ impl AppView {
     }
 }
 
+fn workspace_switcher(
+    this: &AppView,
+    workspace_name: Option<String>,
+    cx: &mut Context<AppView>,
+) -> impl gpui_kit::IntoElement {
+    let weak = cx.entity().downgrade();
+    let recents = this.core.config.session().recent_workspaces;
+    let current = this
+        .workspace
+        .read(cx)
+        .root()
+        .map(|path| path.to_string_lossy().into_owned());
+    let label =
+        workspace_name.unwrap_or_else(|| tr!(cx, "选择工作区", "Choose workspace").to_string());
+
+    Button::new("workspace-switch")
+        .ghost()
+        .small()
+        .label(label)
+        .dropdown_menu(move |menu, _, cx| {
+            let mut menu = menu;
+            if recents.is_empty() {
+                menu = menu.item(PopupMenuItem::new(tr!(
+                    cx,
+                    "还没有最近的工作区",
+                    "No recent workspaces"
+                )));
+            }
+            for recent in &recents {
+                let path = std::path::PathBuf::from(&recent.path);
+                let weak = weak.clone();
+                let selected = current.as_deref() == Some(recent.path.as_str());
+                let name = if selected {
+                    format!("✓ {}", recent.name)
+                } else {
+                    recent.name.clone()
+                };
+                menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _, cx| {
+                    let path = path.clone();
+                    let _ = weak.update(cx, |view, cx| view.open_workspace_path(path, cx));
+                }));
+            }
+            let open_weak = weak.clone();
+            let create_weak = weak.clone();
+            menu.separator()
+                .item(
+                    PopupMenuItem::new(tr!(cx, "打开工作区…", "Open workspace…")).on_click(
+                        move |_, window, cx| {
+                            let _ = open_weak.update_in(cx, |view, window, cx| {
+                                view.prompt_open_workspace(window, cx);
+                            });
+                            let _ = window;
+                        },
+                    ),
+                )
+                .item(
+                    PopupMenuItem::new(tr!(cx, "新建工作区…", "New workspace…")).on_click(
+                        move |_, window, cx| {
+                            let _ = create_weak.update_in(cx, |view, window, cx| {
+                                view.prompt_create_workspace(window, cx);
+                            });
+                            let _ = window;
+                        },
+                    ),
+                )
+        })
+}
+
 impl Render for AppView {
     fn render(
         &mut self,
@@ -828,12 +1126,11 @@ impl Render for AppView {
         cx: &mut Context<Self>,
     ) -> impl gpui_kit::IntoElement {
         let theme = cx.theme().clone();
-        let name = self
+        let workspace_name = self
             .workspace
             .read(cx)
             .index()
-            .map(|index| index.name.clone())
-            .unwrap_or_else(|| tr!(cx, "Thread / 灰线", "Thread").to_string());
+            .map(|index| index.name.clone());
 
         v_flex()
             .size_full()
@@ -843,33 +1140,50 @@ impl Render for AppView {
                 TitleBar::new()
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap_1()
+                            .items_center()
                             .child(
-                                div()
-                                    .size_5()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_sm()
-                                    .bg(theme.primary)
-                                    .text_color(theme.primary_foreground)
-                                    .text_size(px(11.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .child(tr!(cx, "灰", "T")),
+                                Button::new("sidebar-toggle")
+                                    .ghost()
+                                    .icon(if self.sidebar_collapsed {
+                                        IconName::PanelLeftOpen
+                                    } else {
+                                        IconName::PanelLeftClose
+                                    })
+                                    .tooltip(if self.sidebar_collapsed {
+                                        tr!(cx, "展开侧边栏", "Show sidebar")
+                                    } else {
+                                        tr!(cx, "收起侧边栏", "Hide sidebar")
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_sidebar(cx);
+                                    })),
                             )
-                            .child(div().text_sm().child(name)),
+                            .child(workspace_switcher(self, workspace_name, cx)),
                     )
                     .child(h_flex().gap_1().children(self.titlebar_trailing(cx))),
             )
             .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(
                 if self.workspace.read(cx).is_open() {
-                    h_flex()
+                    div()
                         .size_full()
-                        // h_flex 默认垂直居中。内容列比窗口矮时顶部会空出一大块，
-                        // 比窗口高时页头会被裁掉。拉满高度后各页从顶部排起。
-                        .items_stretch()
-                        .child(views::sidebar::render(self, window, cx))
-                        .child(views::content::render(self, window, cx))
+                        .child(
+                            h_resizable("app-sidebar")
+                                .child(
+                                    resizable_panel()
+                                        .visible(!self.sidebar_collapsed)
+                                        .size(px(240.))
+                                        .size_range(px(180.)..px(480.))
+                                        .child(
+                                            views::sidebar::render(self, window, cx)
+                                                .into_any_element(),
+                                        ),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .child(views::content::render(self, window, cx)),
+                                ),
+                        )
                         .into_any_element()
                 } else {
                     views::welcome::render(self, window, cx).into_any_element()

@@ -28,6 +28,7 @@ use thread_core::workspace::formats::AuthSpec;
 use crate::app::AppView;
 use crate::views::request::{self, EditorPane, KvKind, Protocol};
 use crate::views::response;
+use crate::widgets;
 
 pub fn body(
     this: &mut AppView,
@@ -78,25 +79,30 @@ fn graphql_body(
     v_flex()
         .flex_1()
         .min_h_0()
-        .gap_2()
-        .child(toolbar(
-            this,
-            active,
-            &url,
-            if connected {
-                LiveAction::Stop
-            } else {
-                LiveAction::Graphql
-            },
-            if connected {
-                tr!(cx, "停止订阅", "Stop subscription")
-            } else {
-                tr!(cx, "发送", "Send")
-            },
-            has_path,
-            cx,
+        .child(widgets::band(
+            theme.border,
+            theme.background,
+            toolbar(
+                this,
+                active,
+                &url,
+                if connected {
+                    LiveAction::Stop
+                } else {
+                    LiveAction::Graphql
+                },
+                if connected {
+                    tr!(cx, "停止订阅", "Stop subscription")
+                } else {
+                    tr!(cx, "发送", "Send")
+                },
+                has_path,
+                cx,
+            ),
         ))
-        .child(
+        .child(widgets::band(
+            theme.border,
+            theme.background,
             h_flex().gap_2().child(
                 Button::new("gql-schema")
                     .outline()
@@ -107,9 +113,13 @@ fn graphql_body(
                         send_graphql(this, active, true, cx);
                     })),
             ),
-        )
+        ))
         .when_some(error, |this, error| {
-            this.child(crate::widgets::notice_line(cx, error))
+            this.child(widgets::band(
+                theme.border,
+                theme.background,
+                crate::widgets::notice_line(cx, error),
+            ))
         })
         .child(pane_bar(
             this,
@@ -122,25 +132,29 @@ fn graphql_body(
             ],
             cx,
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(140.))
-                .min_h_0()
-                .id("gql-editor")
-                .overflow_y_scroll()
-                .child(match pane {
-                    EditorPane::Primary => editor_box(&body, &theme),
-                    EditorPane::Secondary => editor_box(&variables, &theme),
-                    EditorPane::Headers => request::kv_editor(this, active, KvKind::Headers, cx),
-                }),
-        )
         .when(
             !suggestions.is_empty() && pane == EditorPane::Primary,
             |parent| parent.child(suggestion_row(this, active, &suggestions, window, cx)),
         )
-        .child(session_log(this, active, cx))
-        .child(response::render(this, active, window, cx))
+        .child(widgets::editor_split(
+            theme.muted,
+            this.editor_layout == crate::theme::EditorLayout::Stacked,
+            if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                "gql-editor-split"
+            } else {
+                "gql-editor-split-side"
+            },
+            filling_editor(match pane {
+                EditorPane::Primary => editor_box(&body, &theme),
+                EditorPane::Secondary => editor_box(&variables, &theme),
+                EditorPane::Headers => widgets::pane_frame(
+                    theme.border,
+                    theme.background,
+                    request::kv_editor(this, active, KvKind::Headers, cx),
+                ),
+            }),
+            activity_pane(this, active, window, cx),
+        ))
         .into_any_element()
 }
 
@@ -163,21 +177,26 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
     v_flex()
         .flex_1()
         .min_h_0()
-        .gap_2()
-        .child(toolbar(
-            this,
-            active,
-            &url,
-            LiveAction::Websocket,
-            if connected {
-                tr!(cx, "断开", "Disconnect")
-            } else {
-                tr!(cx, "连接", "Connect")
-            },
-            has_path,
-            cx,
+        .child(widgets::band(
+            theme.border,
+            theme.background,
+            toolbar(
+                this,
+                active,
+                &url,
+                LiveAction::Websocket,
+                if connected {
+                    tr!(cx, "断开", "Disconnect")
+                } else {
+                    tr!(cx, "连接", "Connect")
+                },
+                has_path,
+                cx,
+            ),
         ))
-        .child(
+        .child(widgets::band(
+            theme.border,
+            theme.background,
             h_flex()
                 .gap_3()
                 .items_center()
@@ -214,9 +233,13 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
                         .text_color(theme.muted_foreground)
                         .child(tr!(cx, "按二进制发送（Base64）", "Send as binary (Base64)")),
                 ),
-        )
+        ))
         .when_some(error, |this, error| {
-            this.child(crate::widgets::notice_line(cx, error))
+            this.child(widgets::band(
+                theme.border,
+                theme.background,
+                crate::widgets::notice_line(cx, error),
+            ))
         })
         .child(pane_bar(
             this,
@@ -228,24 +251,38 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
             ],
             cx,
         ))
-        .child(match pane {
-            EditorPane::Headers => request::kv_editor(this, active, KvKind::Headers, cx),
-            _ => h_flex()
-                .gap_2()
-                .items_center()
-                .child(div().flex_1().child(Input::new(&message).small()))
-                .child(
-                    Button::new("ws-send")
-                        .outline()
-                        .small()
-                        .label(tr!(cx, "发送", "Send"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            send_ws_message(this, active, window, cx);
-                        })),
-                )
-                .into_any_element(),
-        })
-        .child(session_log(this, active, cx))
+        .child(widgets::editor_split(
+            theme.muted,
+            this.editor_layout == crate::theme::EditorLayout::Stacked,
+            if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                "ws-editor-split"
+            } else {
+                "ws-editor-split-side"
+            },
+            match pane {
+                EditorPane::Headers => filling_editor(widgets::pane_frame(
+                    theme.border,
+                    theme.background,
+                    request::kv_editor(this, active, KvKind::Headers, cx),
+                )),
+                _ => h_flex()
+                    .flex_shrink_0()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().child(Input::new(&message).small()))
+                    .child(
+                        Button::new("ws-send")
+                            .outline()
+                            .small()
+                            .label(tr!(cx, "发送", "Send"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                send_ws_message(this, active, window, cx);
+                            })),
+                    )
+                    .into_any_element(),
+            },
+            Some(session_log(this, active, true, cx)),
+        ))
         .into_any_element()
 }
 
@@ -279,27 +316,32 @@ fn grpc_body(
     v_flex()
         .flex_1()
         .min_h_0()
-        .gap_2()
-        .child(toolbar(
-            this,
-            active,
-            &url,
-            if connected {
-                LiveAction::Stop
-            } else {
-                LiveAction::Grpc
-            },
-            if connected {
-                tr!(cx, "取消流", "Cancel stream")
-            } else if streaming {
-                tr!(cx, "打开流", "Open stream")
-            } else {
-                tr!(cx, "调用", "Call")
-            },
-            has_path,
-            cx,
+        .child(widgets::band(
+            theme.border,
+            theme.background,
+            toolbar(
+                this,
+                active,
+                &url,
+                if connected {
+                    LiveAction::Stop
+                } else {
+                    LiveAction::Grpc
+                },
+                if connected {
+                    tr!(cx, "取消流", "Cancel stream")
+                } else if streaming {
+                    tr!(cx, "打开流", "Open stream")
+                } else {
+                    tr!(cx, "调用", "Call")
+                },
+                has_path,
+                cx,
+            ),
         ))
-        .child(
+        .child(widgets::band(
+            theme.border,
+            theme.background,
             h_flex()
                 .gap_2()
                 .items_center()
@@ -339,9 +381,11 @@ fn grpc_body(
                 )
                 .child(div().w(px(180.)).child(Input::new(&service).small()))
                 .child(div().w(px(180.)).child(Input::new(&method).small())),
-        )
+        ))
         .when(streaming && connected, |parent| {
-            parent.child(
+            parent.child(widgets::band(
+                theme.border,
+                theme.background,
                 h_flex()
                     .gap_2()
                     .child(
@@ -362,13 +406,21 @@ fn grpc_body(
                                 close_grpc_send(this, active, window, cx);
                             })),
                     ),
-            )
+            ))
         })
         .when_some(error, |this, error| {
-            this.child(crate::widgets::notice_line(cx, error))
+            this.child(widgets::band(
+                theme.border,
+                theme.background,
+                crate::widgets::notice_line(cx, error),
+            ))
         })
         .when(!discovered.is_empty(), |parent| {
-            parent.child(method_list(this, active, &discovered, window, cx))
+            parent.child(widgets::band(
+                theme.border,
+                theme.background,
+                method_list(this, active, &discovered, window, cx),
+            ))
         })
         .child(pane_bar(
             this,
@@ -380,20 +432,24 @@ fn grpc_body(
             ],
             cx,
         ))
-        .child(
-            div()
-                .flex_1()
-                .min_h(px(120.))
-                .min_h_0()
-                .id("grpc-editor")
-                .overflow_y_scroll()
-                .child(match pane {
-                    EditorPane::Headers => request::kv_editor(this, active, KvKind::Headers, cx),
-                    _ => editor_box(&body, &theme),
-                }),
-        )
-        .child(session_log(this, active, cx))
-        .child(response::render(this, active, window, cx))
+        .child(widgets::editor_split(
+            theme.muted,
+            this.editor_layout == crate::theme::EditorLayout::Stacked,
+            if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                "grpc-editor-split"
+            } else {
+                "grpc-editor-split-side"
+            },
+            filling_editor(match pane {
+                EditorPane::Headers => widgets::pane_frame(
+                    theme.border,
+                    theme.background,
+                    request::kv_editor(this, active, KvKind::Headers, cx),
+                ),
+                _ => editor_box(&body, &theme),
+            }),
+            activity_pane(this, active, window, cx),
+        ))
         .into_any_element()
 }
 
@@ -429,7 +485,7 @@ enum LiveAction {
 }
 
 fn toolbar(
-    _this: &mut AppView,
+    this: &mut AppView,
     active: usize,
     url: &Entity<InputState>,
     action: LiveAction,
@@ -441,14 +497,8 @@ fn toolbar(
         .w_full()
         .flex_shrink_0()
         .gap_2()
-        .items_center()
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(160.))
-                .h(px(28.))
-                .child(Input::new(url).small()),
-        )
+        .items_start()
+        .child(crate::views::url_vars::field(this, active, url, cx))
         .child(
             Button::new("proto-action")
                 .primary()
@@ -492,39 +542,79 @@ fn pane_bar(
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    h_flex().gap_1().children(panes.iter().map(|(pane, label)| {
-        let pane = *pane;
-        let on = selected == pane;
-        div()
-            .id(SharedString::from(format!("pane-{label}")))
-            .px_2()
-            .py_1()
-            .text_xs()
-            .rounded_sm()
-            .cursor_pointer()
-            .when(on, |this| this.bg(theme.accent))
-            .when(!on, |this| {
-                this.text_color(theme.muted_foreground)
-                    .hover(|this| this.bg(theme.muted))
-            })
-            .child(*label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(tab) = this.tabs.get_mut(active) {
-                    tab.pane = pane;
-                    cx.notify();
-                }
-            }))
-    }))
+    h_flex()
+        .flex_shrink_0()
+        .px_3()
+        .gap_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .children(panes.iter().map(|(pane, label)| {
+            let pane = *pane;
+            let on = selected == pane;
+            div()
+                .id(SharedString::from(format!("pane-{label}")))
+                .px_2()
+                .py_1p5()
+                .text_xs()
+                .border_b_2()
+                .cursor_pointer()
+                .when(on, |this| {
+                    this.border_color(theme.primary)
+                        .text_color(theme.foreground)
+                })
+                .when(!on, |this| {
+                    this.border_color(gpui_kit::transparent_black())
+                        .text_color(theme.muted_foreground)
+                        .hover(|this| this.text_color(theme.foreground))
+                })
+                .child(*label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tab) = this.tabs.get_mut(active) {
+                        tab.pane = pane;
+                        cx.notify();
+                    }
+                }))
+        }))
 }
 
 fn editor_box(editor: &Entity<EditorState>, theme: &gpui_kit::component::Theme) -> AnyElement {
     div()
-        .h(px(220.))
+        .size_full()
+        .min_h(px(120.))
         .rounded_md()
         .border_1()
         .border_color(theme.border)
+        .bg(theme.background)
         .child(Editor::new(editor).h_full())
         .into_any_element()
+}
+
+fn filling_editor(editor: AnyElement) -> AnyElement {
+    div().size_full().min_h_0().child(editor).into_any_element()
+}
+
+fn activity_pane(
+    this: &mut AppView,
+    active: usize,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) -> Option<AnyElement> {
+    let has_log = !this.tabs[active].log.is_empty();
+    let log = if has_log {
+        Some(session_log(this, active, false, cx))
+    } else {
+        None
+    };
+    let response = response::render(this, active, window, cx);
+    Some(
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .gap_2()
+            .when_some(log, |parent, log| parent.child(log))
+            .child(response)
+            .into_any_element(),
+    )
 }
 
 fn suggestion_row(
@@ -621,15 +711,40 @@ fn method_list(
         .children(rows)
 }
 
-fn session_log(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> AnyElement {
+fn session_log(
+    this: &mut AppView,
+    active: usize,
+    placeholder: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let log = this.tabs[active].log.clone();
     if log.is_empty() {
-        return div().into_any_element();
+        if !placeholder {
+            return div().into_any_element();
+        }
+        return div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(tr!(
+                cx,
+                "连接之后，收发的消息会显示在这里。",
+                "Messages show up here after you connect."
+            ))
+            .into_any_element();
     }
     v_flex()
         .id("session-log")
-        .h(px(160.))
+        .flex_1()
+        .min_h(px(80.))
+        .size_full()
         .overflow_y_scroll()
         .gap_0p5()
         .rounded_md()
@@ -746,6 +861,12 @@ fn send_graphql(this: &mut AppView, tab_ix: usize, introspect: bool, cx: &mut Co
                             }
                         }
                     }
+                    crate::views::history::push_local_run(
+                        tab,
+                        response.status_code,
+                        response.duration_ms.round() as i64,
+                        &url,
+                    );
                     tab.response = Some(graphql_as_http(&url, &response));
                     response::auto_select_section(tab);
                 }
@@ -1079,6 +1200,12 @@ fn call_grpc(this: &mut AppView, tab_ix: usize, cx: &mut Context<AppView>) {
                 Ok(grpc) => {
                     let body = serde_json::to_string_pretty(&grpc.response)
                         .unwrap_or_else(|_| grpc.response.to_string());
+                    crate::views::history::push_local_run(
+                        tab,
+                        200,
+                        grpc.duration_ms.round() as i64,
+                        &host,
+                    );
                     tab.response = Some(text_response(&host, &body, grpc.duration_ms));
                     response::auto_select_section(tab);
                 }

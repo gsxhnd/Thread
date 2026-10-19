@@ -5,7 +5,7 @@ use gpui_kit::component::{ActiveTheme as _, v_flex};
 use gpui_kit::{Action, App, IntoElement, ParentElement as _, Styled as _, Window, div};
 
 use crate::widgets;
-use crate::{OpenSettings, Quit};
+use crate::{OpenSettings, Quit, SaveRequest};
 
 pub fn render(window: &Window, cx: &App) -> impl IntoElement {
     v_flex()
@@ -33,6 +33,17 @@ pub fn render(window: &Window, cx: &App) -> impl IntoElement {
                 "These work in the main window and the settings window."
             ),
             v_flex()
+                .child(shortcut_row(
+                    window,
+                    cx,
+                    tr!(cx, "保存请求", "Save request"),
+                    tr!(
+                        cx,
+                        "把当前请求写回工作区。临时请求会存成新文件。",
+                        "Writes the current request back to the workspace."
+                    ),
+                    &SaveRequest,
+                ))
                 .child(shortcut_row(
                     window,
                     cx,

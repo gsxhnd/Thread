@@ -407,6 +407,7 @@ impl AppCore {
             "redirectCount": response.redirect_count,
             "url": response.url,
             "unresolvedVariables": response.unresolved_variables,
+            "body": response.body,
         })
         .to_string();
 

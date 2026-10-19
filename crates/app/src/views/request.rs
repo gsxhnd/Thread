@@ -2,9 +2,9 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, Input, InputState, TabSize};
+use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
 use gpui_kit::component::notification::NotificationType;
-use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::app::{AppView, RequestTab};
 use crate::format::HTTP_METHODS;
-use crate::views::{protocols, response};
+use crate::views::{history, protocols, response};
 use crate::widgets;
 
 /// 请求编辑区上方的分区。
@@ -33,11 +33,12 @@ pub enum RequestSection {
     Params,
     Headers,
     Body,
+    Timeline,
 }
 
 impl RequestSection {
-    pub fn all() -> [RequestSection; 3] {
-        [Self::Params, Self::Headers, Self::Body]
+    pub fn all() -> [RequestSection; 4] {
+        [Self::Params, Self::Headers, Self::Body, Self::Timeline]
     }
 
     fn label(self, cx: &App) -> &'static str {
@@ -45,6 +46,7 @@ impl RequestSection {
             Self::Params => tr!(cx, "参数", "Params"),
             Self::Headers => tr!(cx, "请求头", "Headers"),
             Self::Body => tr!(cx, "请求体", "Body"),
+            Self::Timeline => tr!(cx, "时间线", "Timeline"),
         }
     }
 }
@@ -173,7 +175,11 @@ impl RequestTab {
                     cx,
                 )
             }),
+            id: Uuid::new_v4().to_string(),
             url: cx.new(|cx| InputState::new(window, cx).placeholder("https://example.com/api")),
+            url_watch: None,
+            edit_watches: Vec::new(),
+            local_runs: Vec::new(),
             params: Vec::new(),
             headers: Vec::new(),
             form_fields: Vec::new(),
@@ -637,40 +643,69 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     let theme_for_tabs = theme.clone();
 
     let tab_bar = h_flex()
+        .w_full()
+        .flex_shrink_0()
+        .items_end()
         .gap_1()
-        .items_center()
+        .px_2()
+        .bg(theme_for_tabs.sidebar)
+        .border_b_1()
+        .border_color(theme_for_tabs.border)
         .id("request-tab-bar")
         .overflow_x_scroll()
         .children((0..tab_count).map(|ix| {
             let name = this.tabs[ix].name.clone();
+            let dirty = this.tabs[ix].dirty;
             let is_active = this.active_tab == Some(ix);
+            let tab_id = this.tabs[ix].id.clone();
+            let close_id = tab_id.clone();
             h_flex()
-                .id(("tab", ix))
+                .id(SharedString::from(format!("tab-{tab_id}")))
                 .items_center()
                 .gap_2()
                 .px_3()
                 .py_1p5()
-                .rounded_md()
                 .text_sm()
+                .border_b_2()
                 .when(is_active, |this| {
-                    this.bg(theme_for_tabs.accent)
+                    this.border_color(theme_for_tabs.primary)
+                        .bg(theme_for_tabs.background)
                         .font_weight(FontWeight::SEMIBOLD)
                 })
                 .when(!is_active, |this| {
-                    this.hover(|this| this.bg(theme_for_tabs.muted))
+                    this.border_color(theme_for_tabs.sidebar)
                         .text_color(theme_for_tabs.muted_foreground)
+                        .hover(|this| this.bg(theme_for_tabs.muted))
                 })
                 .cursor_pointer()
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme_for_tabs.muted_foreground)
+                        .text_color(if is_active {
+                            theme_for_tabs.primary
+                        } else {
+                            theme_for_tabs.muted_foreground
+                        })
                         .child(this.tabs[ix].protocol.label()),
                 )
-                .child(div().text_ellipsis().max_w(px(160.)).child(name))
+                .when(dirty, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(div().size(px(6.)).rounded_full().bg(theme_for_tabs.primary))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme_for_tabs.primary)
+                                    .child(tr!(cx, "未保存", "Unsaved")),
+                            ),
+                    )
+                })
+                .child(div().text_ellipsis().max_w(px(180.)).child(name))
                 .child(
                     div()
-                        .id(("tab-close", ix))
+                        .id(SharedString::from(format!("tab-close-{close_id}")))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -681,7 +716,13 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                         .child(Icon::new(IconName::X).xsmall())
                         .on_click(cx.listener(
                             move |this, _: &gpui_kit::ClickEvent, window, cx| {
-                                this.close_tab(ix, window, cx);
+                                cx.stop_propagation();
+                                let Some(index) =
+                                    this.tabs.iter().position(|tab| tab.id == close_id)
+                                else {
+                                    return;
+                                };
+                                this.close_tab(index, window, cx);
                             },
                         )),
                 )
@@ -689,6 +730,15 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                     this.active_tab = Some(ix);
                     cx.notify();
                 }))
+                .on_aux_click(
+                    cx.listener(move |this, _: &gpui_kit::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        let Some(index) = this.tabs.iter().position(|tab| tab.id == tab_id) else {
+                            return;
+                        };
+                        this.close_tab(index, window, cx);
+                    }),
+                )
         }))
         .child(
             Button::new("tab-new")
@@ -702,15 +752,44 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
         );
 
     if this.tabs[active].protocol != Protocol::Http {
+        let show_timeline = this.tabs[active].section == RequestSection::Timeline;
         return v_flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
-            .gap_2()
-            .px_4()
-            .py_3()
             .child(tab_bar)
-            .child(protocols::body(this, active, window, cx))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(widgets::band(
+                        theme.border,
+                        theme.background,
+                        Button::new("proto-timeline")
+                            .ghost()
+                            .xsmall()
+                            .label(if show_timeline {
+                                tr!(cx, "返回请求", "Back to request")
+                            } else {
+                                tr!(cx, "时间线", "Timeline")
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(tab) = this.tabs.get_mut(active) {
+                                    tab.section = if tab.section == RequestSection::Timeline {
+                                        RequestSection::Body
+                                    } else {
+                                        RequestSection::Timeline
+                                    };
+                                }
+                                cx.notify();
+                            })),
+                    ))
+                    .child(if show_timeline {
+                        history::request_timeline(this, active, cx)
+                    } else {
+                        protocols::body(this, active, window, cx)
+                    }),
+            )
             .into_any_element();
     }
 
@@ -756,15 +835,18 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                 div()
                     .id(SharedString::from(format!("section-{section_candidate:?}")))
                     .px_2()
-                    .py_1()
+                    .py_1p5()
                     .text_xs()
-                    .rounded_sm()
+                    .border_b_2()
                     .when(selected, |this| {
-                        this.bg(theme.accent).font_weight(FontWeight::SEMIBOLD)
+                        this.border_color(theme.primary)
+                            .text_color(theme.foreground)
+                            .font_weight(FontWeight::SEMIBOLD)
                     })
                     .when(!selected, |this| {
-                        this.text_color(theme.muted_foreground)
-                            .hover(|this| this.bg(theme.muted))
+                        this.border_color(gpui_kit::transparent_black())
+                            .text_color(theme.muted_foreground)
+                            .hover(|this| this.text_color(theme.foreground))
                     })
                     .cursor_pointer()
                     .child(section_label_with_count(
@@ -776,78 +858,93 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(tab) = this.tabs.get_mut(active) {
                             tab.section = section_candidate;
-                            cx.notify();
                         }
+                        if section_candidate == RequestSection::Timeline {
+                            this.reload_request_timeline(active, cx);
+                        }
+                        cx.notify();
                     }))
             }));
+
+    let editor = match section {
+        RequestSection::Params => div()
+            .size_full()
+            .id("request-editor")
+            .overflow_y_scroll()
+            .child(kv_editor(this, active, KvKind::Params, cx))
+            .into_any_element(),
+        RequestSection::Headers => div()
+            .size_full()
+            .id("request-editor")
+            .overflow_y_scroll()
+            .child(kv_editor(this, active, KvKind::Headers, cx))
+            .into_any_element(),
+        RequestSection::Body => body_editor(this, active, &method, &body_kind, &body, cx),
+        RequestSection::Timeline => crate::views::history::request_timeline(this, active, cx),
+    };
+    let response_panel = Some(response::render(this, active, window, cx));
 
     v_flex()
         .flex_1()
         .min_w_0()
         .min_h_0()
-        .gap_2()
-        .px_4()
-        .py_3()
         .child(tab_bar)
         .child(
-            h_flex()
-                .w_full()
-                .flex_shrink_0()
-                .gap_2()
-                .items_center()
-                .child(
-                    div()
-                        .w(px(96.))
-                        .flex_shrink_0()
-                        .child(Select::new(&method).small()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(160.))
-                        .h(px(28.))
-                        .child(Input::new(&url).small()),
-                )
-                .child(send_button)
-                .child(save_button),
-        )
-        .when_some(error, |this, error| {
-            this.child(widgets::notice_line(cx, error))
-        })
-        .child(
-            h_flex()
-                .gap_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(section_bar),
-        )
-        .child(
-            div()
+            v_flex()
                 .flex_1()
-                .min_h(px(140.))
                 .min_h_0()
-                .id("request-editor")
-                .overflow_y_scroll()
-                .child(match section {
-                    RequestSection::Params => kv_editor(this, active, KvKind::Params, cx),
-                    RequestSection::Headers => kv_editor(this, active, KvKind::Headers, cx),
-                    RequestSection::Body => {
-                        body_editor(this, active, &method, &body_kind, &body, cx)
-                    }
-                }),
+                .child(widgets::band(
+                    theme.border,
+                    theme.background,
+                    h_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .w(px(108.))
+                                .flex_shrink_0()
+                                .child(Select::new(&method).small()),
+                        )
+                        .child(crate::views::url_vars::field(this, active, &url, cx))
+                        .child(send_button)
+                        .child(save_button),
+                ))
+                .when_some(error, |this, error| {
+                    this.child(widgets::band(
+                        theme.border,
+                        theme.background,
+                        widgets::notice_line(cx, error),
+                    ))
+                })
+                .child(widgets::band(theme.border, theme.background, section_bar))
+                .when(sending, |this| {
+                    this.child(widgets::band(
+                        theme.border,
+                        theme.background,
+                        h_flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .items_center()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(gpui_kit::component::spinner::Spinner::new())
+                            .child(tr!(cx, "请求发送中…", "Sending…")),
+                    ))
+                })
+                .child(widgets::editor_split(
+                    theme.muted,
+                    this.editor_layout == crate::theme::EditorLayout::Stacked,
+                    if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                        "http-editor-split"
+                    } else {
+                        "http-editor-split-side"
+                    },
+                    widgets::pane_frame(theme.border, theme.background, editor),
+                    response_panel,
+                )),
         )
-        .when(sending, |this| {
-            this.child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(gpui_kit::component::spinner::Spinner::new())
-                    .child(tr!(cx, "请求发送中…", "Sending…")),
-            )
-        })
-        .child(response::render(this, active, window, cx))
         .into_any_element()
 }
 
@@ -871,7 +968,7 @@ fn section_label_with_count(
             .iter()
             .filter(|row| row.enabled && !row.is_empty(cx))
             .count(),
-        RequestSection::Body => 0,
+        RequestSection::Body | RequestSection::Timeline => 0,
     };
     if count == 0 {
         SharedString::from(section.label(cx))
@@ -1064,9 +1161,12 @@ fn body_editor(
     let body_kind = body_kind.clone();
 
     v_flex()
+        .size_full()
+        .min_h_0()
         .gap_2()
         .child(
             h_flex()
+                .flex_shrink_0()
                 .gap_2()
                 .items_center()
                 .child(
@@ -1089,9 +1189,16 @@ fn body_editor(
                 .py_4()
                 .child(tr!(cx, "该请求没有请求体。", "This request has no body."))
                 .into_any_element(),
-            "form" => kv_editor(this, active, KvKind::Form, cx),
+            "form" => div()
+                .flex_1()
+                .min_h_0()
+                .id("request-form")
+                .overflow_y_scroll()
+                .child(kv_editor(this, active, KvKind::Form, cx))
+                .into_any_element(),
             _ => div()
-                .h(px(180.))
+                .flex_1()
+                .min_h(px(120.))
                 .rounded_md()
                 .border_1()
                 .border_color(theme.border)
@@ -1109,16 +1216,19 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.tabs.get_mut(tab_ix) else {
-            return;
-        };
         let row = KvRow::new(window, cx, "", "", true);
-        match kind {
-            KvKind::Params => tab.params.push(row),
-            KvKind::Headers => tab.headers.push(row),
-            KvKind::Form => tab.form_fields.push(row),
+        {
+            let Some(tab) = self.tabs.get_mut(tab_ix) else {
+                return;
+            };
+            match kind {
+                KvKind::Params => tab.params.push(row),
+                KvKind::Headers => tab.headers.push(row),
+                KvKind::Form => tab.form_fields.push(row),
+            }
+            tab.dirty = true;
         }
-        tab.dirty = true;
+        watch_tab_edits(self, tab_ix, window, cx);
         cx.notify();
     }
 
@@ -1217,28 +1327,49 @@ impl AppView {
                     Err(error) => Err(AppError::Internal(error.to_string())),
                 };
             let _ = this.update_in(cx, |view, window, cx| {
-                let Some(tab) = view.tabs.get_mut(tab_ix) else {
-                    return;
+                let saved = {
+                    let Some(tab) = view.tabs.get_mut(tab_ix) else {
+                        return;
+                    };
+                    if !tab.task_id.is_some() {
+                        return; // 标签页已被替换或取消重置
+                    }
+                    tab.sending = false;
+                    match result {
+                        Ok(response) => {
+                            tracing::info!(
+                                status = response.status_code,
+                                elapsed_ms = response.timing.total_ms,
+                                "http request finished"
+                            );
+                            let run = crate::app::LocalRun {
+                                id: Uuid::new_v4().to_string(),
+                                at: thread_core::db::now_ms(),
+                                status: response.status_code,
+                                duration_ms: response.timing.total_ms.round() as i64,
+                                url: response.url.clone(),
+                            };
+                            let saved = tab.path.is_some();
+                            if !saved {
+                                tab.local_runs.insert(0, run);
+                            }
+                            tab.response = Some(response);
+                            response::auto_select_section(tab);
+                            saved
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "http request failed");
+                            tab.error = Some(error.to_string());
+                            window.push_notification(
+                                (NotificationType::Error, error.to_string()),
+                                cx,
+                            );
+                            false
+                        }
+                    }
                 };
-                if !tab.task_id.is_some() {
-                    return; // 标签页已被替换或取消重置
-                }
-                tab.sending = false;
-                match result {
-                    Ok(response) => {
-                        tracing::info!(
-                            status = response.status_code,
-                            elapsed_ms = response.timing.total_ms,
-                            "http request finished"
-                        );
-                        tab.response = Some(response);
-                        response::auto_select_section(tab);
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "http request failed");
-                        tab.error = Some(error.to_string());
-                        window.push_notification((NotificationType::Error, error.to_string()), cx);
-                    }
+                if saved {
+                    view.reload_request_timeline(tab_ix, cx);
                 }
                 cx.notify();
             });
@@ -1299,6 +1430,7 @@ impl AppView {
         let document = tab.to_document(cx);
         let name = tab.name.clone();
         let protocol = tab.protocol.file_protocol();
+        let tab_id = tab.id.clone();
 
         let core = self.core.clone();
         let receiver = core.spawn(async move {
@@ -1329,17 +1461,149 @@ impl AppView {
                         });
                     });
                     tracing::info!(%path, "request saved as");
-                    if let Some(tab) = view.tabs.get_mut(tab_ix) {
+                    if let Some(tab) = view.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                         tab.path = Some(path);
                         tab.dirty = false;
+                    }
+                    if view.close_after_save.as_deref() == Some(tab_id.as_str()) {
+                        view.close_after_save = None;
+                        if let Some(index) = view.tabs.iter().position(|tab| tab.id == tab_id) {
+                            view.finish_close_tab(index, cx);
+                        }
                     }
                     cx.notify();
                 }
                 Err(error) => {
+                    view.close_after_save = None;
                     window.push_notification((NotificationType::Error, error.to_string()), cx);
                 }
             });
         })
         .detach();
     }
+}
+
+/// 订阅这个标签上的输入。用户改了内容就标成未保存，不会自动写盘。
+pub fn watch_tab_edits(
+    this: &mut AppView,
+    tab_ix: usize,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    let Some(tab) = this.tabs.get(tab_ix) else {
+        return;
+    };
+    let mut inputs = vec![
+        tab.url.clone(),
+        tab.service.clone(),
+        tab.rpc_method.clone(),
+        tab.operation_name.clone(),
+        tab.message.clone(),
+    ];
+    for row in tab
+        .params
+        .iter()
+        .chain(tab.headers.iter())
+        .chain(tab.form_fields.iter())
+    {
+        inputs.push(row.key.clone());
+        inputs.push(row.value.clone());
+    }
+    let editors = [tab.body.clone(), tab.variables.clone()];
+    let selects = [tab.method.clone(), tab.body_kind.clone()];
+
+    let mut watches = Vec::new();
+    for input in inputs {
+        watches.push(
+            cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    mark_input_dirty(this, input, cx);
+                }
+            }),
+        );
+    }
+    for editor in editors {
+        watches.push(cx.subscribe_in(
+            &editor,
+            window,
+            |this, editor, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    mark_editor_dirty(this, editor, cx);
+                }
+            },
+        ));
+    }
+    for select in selects {
+        watches.push(cx.subscribe_in(
+            &select,
+            window,
+            |this, select, event: &SelectEvent<Vec<&'static str>>, _, cx| {
+                if matches!(event, SelectEvent::Confirm(_)) {
+                    mark_select_dirty(this, select, cx);
+                }
+            },
+        ));
+    }
+    if let Some(tab) = this.tabs.get_mut(tab_ix) {
+        tab.edit_watches = watches;
+    }
+}
+
+fn mark_input_dirty(this: &mut AppView, input: &Entity<InputState>, cx: &mut Context<AppView>) {
+    let Some(tab) = this.tabs.iter_mut().find(|tab| input_belongs(tab, input)) else {
+        return;
+    };
+    if tab.dirty {
+        return;
+    }
+    tab.dirty = true;
+    cx.notify();
+}
+
+fn input_belongs(tab: &RequestTab, input: &Entity<InputState>) -> bool {
+    tab.url == *input
+        || tab.service == *input
+        || tab.rpc_method == *input
+        || tab.operation_name == *input
+        || tab.message == *input
+        || tab
+            .params
+            .iter()
+            .chain(tab.headers.iter())
+            .chain(tab.form_fields.iter())
+            .any(|row| row.key == *input || row.value == *input)
+}
+
+fn mark_editor_dirty(this: &mut AppView, editor: &Entity<EditorState>, cx: &mut Context<AppView>) {
+    let Some(tab) = this
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.body == *editor || tab.variables == *editor)
+    else {
+        return;
+    };
+    if tab.dirty {
+        return;
+    }
+    tab.dirty = true;
+    cx.notify();
+}
+
+fn mark_select_dirty(
+    this: &mut AppView,
+    select: &Entity<SelectState<Vec<&'static str>>>,
+    cx: &mut Context<AppView>,
+) {
+    let Some(tab) = this
+        .tabs
+        .iter_mut()
+        .find(|tab| tab.method == *select || tab.body_kind == *select)
+    else {
+        return;
+    };
+    if tab.dirty {
+        return;
+    }
+    tab.dirty = true;
+    cx.notify();
 }

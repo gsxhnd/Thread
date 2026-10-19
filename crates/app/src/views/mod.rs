@@ -12,4 +12,5 @@ pub mod settings;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod statusbar;
+pub mod url_vars;
 pub mod welcome;

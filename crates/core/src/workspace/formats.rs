@@ -243,6 +243,9 @@ pub struct CollectionMeta {
     pub pre_script: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub post_script: String,
+    /// 请求文件的工作区相对路径，按侧边栏里的显示顺序。空则按名称排序。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_order: Vec<String>,
 }
 
 impl CollectionMeta {
@@ -256,6 +259,7 @@ impl CollectionMeta {
             headers: Vec::new(),
             pre_script: String::new(),
             post_script: String::new(),
+            request_order: Vec::new(),
         }
     }
 }

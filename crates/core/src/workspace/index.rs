@@ -521,7 +521,11 @@ fn scan_collection(dir: &Path, rel: &str, warnings: &mut Vec<String>) -> Option<
         }
     }
 
-    sort_requests(&mut requests);
+    let order = meta
+        .as_ref()
+        .map(|meta| meta.request_order.clone())
+        .unwrap_or_default();
+    sort_requests(&mut requests, &order);
     sort_collections(&mut children);
 
     let is_interesting = has_meta || !requests.is_empty() || !children.is_empty();
@@ -553,8 +557,20 @@ fn sort_collections(nodes: &mut [CollectionNode]) {
     nodes.sort_by_key(|a| a.name.to_lowercase());
 }
 
-fn sort_requests(nodes: &mut [RequestNode]) {
-    nodes.sort_by_key(|a| a.name.to_lowercase());
+fn sort_requests(nodes: &mut [RequestNode], order: &[String]) {
+    nodes.sort_by(|left, right| {
+        let left_at = order
+            .iter()
+            .position(|path| path == &left.path)
+            .unwrap_or(usize::MAX);
+        let right_at = order
+            .iter()
+            .position(|path| path == &right.path)
+            .unwrap_or(usize::MAX);
+        left_at
+            .cmp(&right_at)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
 }
 
 #[cfg(test)]
@@ -771,6 +787,29 @@ mod tests {
         assert_eq!(index.search("BASEURL", 10).len(), 2);
         assert_eq!(index.search("api/", 10).len(), 2);
         assert!(index.search("  ", 10).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn request_order_overrides_alphabetical_sort() {
+        let root = temp_workspace("order");
+        let mut meta = CollectionMeta::new("API");
+        meta.request_order = vec!["api/zeta.http.json".into(), "api/alpha.http.json".into()];
+        write_json(&root.join("api/collection.json"), &meta).unwrap();
+        write_request(
+            &root,
+            "api/alpha.http.json",
+            "Alpha",
+            "https://example.com/a",
+        );
+        write_request(&root, "api/zeta.http.json", "Zeta", "https://example.com/z");
+        let index = scan(&root, None).unwrap().index;
+        let names: Vec<_> = index.collections[0]
+            .requests
+            .iter()
+            .map(|request| request.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Zeta", "Alpha"]);
         let _ = fs::remove_dir_all(&root);
     }
 

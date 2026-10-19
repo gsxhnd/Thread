@@ -3,10 +3,12 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::label::Label;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Sizable as _, h_flex, h_resizable, resizable_panel, v_flex, v_resizable,
+};
 use gpui_kit::{
-    App, FontWeight, Hsla, IntoElement, ParentElement as _, RenderOnce, SharedString, Styled as _,
-    Window, div, px,
+    AnyElement, App, FontWeight, Hsla, IntoElement, ParentElement as _, RenderOnce, SharedString,
+    Styled as _, Window, div, px,
 };
 
 use crate::format::{SemanticColors, method_color, status_color};
@@ -241,6 +243,137 @@ pub fn mini_tag(cx: &App, text: impl Into<SharedString>) -> impl IntoElement {
         .text_color(theme.muted_foreground)
         .bg(theme.muted)
         .child(text)
+}
+
+/// 上下分栏。下栏缺省时隐藏；有内容时两栏平分高度，内容在各自的栏里滚动。
+///
+/// 下栏始终占一个面板位，只是在没有内容时隐藏，避免面板数量变化把分隔状态打乱。
+pub fn vertical_split(
+    gutter: Hsla,
+    id: &'static str,
+    top: AnyElement,
+    bottom: Option<AnyElement>,
+) -> AnyElement {
+    let open = bottom.is_some();
+    let bottom = bottom.unwrap_or_else(|| div().into_any_element());
+    div()
+        .flex_1()
+        .w_full()
+        .min_h_0()
+        .child(
+            v_resizable(id)
+                .child(
+                    resizable_panel()
+                        .size_range(px(140.)..px(8000.))
+                        .child(fill_pane(gutter, top)),
+                )
+                .child(
+                    resizable_panel()
+                        .visible(open)
+                        .size_range(px(140.)..px(8000.))
+                        .child(fill_pane(gutter, bottom)),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 请求和响应的分栏。上下两栏平分高度；左右时请求在左、响应在右。
+pub fn editor_split(
+    gutter: Hsla,
+    stacked: bool,
+    id: &'static str,
+    primary: AnyElement,
+    secondary: Option<AnyElement>,
+) -> AnyElement {
+    if stacked {
+        return vertical_split(gutter, id, primary, secondary);
+    }
+    let open = secondary.is_some();
+    let secondary = secondary.unwrap_or_else(|| div().into_any_element());
+    div()
+        .flex_1()
+        .w_full()
+        .min_h_0()
+        .child(
+            h_resizable(id)
+                .child(
+                    resizable_panel()
+                        .size(px(520.))
+                        .size_range(px(240.)..px(8000.))
+                        .child(fill_pane(gutter, primary)),
+                )
+                .child(
+                    resizable_panel()
+                        .visible(open)
+                        .size_range(px(240.)..px(8000.))
+                        .child(fill_pane(gutter, secondary)),
+                ),
+        )
+        .into_any_element()
+}
+
+fn fill_pane(gutter: Hsla, child: AnyElement) -> AnyElement {
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .min_w_0()
+        .p_2()
+        .bg(gutter)
+        .overflow_hidden()
+        .child(child)
+        .into_any_element()
+}
+
+/// 请求页里一整条控件：底边隔开，左右留出同样的内边距。
+pub fn band(border: Hsla, background: Hsla, child: impl IntoElement) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(border)
+        .bg(background)
+        .child(child)
+}
+
+/// 编辑区外框，和响应卡片一样有边，放在分栏的底色上。
+pub fn pane_frame(border: Hsla, background: Hsla, child: impl IntoElement) -> AnyElement {
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .overflow_hidden()
+        .rounded_md()
+        .border_1()
+        .border_color(border)
+        .bg(background)
+        .p_3()
+        .child(child)
+        .into_any_element()
+}
+
+/// 左右分栏，左侧给出初始宽度，分隔条可拖。
+pub fn horizontal_split(
+    id: &'static str,
+    leading_width: f32,
+    leading: AnyElement,
+    trailing: AnyElement,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .w_full()
+        .min_h_0()
+        .child(
+            h_resizable(id)
+                .child(
+                    resizable_panel()
+                        .size(px(leading_width))
+                        .size_range(px(220.)..px(640.))
+                        .child(leading),
+                )
+                .child(resizable_panel().child(trailing)),
+        )
+        .into_any_element()
 }
 
 /// 页面内提示条。

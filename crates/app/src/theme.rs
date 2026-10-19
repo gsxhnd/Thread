@@ -62,6 +62,8 @@ fn system_dark(cx: &App) -> bool {
 pub(crate) struct UiLayout {
     pub theme: Option<String>,
     pub locale: Option<String>,
+    pub editor_layout: Option<String>,
+    pub sidebar_collapsed: Option<bool>,
 }
 
 pub(crate) fn load_layout(config: &ThreadConfigStore) -> UiLayout {
@@ -119,4 +121,43 @@ pub fn set(config: &ThreadConfigStore, preference: ThemePreference, cx: &mut App
         theme = layout.theme.as_deref().unwrap_or("system"),
         "theme changed"
     );
+}
+
+/// 请求编辑区和响应区的摆放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorLayout {
+    /// 请求在上，响应在下。
+    #[default]
+    Stacked,
+    /// 请求在左，响应在右。
+    Columns,
+}
+
+pub fn editor_layout(config: &ThreadConfigStore) -> EditorLayout {
+    match load_layout(config).editor_layout.as_deref() {
+        Some("columns") => EditorLayout::Columns,
+        _ => EditorLayout::Stacked,
+    }
+}
+
+pub fn store_editor_layout(config: &ThreadConfigStore, layout: EditorLayout) {
+    let mut stored = load_layout(config);
+    stored.editor_layout = Some(
+        match layout {
+            EditorLayout::Stacked => "stacked",
+            EditorLayout::Columns => "columns",
+        }
+        .to_string(),
+    );
+    save_layout(config, &stored);
+}
+
+pub fn sidebar_collapsed(config: &ThreadConfigStore) -> bool {
+    load_layout(config).sidebar_collapsed.unwrap_or(false)
+}
+
+pub fn store_sidebar_collapsed(config: &ThreadConfigStore, collapsed: bool) {
+    let mut stored = load_layout(config);
+    stored.sidebar_collapsed = Some(collapsed);
+    save_layout(config, &stored);
 }

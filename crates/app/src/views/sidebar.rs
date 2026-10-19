@@ -1,7 +1,7 @@
 //! 侧边栏：工作区身份 + 视图导航 + 集合树。
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui_kit::assets::IconName;
@@ -10,17 +10,16 @@ use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::tree::{TreeItem, tree};
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, PromptLevel,
-    SharedString, Styled as _, WeakEntity, Window, div, px,
+    Render, SharedString, Styled as _, WeakEntity, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
-use thread_core::error::AppResult;
+use thread_core::error::{AppError, AppResult};
 use thread_core::workspace::index::{CollectionNode, RequestNode, WorkspaceIndex};
 
 use crate::app::AppView;
@@ -123,8 +122,9 @@ pub fn render(
 
         if is_request {
             let weak = weak.clone();
+            let click_id = id.clone();
             row = row.on_click(move |_, window, cx| {
-                let Some(path) = id.strip_prefix("req:") else {
+                let Some(path) = click_id.strip_prefix("req:") else {
                     return;
                 };
                 let Some(view) = weak.upgrade() else {
@@ -150,25 +150,64 @@ pub fn render(
                     }
                 });
             });
+            let drag_path = id.strip_prefix("req:").unwrap_or_default().to_string();
+            row = row.on_drag(
+                RequestDrag {
+                    path: drag_path,
+                    name: item.label.clone(),
+                },
+                |drag, _, _, cx| {
+                    cx.new(|_| DragLabel {
+                        name: drag.name.clone(),
+                    })
+                },
+            );
         }
+        let drop_weak = weak.clone();
+        let drop_id = id.clone();
+        let hover_id = id.clone();
+        row = row
+            .can_drop(|value: &dyn std::any::Any, _, _| value.is::<RequestDrag>())
+            .drag_over::<RequestDrag>(move |style, drag, _, cx| {
+                let theme = cx.theme();
+                if hover_id.starts_with("coll:") {
+                    style
+                        .rounded_md()
+                        .bg(theme.drop_target)
+                        .border_l_4()
+                        .border_color(theme.drag_border)
+                } else if hover_id.strip_prefix("req:") == Some(drag.path.as_str()) {
+                    style
+                } else {
+                    style.border_t_4().border_color(theme.drag_border)
+                }
+            })
+            .on_drop(move |drag: &RequestDrag, window, cx| {
+                let Some(view) = drop_weak.upgrade() else {
+                    return;
+                };
+                let drag = drag.clone();
+                view.update(cx, |view, cx| {
+                    view.place_dragged_request(drag, &drop_id, window, cx);
+                });
+            });
         row
     })
     .context_menu(move |_ix, entry, menu, _window, cx| {
         node_context_menu(menu, entry.item().id.clone(), menu_weak.clone(), cx)
     });
 
-    let nav = h_flex().px_2().pb_1().gap_0p5().children(
+    let nav = v_flex().px_2().py_2().gap_0p5().children(
         MainView::ALL
             .iter()
             .map(|view| nav_button(cx, this.view == *view, *view)),
     );
 
     v_flex()
-        .w(px(248.))
-        .flex_shrink_0()
-        .h_full()
-        .border_r_1()
-        .border_color(theme.border)
+        .size_full()
+        .min_w_0()
+        .min_h_0()
+        .overflow_hidden()
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
         // 工作区身份
@@ -291,12 +330,28 @@ fn draft_icon(
 }
 
 fn nav_button(cx: &mut Context<AppView>, active: bool, view: MainView) -> gpui_kit::AnyElement {
-    Button::new(nav_id(view))
-        .ghost()
-        .xsmall()
-        .icon(icon_for(view))
-        .tooltip(view.label(cx))
-        .selected(active)
+    let theme = cx.theme().clone();
+    h_flex()
+        .id(nav_id(view))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_sm()
+        .cursor_pointer()
+        .when(active, |this| {
+            this.bg(theme.accent)
+                .text_color(theme.foreground)
+                .font_weight(FontWeight::SEMIBOLD)
+        })
+        .when(!active, |this| {
+            this.text_color(theme.muted_foreground)
+                .hover(|this| this.bg(theme.muted).text_color(theme.foreground))
+        })
+        .child(Icon::new(icon_for(view)).xsmall())
+        .child(view.label(cx))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.switch_view(view, window, cx);
         }))
@@ -680,4 +735,199 @@ fn confirm_trash<F>(
 /// 从索引里解析请求节点。
 pub fn find_request(index: &WorkspaceIndex, path: &str) -> Option<RequestNode> {
     index.find_request(path).map(|location| location.request)
+}
+
+#[derive(Clone)]
+struct RequestDrag {
+    path: String,
+    name: SharedString,
+}
+
+struct DragLabel {
+    name: SharedString,
+}
+
+impl Render for DragLabel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        h_flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.drag_border)
+            .bg(theme.drop_target)
+            .child(Icon::new(IconName::Send).xsmall())
+            .child(div().text_sm().child(self.name.clone()))
+    }
+}
+
+fn parent_rel(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .filter(|parent| !parent.is_empty() && parent != ".")
+        .unwrap_or_default()
+}
+
+fn collection_request_paths(index: &WorkspaceIndex, collection: &str) -> Vec<String> {
+    fn walk<'a>(nodes: &'a [CollectionNode], path: &str) -> Option<&'a CollectionNode> {
+        for node in nodes {
+            if node.path == path {
+                return Some(node);
+            }
+            if let Some(found) = walk(&node.children, path) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&index.collections, collection)
+        .map(|node| {
+            node.requests
+                .iter()
+                .map(|request| request.path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn move_before(order: &mut Vec<String>, path: &str, before: &str) {
+    order.retain(|item| item != path);
+    let index = order
+        .iter()
+        .position(|item| item == before)
+        .unwrap_or(order.len());
+    order.insert(index, path.to_string());
+}
+
+impl AppView {
+    /// 拖拽请求：同一个集合里改顺序，丢到别的集合里就移动文件。
+    fn place_dragged_request(
+        &mut self,
+        drag: RequestDrag,
+        target_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (onto_request, target_path) = if let Some(path) = target_id.strip_prefix("req:") {
+            if path == drag.path {
+                return;
+            }
+            (true, path.to_string())
+        } else if let Some(path) = target_id.strip_prefix("coll:") {
+            (false, path.to_string())
+        } else {
+            return;
+        };
+
+        let source_collection = parent_rel(&drag.path);
+        let dest_collection = if onto_request {
+            parent_rel(&target_path)
+        } else {
+            target_path.clone()
+        };
+        let Some(index) = self.workspace.read(cx).index().cloned() else {
+            return;
+        };
+        let mut source_order = collection_request_paths(&index, &source_collection);
+        if source_collection == dest_collection {
+            if onto_request {
+                move_before(&mut source_order, &drag.path, &target_path);
+            } else {
+                source_order.retain(|path| path != &drag.path);
+                source_order.push(drag.path.clone());
+            }
+            let collection = source_collection.clone();
+            let locale = crate::i18n::current(cx);
+            self.workspace.update(cx, |model, cx| {
+                let order = source_order.clone();
+                let collection = collection.clone();
+                model.run(cx, move |root| {
+                    thread_core::workspace::ops::set_request_order(&root, &collection, &order).map(
+                        |_| {
+                            crate::i18n::owned(
+                                locale,
+                                "已调整请求顺序。".to_string(),
+                                "Request order updated.".to_string(),
+                            )
+                        },
+                    )
+                });
+            });
+            let _ = window;
+            return;
+        }
+
+        let Some(root) = self
+            .workspace
+            .read(cx)
+            .root()
+            .map(|path| path.to_path_buf())
+        else {
+            return;
+        };
+        let workspace_key = root.to_string_lossy().into_owned();
+        let old_path = drag.path.clone();
+        let previous = old_path.clone();
+        let dest_order = collection_request_paths(&index, &dest_collection);
+        source_order.retain(|path| path != &old_path);
+        let db = self.core.db.clone();
+        let core = self.core.clone();
+        let onto = onto_request;
+        let target_for_insert = target_path.clone();
+        let receiver = core.spawn(async move {
+            let new_path =
+                thread_core::workspace::ops::move_request_file(&root, &old_path, &dest_collection)?;
+            let mut dest = dest_order;
+            if onto {
+                let index = dest
+                    .iter()
+                    .position(|path| path == &target_for_insert)
+                    .unwrap_or(dest.len());
+                dest.insert(index, new_path.clone());
+            } else {
+                dest.push(new_path.clone());
+            }
+            thread_core::workspace::ops::set_request_order(
+                &root,
+                &source_collection,
+                &source_order,
+            )?;
+            thread_core::workspace::ops::set_request_order(&root, &dest_collection, &dest)?;
+            let _ = thread_core::services::history::retarget_request(
+                &db,
+                &workspace_key,
+                &old_path,
+                &new_path,
+            );
+            Ok::<String, AppError>(new_path)
+        });
+        cx.spawn(async move |this, cx| {
+            let moved = receiver
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))
+                .and_then(|result| result);
+            let _ = this.update_in(cx, |view, window, cx| match moved {
+                Ok(new_path) => {
+                    for tab in &mut view.tabs {
+                        if tab.path.as_deref() == Some(previous.as_str()) {
+                            tab.path = Some(new_path.clone());
+                        }
+                    }
+                    if view.timeline_for.as_deref() == Some(previous.as_str()) {
+                        view.timeline_for = Some(new_path.clone());
+                    }
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    window.push_notification(tr!(cx, "请求已移动。", "Request moved."), cx);
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
 }

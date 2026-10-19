@@ -19,6 +19,7 @@ pub enum ResponseSection {
     Headers,
     Cookies,
     Timing,
+    Console,
 }
 
 impl ResponseSection {
@@ -28,6 +29,7 @@ impl ResponseSection {
             Self::Headers => tr!(cx, "响应头", "Headers"),
             Self::Cookies => "Cookie",
             Self::Timing => tr!(cx, "耗时", "Timing"),
+            Self::Console => tr!(cx, "控制台", "Console"),
         }
     }
 }
@@ -49,10 +51,11 @@ pub fn render(
 ) -> AnyElement {
     let theme = cx.theme().clone();
     let Some(tab) = this.tabs.get(tab_ix) else {
-        return div().into_any_element();
+        return empty_response(false, cx);
     };
+    let sending = tab.sending;
     let Some(response) = &tab.response else {
-        return div().into_any_element();
+        return empty_response(sending, cx);
     };
     let section = tab.response_section;
 
@@ -65,6 +68,7 @@ pub fn render(
             ResponseSection::Headers,
             ResponseSection::Cookies,
             ResponseSection::Timing,
+            ResponseSection::Console,
         ]
         .map(|candidate| {
             let selected = section == candidate;
@@ -73,13 +77,16 @@ pub fn render(
                 .px_2()
                 .py_1()
                 .text_xs()
-                .rounded_sm()
+                .border_b_2()
                 .when(selected, |this| {
-                    this.bg(theme.accent).font_weight(FontWeight::SEMIBOLD)
+                    this.border_color(theme.primary)
+                        .text_color(theme.foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
                 })
                 .when(!selected, |this| {
-                    this.text_color(theme.muted_foreground)
-                        .hover(|this| this.bg(theme.muted))
+                    this.border_color(gpui_kit::transparent_black())
+                        .text_color(theme.muted_foreground)
+                        .hover(|this| this.text_color(theme.foreground))
                 })
                 .cursor_pointer()
                 .child(candidate.label(cx))
@@ -101,11 +108,11 @@ pub fn render(
         ResponseSection::Headers => headers_view(&response.headers, cx),
         ResponseSection::Cookies => cookies_view(&response.headers, cx),
         ResponseSection::Timing => timing_view(timing, cx),
+        ResponseSection::Console => console_view(response, cx),
     };
 
     v_flex()
-        .flex_1()
-        .min_h(px(140.))
+        .size_full()
         .min_h_0()
         .gap_2()
         .rounded_lg()
@@ -169,6 +176,74 @@ pub fn render(
         .into_any_element()
 }
 
+/// 还没有响应时也画出同一块面板，分栏从打开请求起就占好位置。
+fn empty_response(sending: bool, cx: &App) -> AnyElement {
+    let theme = cx.theme().clone();
+    let hint = if sending {
+        tr!(cx, "请求发送中…", "Sending…").to_string()
+    } else {
+        tr!(
+            cx,
+            "发送请求后，响应会显示在这里。",
+            "The response shows up here after you send."
+        )
+        .to_string()
+    };
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .p_3()
+        .child(response_sections(ResponseSection::Body, cx))
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(hint),
+        )
+        .into_any_element()
+}
+
+fn response_sections(section: ResponseSection, cx: &App) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    h_flex().gap_1().children(
+        [
+            ResponseSection::Body,
+            ResponseSection::Headers,
+            ResponseSection::Cookies,
+            ResponseSection::Timing,
+            ResponseSection::Console,
+        ]
+        .map(|candidate| {
+            let selected = section == candidate;
+            div()
+                .px_2()
+                .py_1()
+                .text_xs()
+                .border_b_2()
+                .when(selected, |this| {
+                    this.border_color(theme.primary)
+                        .text_color(theme.foreground)
+                        .font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!selected, |this| {
+                    this.border_color(gpui_kit::transparent_black())
+                        .text_color(theme.muted_foreground)
+                })
+                .child(candidate.label(cx))
+        }),
+    )
+}
+
 /// 响应体：JSON 自动美化，其余原样展示。
 fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> AnyElement {
     let theme = cx.theme().clone();
@@ -207,7 +282,13 @@ fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> An
         .rounded_md()
         .bg(theme.muted)
         .p_3()
-        .child(div().text_xs().font_family(mono).child(display))
+        .child(
+            div()
+                .text_xs()
+                .whitespace_normal()
+                .font_family(mono)
+                .child(display),
+        )
         .into_any_element()
 }
 
@@ -303,6 +384,72 @@ fn cookies_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &
                         .child(key),
                 )
                 .child(div().flex_1().text_ellipsis().child(value))
+        }))
+        .into_any_element()
+}
+
+fn console_view(response: &thread_core::services::http::HttpResponse, cx: &App) -> AnyElement {
+    let timing = &response.timing;
+    let mut lines = vec![
+        format!("{}  {}", response.status_code, response.url),
+        format!(
+            "{}  ·  {}",
+            format_bytes(response.body_size),
+            response
+                .content_type
+                .clone()
+                .unwrap_or_else(|| tr!(cx, "未知类型", "unknown type").to_string())
+        ),
+        format!(
+            "dns {}   tcp {}   tls {}   ttfb {}   download {}   total {}",
+            format_duration(timing.dns_ms),
+            format_duration(timing.tcp_ms),
+            format_duration(timing.tls_ms),
+            format_duration(timing.ttfb_ms),
+            format_duration(timing.download_ms),
+            format_duration(timing.total_ms),
+        ),
+        tr!(
+            cx,
+            format!("重定向 {} 次", response.redirect_count),
+            format!("{} redirects", response.redirect_count)
+        ),
+    ];
+    if response.unresolved_variables.is_empty() {
+        lines.push(tr!(cx, "变量都已替换。", "Every variable was replaced.").to_string());
+    } else {
+        lines.push(tr!(
+            cx,
+            format!("未定义的变量：{}", response.unresolved_variables.join("、")),
+            format!(
+                "Undefined variables: {}",
+                response.unresolved_variables.join(", ")
+            )
+        ));
+    }
+    if timing.tls_ms == 0.0 {
+        lines.push(
+            tr!(
+                cx,
+                "TLS 耗时包含在首字节里，没有单独计时。",
+                "TLS time is included in the first byte, not measured on its own."
+            )
+            .to_string(),
+        );
+    }
+    let mono = cx.theme().mono_font_family.clone();
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .id("response-console")
+        .overflow_y_scroll()
+        .flex_1()
+        .gap_1()
+        .children(lines.into_iter().map(|line| {
+            div()
+                .text_xs()
+                .font_family(mono.clone())
+                .text_color(muted)
+                .child(line)
         }))
         .into_any_element()
 }
