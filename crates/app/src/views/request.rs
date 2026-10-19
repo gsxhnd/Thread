@@ -197,6 +197,9 @@ impl RequestTab {
             url_watch: None,
             edit_watches: Vec::new(),
             local_runs: Vec::new(),
+            timeline_selected: None,
+            timeline_request: None,
+            timeline_wire: false,
             params: Vec::new(),
             headers: Vec::new(),
             form_fields: Vec::new(),
@@ -974,7 +977,11 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
-                .tooltip(tr!(cx, "新建临时请求", "New untitled request"))
+                .tooltip_with_action(
+                    tr!(cx, "新建临时请求", "New untitled request"),
+                    &crate::NewRequest,
+                    None,
+                )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.new_draft_tab(window, cx);
                 })),
@@ -1034,6 +1041,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
         Button::new("send")
             .primary()
             .label(tr!(cx, "发送", "Send"))
+            .tooltip_with_action(tr!(cx, "发送", "Send"), &crate::SendRequest, None)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.send_request(active, window, cx);
             }))
@@ -1043,6 +1051,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
         Button::new("save")
             .outline()
             .label(tr!(cx, "保存", "Save"))
+            .tooltip_with_action(tr!(cx, "保存", "Save"), &crate::SaveRequest, None)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.save_request(active, window, cx);
             }))
@@ -1123,51 +1132,6 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
             v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(widgets::band(
-                    theme.border,
-                    theme.background,
-                    h_flex()
-                        .w_full()
-                        .flex_shrink_0()
-                        .gap_2()
-                        .items_start()
-                        .child(
-                            div()
-                                .w(px(108.))
-                                .flex_shrink_0()
-                                .child(Select::new(&method).small()),
-                        )
-                        .child(crate::views::url_vars::field(this, active, &url, cx))
-                        .child(
-                            // 复制的是输入框当前内容，含未替换的 {{变量}}。
-                            Clipboard::new("copy-request-url")
-                                .small()
-                                .value_fn(move |_, cx| url.read(cx).value())
-                                .tooltip(tr!(cx, "复制 URL", "Copy URL")),
-                        )
-                        .child(
-                            // 点击时按当前表单导出 cURL，含请求体与认证。
-                            Clipboard::new("copy-curl")
-                                .small()
-                                .value_fn(move |_, cx| {
-                                    let Some(main) = cx.try_global::<crate::app::MainApp>() else {
-                                        return SharedString::default();
-                                    };
-                                    let Some(view) = main.0.upgrade() else {
-                                        return SharedString::default();
-                                    };
-                                    let Some(tab) = view.read(cx).tabs.get(active) else {
-                                        return SharedString::default();
-                                    };
-                                    SharedString::from(crate::curl::command(
-                                        &tab.collect_config(cx),
-                                    ))
-                                })
-                                .tooltip(tr!(cx, "复制为 cURL", "Copy as cURL")),
-                        )
-                        .child(send_button)
-                        .child(save_button),
-                ))
                 .when_some(error, |this, error| {
                     this.child(widgets::band(
                         theme.border,
@@ -1175,7 +1139,58 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                         widgets::notice_line(cx, error),
                     ))
                 })
-                .child(widgets::band(theme.border, theme.background, section_bar))
+                .child(widgets::band(
+                    theme.border,
+                    theme.background,
+                    v_flex()
+                        .w_full()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .flex_shrink_0()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .w(px(108.))
+                                        .flex_shrink_0()
+                                        .child(Select::new(&method).small()),
+                                )
+                                .child(crate::views::url_vars::field(this, active, &url, cx))
+                                .child(
+                                    // 复制的是输入框当前内容，含未替换的 {{变量}}。
+                                    Clipboard::new("copy-request-url")
+                                        .small()
+                                        .value_fn(move |_, cx| url.read(cx).value())
+                                        .tooltip(tr!(cx, "复制 URL", "Copy URL")),
+                                )
+                                .child(
+                                    // 点击时按当前表单导出 cURL，含请求体与认证。
+                                    Clipboard::new("copy-curl")
+                                        .small()
+                                        .value_fn(move |_, cx| {
+                                            let Some(main) = cx.try_global::<crate::app::MainApp>()
+                                            else {
+                                                return SharedString::default();
+                                            };
+                                            let Some(view) = main.0.upgrade() else {
+                                                return SharedString::default();
+                                            };
+                                            let Some(tab) = view.read(cx).tabs.get(active) else {
+                                                return SharedString::default();
+                                            };
+                                            SharedString::from(crate::curl::command(
+                                                &tab.collect_config(cx),
+                                            ))
+                                        })
+                                        .tooltip(tr!(cx, "复制为 cURL", "Copy as cURL")),
+                                )
+                                .child(send_button)
+                                .child(save_button),
+                        )
+                        .child(section_bar),
+                ))
                 .when(sending, |this| {
                     this.child(widgets::band(
                         theme.border,
@@ -1634,7 +1649,7 @@ fn body_placeholder(kind: &str, cx: &App) -> SharedString {
     }
 }
 
-fn response_from_history(detail: &HistoryDetail) -> Option<HttpResponse> {
+pub(crate) fn response_from_history(detail: &HistoryDetail) -> Option<HttpResponse> {
     let snap = detail.response_snapshot.as_ref()?;
     let timing = snap
         .get("timing")
@@ -2044,6 +2059,8 @@ impl AppView {
         }
         let config = tab.collect_config(cx);
         let request_path = tab.path.clone();
+        let values = self.current_variables(cx);
+        let recorded = crate::views::url_vars::concrete_config(&config, &values);
         let task_id = Uuid::new_v4().to_string();
 
         tracing::info!(
@@ -2102,9 +2119,16 @@ impl AppView {
                                 status: response.status_code,
                                 duration_ms: response.timing.total_ms.round() as i64,
                                 url: response.url.clone(),
+                                request: Some(recorded),
+                                response: Some(response.clone()),
                             };
                             let saved = tab.path.is_some();
-                            if !saved {
+                            tab.timeline_request = run.request.clone();
+                            tab.timeline_wire = false;
+                            if saved {
+                                tab.timeline_selected = None;
+                            } else {
+                                tab.timeline_selected = Some(run.id.clone());
                                 tab.local_runs.insert(0, run);
                             }
                             tab.response = Some(response);

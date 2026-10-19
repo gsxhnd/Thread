@@ -12,7 +12,9 @@ use gpui_kit::{
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::AppError;
-use thread_core::services::history::{self, HistorySummary};
+use thread_core::services::history::{self, HistoryDetail, HistorySummary};
+use thread_core::services::http::HttpRequestConfig;
+use thread_core::workspace::formats::{HttpBody, KeyValue};
 
 use crate::app::AppView;
 use crate::format::{format_duration, format_relative_time, method_color, status_color};
@@ -329,6 +331,8 @@ pub fn push_local_run(tab: &mut crate::app::RequestTab, status: u16, duration_ms
             status,
             duration_ms,
             url: url.to_string(),
+            request: None,
+            response: None,
         },
     );
 }
@@ -355,15 +359,30 @@ pub fn request_timeline(
         Vec::new()
     };
 
+    let selected = this
+        .tabs
+        .get(tab_ix)
+        .and_then(|tab| tab.timeline_selected.clone());
+    let (request, wire) = this
+        .tabs
+        .get(tab_ix)
+        .map(|tab| (tab.timeline_request.clone(), tab.timeline_wire))
+        .unwrap_or((None, false));
     let rows = if use_db {
         db_items
             .into_iter()
-            .map(|item| timeline_db_row(tab_ix, item, cx))
+            .map(|item| {
+                let chosen = selected.as_deref() == Some(item.id.as_str());
+                timeline_db_row(tab_ix, item, chosen, cx)
+            })
             .collect::<Vec<_>>()
     } else {
         local
             .into_iter()
-            .map(|run| timeline_local_row(tab_ix, run, cx))
+            .map(|run| {
+                let chosen = selected.as_deref() == Some(run.id.as_str());
+                timeline_local_row(tab_ix, run, chosen, cx)
+            })
             .collect::<Vec<_>>()
     };
 
@@ -372,7 +391,6 @@ pub fn request_timeline(
         .min_h_0()
         .gap_2()
         .id("request-timeline")
-        .overflow_y_scroll()
         .child(
             h_flex()
                 .justify_between()
@@ -403,26 +421,60 @@ pub fn request_timeline(
                 ),
             ))
         })
-        .when(rows.is_empty(), |column| {
-            column.child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(tr!(
-                        cx,
-                        "还没有发送记录。发送一次之后会出现在这里，可以单独保存、删除或清空。",
-                        "No sends yet. After you send, each run shows up here and can be saved, deleted, or cleared."
-                    )),
-            )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .id("timeline-rows")
+                .overflow_y_scroll()
+                .gap_1()
+                .when(rows.is_empty(), |column| {
+                    column.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(tr!(
+                                cx,
+                                "还没有发送记录。发送一次之后会出现在这里，点一行可以查看那次的请求和响应，也可以单独保存、删除或清空。",
+                                "No sends yet. After you send, each run shows up here. Click a row to view that request and response, or save, delete, and clear them one by one."
+                            )),
+                    )
+                })
+                .when(!rows.is_empty(), |column| column.child(timeline_header(cx)))
+                .children(rows),
+        )
+        .when_some(request, |column, config| {
+            column.child(timeline_request_panel(&config, wire, cx))
         })
-        .children(rows)
         .into_any_element()
 }
 
-fn timeline_db_row(tab_ix: usize, item: HistorySummary, cx: &mut Context<AppView>) -> AnyElement {
+fn timeline_header(cx: &gpui_kit::App) -> AnyElement {
+    let theme = cx.theme().clone();
+    h_flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(div().w(px(72.)).child(tr!(cx, "时间", "Time")))
+        .child(div().w(px(56.)).child(tr!(cx, "方法", "Method")))
+        .child(div().w(px(44.)).child(tr!(cx, "状态", "Status")))
+        .child(div().w(px(64.)).child(tr!(cx, "耗时", "Duration")))
+        .child(div().flex_1().child("URL"))
+        .into_any_element()
+}
+
+fn timeline_db_row(
+    tab_ix: usize,
+    item: HistorySummary,
+    selected: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let colors = crate::format::SemanticColors::for_theme(&theme);
     let id = item.id.clone();
+    let select_id = id.clone();
     let save_id = id.clone();
     let delete_id = id.clone();
     let when = format_relative_time(item.created_at, cx);
@@ -441,16 +493,24 @@ fn timeline_db_row(tab_ix: usize, item: HistorySummary, cx: &mut Context<AppView
         .px_2()
         .py_1p5()
         .rounded_md()
-        .hover(|row| row.bg(theme.muted))
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme.accent))
+        .when(!selected, |row| row.hover(|row| row.bg(theme.muted)))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.select_timeline_entry(tab_ix, &select_id, cx);
+        }))
         .child(
             div()
                 .w(px(72.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(when),
         )
         .child(
             div()
+                .w(px(56.))
+                .flex_shrink_0()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(method_color(item.method.as_deref(), &colors))
@@ -458,12 +518,16 @@ fn timeline_db_row(tab_ix: usize, item: HistorySummary, cx: &mut Context<AppView
         )
         .child(
             div()
+                .w(px(44.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(status_color(item.status_code, &colors))
                 .child(status),
         )
         .child(
             div()
+                .w(px(64.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(duration),
@@ -500,13 +564,20 @@ fn timeline_db_row(tab_ix: usize, item: HistorySummary, cx: &mut Context<AppView
 fn timeline_local_row(
     tab_ix: usize,
     run: crate::app::LocalRun,
+    selected: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
     let colors = crate::format::SemanticColors::for_theme(&theme);
     let id = run.id.clone();
+    let select_id = id.clone();
     let save_id = id.clone();
     let delete_id = id.clone();
+    let method = run
+        .request
+        .as_ref()
+        .map(|config| config.method.clone())
+        .unwrap_or_default();
     h_flex()
         .id(SharedString::from(format!("timeline-local-{id}")))
         .items_center()
@@ -514,22 +585,44 @@ fn timeline_local_row(
         .px_2()
         .py_1p5()
         .rounded_md()
-        .hover(|row| row.bg(theme.muted))
+        .cursor_pointer()
+        .when(selected, |row| row.bg(theme.accent))
+        .when(!selected, |row| row.hover(|row| row.bg(theme.muted)))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.select_timeline_entry(tab_ix, &select_id, cx);
+        }))
         .child(
             div()
                 .w(px(72.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(format_relative_time(run.at, cx)),
         )
         .child(
             div()
+                .w(px(56.))
+                .flex_shrink_0()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(method_color(
+                    (!method.is_empty()).then_some(method.as_str()),
+                    &colors,
+                ))
+                .child(method),
+        )
+        .child(
+            div()
+                .w(px(44.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(status_color(Some(run.status as i64), &colors))
                 .child(run.status.to_string()),
         )
         .child(
             div()
+                .w(px(64.))
+                .flex_shrink_0()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(format_duration(run.duration_ms as f64)),
@@ -570,11 +663,286 @@ fn timeline_local_row(
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(tab) = this.tabs.get_mut(tab_ix) {
                     tab.local_runs.retain(|run| run.id != delete_id);
+                    if tab.timeline_selected.as_deref() == Some(delete_id.as_str()) {
+                        tab.timeline_selected = None;
+                        tab.timeline_request = None;
+                        tab.timeline_wire = false;
+                    }
                 }
                 cx.notify();
             })),
         )
         .into_any_element()
+}
+
+fn timeline_request_panel(
+    config: &HttpRequestConfig,
+    wire: bool,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    let mono = theme.mono_font_family.clone();
+    let query = enabled_pairs(&config.query_params);
+    let headers = enabled_pairs(&config.headers);
+    let body = body_text(&config.body);
+    let auth = auth_summary(&config.auth, cx);
+    let url = config.url.clone();
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .id("timeline-request")
+        .overflow_y_scroll()
+        .gap_2()
+        .pt_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(tr!(cx, "请求", "Request")),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(widgets::MethodTag::new(&config.method, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_ellipsis_start()
+                        .child(url.clone()),
+                )
+                .when(!url.is_empty(), |row| {
+                    row.child(
+                        Clipboard::new("copy-timeline-request-url")
+                            .small()
+                            .value(url)
+                            .tooltip(tr!(cx, "复制 URL", "Copy URL")),
+                    )
+                }),
+        )
+        .when(!query.is_empty(), |panel| {
+            panel.child(kv_block(cx, tr!(cx, "查询参数", "Query"), &query))
+        })
+        .when(!headers.is_empty(), |panel| {
+            panel.child(kv_block(cx, tr!(cx, "请求头", "Headers"), &headers))
+        })
+        .when(!wire, |panel| {
+            panel.child(
+                v_flex()
+                    .gap_1()
+                    .child(section_label(cx, tr!(cx, "认证", "Auth")))
+                    .child(
+                        div()
+                            .text_xs()
+                            .whitespace_normal()
+                            .text_color(theme.foreground)
+                            .child(auth),
+                    ),
+            )
+        })
+        .when_some(body, |panel, body| {
+            panel.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(section_label(cx, tr!(cx, "请求体", "Body")))
+                            .child(
+                                Clipboard::new("copy-timeline-request-body")
+                                    .small()
+                                    .value(body.clone())
+                                    .tooltip(tr!(cx, "复制请求体", "Copy body")),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .rounded_md()
+                            .bg(theme.muted)
+                            .p_3()
+                            .text_xs()
+                            .font_family(mono)
+                            .whitespace_normal()
+                            .child(body),
+                    ),
+            )
+        })
+        .into_any_element()
+}
+
+fn section_label(cx: &gpui_kit::App, text: impl Into<SharedString>) -> AnyElement {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+        .into_any_element()
+}
+
+fn kv_block(
+    cx: &gpui_kit::App,
+    title: impl Into<SharedString>,
+    pairs: &[(String, String)],
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    v_flex()
+        .gap_1()
+        .child(section_label(cx, title))
+        .children(pairs.iter().map(|(key, value)| {
+            h_flex()
+                .gap_2()
+                .items_start()
+                .text_xs()
+                .child(
+                    div()
+                        .w(px(140.))
+                        .flex_shrink_0()
+                        .text_color(theme.muted_foreground)
+                        .child(key.clone()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal()
+                        .child(value.clone()),
+                )
+        }))
+        .into_any_element()
+}
+
+fn enabled_pairs(rows: &[KeyValue]) -> Vec<(String, String)> {
+    rows.iter()
+        .filter(|row| row.enabled && !row.key.is_empty())
+        .map(|row| (row.key.clone(), row.value.clone()))
+        .collect()
+}
+
+fn body_text(body: &HttpBody) -> Option<String> {
+    match body.kind.as_str() {
+        "none" | "" => None,
+        "form" | "form-data" => {
+            let lines: Vec<String> = body
+                .fields
+                .iter()
+                .filter(|field| field.enabled && !field.key.is_empty())
+                .map(|field| {
+                    let value = if field.kind == "file" {
+                        field.file_path.clone().unwrap_or_default()
+                    } else {
+                        field.value.clone()
+                    };
+                    format!("{}: {value}", field.key)
+                })
+                .collect();
+            if !lines.is_empty() {
+                Some(lines.join("\n"))
+            } else if body.content.is_empty() {
+                None
+            } else {
+                Some(body.content.clone())
+            }
+        }
+        "json" if !body.content.is_empty() => Some(pretty_body(&body.content)),
+        _ if body.content.is_empty() => None,
+        _ => Some(body.content.clone()),
+    }
+}
+
+fn auth_summary(auth: &thread_core::workspace::formats::AuthSpec, cx: &gpui_kit::App) -> String {
+    match auth.kind.as_str() {
+        "none" => tr!(cx, "无", "None").to_string(),
+        "bearer" => format!("Bearer {}", auth.token.as_deref().unwrap_or("")),
+        "basic" => format!(
+            "Basic {}:{}",
+            auth.username.as_deref().unwrap_or(""),
+            auth.password.as_deref().unwrap_or("")
+        ),
+        "apiKey" | "apikey" => format!(
+            "{} {} = {}",
+            auth.location.as_deref().unwrap_or("header"),
+            auth.key.as_deref().unwrap_or(""),
+            auth.value.as_deref().unwrap_or("")
+        ),
+        _ => tr!(cx, "继承集合", "Inherit collection").to_string(),
+    }
+}
+
+/// 历史快照里的请求。优先用当时真正发出去的内容（变量已换成具体值）。
+/// 第二个值表示这是线上请求，认证已经写进请求头。
+fn request_config_from_detail(detail: &HistoryDetail) -> Option<(HttpRequestConfig, bool)> {
+    if let Some(config) = resolved_display(&detail.request_snapshot) {
+        return Some((config, true));
+    }
+    for key in ["sent", "document"] {
+        if let Some(config) = detail
+            .request_snapshot
+            .get(key)
+            .and_then(|value| serde_json::from_value::<HttpRequestConfig>(value.clone()).ok())
+            .filter(|config| {
+                !config.url.is_empty()
+                    || !config.query_params.is_empty()
+                    || !config.headers.is_empty()
+                    || (config.body.kind != "none" && !config.body.kind.is_empty())
+                    || !config.body.content.is_empty()
+            })
+        {
+            return Some((config, false));
+        }
+    }
+    None
+}
+
+fn resolved_display(snapshot: &serde_json::Value) -> Option<HttpRequestConfig> {
+    let resolved = snapshot.get("resolved")?;
+    let method = resolved
+        .get("method")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = resolved
+        .get("url")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    if method.is_empty() && url.is_empty() {
+        return None;
+    }
+    let headers = resolved
+        .get("headers")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    let kind = resolved
+        .get("bodyKind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let content = resolved
+        .get("bodyPreview")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(HttpRequestConfig {
+        method: if method.is_empty() {
+            "GET".to_string()
+        } else {
+            method
+        },
+        url,
+        headers,
+        body: HttpBody {
+            kind,
+            content,
+            ..HttpBody::default()
+        },
+        ..HttpRequestConfig::default()
+    })
 }
 
 impl AppView {
@@ -720,6 +1088,86 @@ impl AppView {
         .detach();
     }
 
+    /// 点时间线的一行：选中它，展示那次的请求，并把响应放到响应区。正在编辑的表单保持不动。
+    pub fn select_timeline_entry(&mut self, tab_ix: usize, id: &str, cx: &mut Context<Self>) {
+        let values = self.current_variables(cx);
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        tab.timeline_selected = Some(id.to_string());
+        let local = tab
+            .local_runs
+            .iter()
+            .find(|run| run.id == id)
+            .map(|run| (run.request.clone(), run.response.clone()));
+        if let Some((request, response)) = local {
+            let shown = request
+                .as_ref()
+                .map(|config| crate::views::url_vars::concrete_config(config, &values));
+            tab.timeline_request = shown.clone();
+            tab.timeline_wire = false;
+            if let Some(shown) = shown
+                && let Some(run) = tab.local_runs.iter_mut().find(|run| run.id == id)
+            {
+                run.request = Some(shown);
+            }
+            if let Some(response) = response {
+                tab.response = Some(response);
+            }
+            cx.notify();
+            return;
+        }
+        tab.timeline_request = None;
+        tab.timeline_wire = false;
+        let id = id.to_string();
+        let expected = id.clone();
+        let db = self.core.db.clone();
+        let receiver = self.core.spawn(async move { history::get(&db, &id) });
+        cx.spawn(async move |this, cx| {
+            let detail = receiver.await.ok().and_then(|result| result.ok());
+            let _ = this.update(cx, |view, cx| {
+                let current = view
+                    .tabs
+                    .get(tab_ix)
+                    .and_then(|tab| tab.timeline_selected.clone());
+                if current.as_deref() != Some(expected.as_str()) {
+                    return;
+                }
+                let prepared = detail.as_ref().and_then(request_config_from_detail);
+                let values = if matches!(prepared, Some((_, false))) {
+                    view.current_variables(cx)
+                } else {
+                    std::collections::BTreeMap::new()
+                };
+                let Some(tab) = view.tabs.get_mut(tab_ix) else {
+                    return;
+                };
+                match prepared {
+                    Some((config, true)) => {
+                        tab.timeline_request = Some(config);
+                        tab.timeline_wire = true;
+                    }
+                    Some((config, false)) => {
+                        tab.timeline_request =
+                            Some(crate::views::url_vars::concrete_config(&config, &values));
+                        tab.timeline_wire = false;
+                    }
+                    None => {
+                        tab.timeline_request = None;
+                        tab.timeline_wire = false;
+                    }
+                }
+                if let Some(detail) = detail.as_ref()
+                    && let Some(response) = crate::views::request::response_from_history(detail)
+                {
+                    tab.response = Some(response);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 读取当前已保存 HTTP 请求在历史库里的记录。
     pub fn reload_request_timeline(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
         let Some(path) = self.tabs.get(tab_ix).and_then(|tab| tab.path.clone()) else {
@@ -853,6 +1301,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let id = id.to_string();
+        let removed_id = id.clone();
         let db = self.core.db.clone();
         let receiver = self.core.spawn(async move { history::delete(&db, &id) });
         cx.spawn(async move |this, cx| {
@@ -862,6 +1311,13 @@ impl AppView {
                 .and_then(|result| result);
             let _ = this.update_in(cx, |view, window, cx| match removed {
                 Ok(_) => {
+                    if let Some(tab) = view.tabs.get_mut(tab_ix)
+                        && tab.timeline_selected.as_deref() == Some(removed_id.as_str())
+                    {
+                        tab.timeline_selected = None;
+                        tab.timeline_request = None;
+                        tab.timeline_wire = false;
+                    }
                     view.reload_request_timeline(tab_ix, cx);
                     view.reload_history(cx);
                     window.push_notification(tr!(cx, "已删除这条记录。", "Deleted this run."), cx);
@@ -887,6 +1343,9 @@ impl AppView {
         if !http_file {
             if let Some(tab) = self.tabs.get_mut(tab_ix) {
                 tab.local_runs.clear();
+                tab.timeline_selected = None;
+                tab.timeline_request = None;
+                tab.timeline_wire = false;
             }
             cx.notify();
             return;
@@ -914,6 +1373,11 @@ impl AppView {
             let _ = this.update_in(cx, |view, window, cx| match removed {
                 Ok(count) => {
                     view.timeline.clear();
+                    if let Some(tab) = view.tabs.get_mut(tab_ix) {
+                        tab.timeline_selected = None;
+                        tab.timeline_request = None;
+                        tab.timeline_wire = false;
+                    }
                     view.reload_history(cx);
                     window.push_notification(
                         (

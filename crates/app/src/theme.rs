@@ -25,19 +25,28 @@ pub enum ThemePreference {
     Dracula,
 }
 
-/// 命名主题的配色。只覆盖常用颜色，其余由默认主题补齐。
+/// 一套完整配色。界面会读到的表面、侧边栏、列表选中和弹出层都在这里，
+/// 避免只改几个底色时按钮和选中态还停在另一套默认色上。
 struct Palette {
     name: &'static str,
     dark: bool,
     background: u32,
     foreground: u32,
     sidebar: u32,
+    sidebar_foreground: u32,
+    sidebar_border: u32,
+    sidebar_accent: u32,
     border: u32,
     muted: u32,
     muted_foreground: u32,
     primary: u32,
     primary_foreground: u32,
     accent: u32,
+    accent_foreground: u32,
+    secondary: u32,
+    input_border: u32,
+    list_active: u32,
+    popover: u32,
 }
 
 impl ThemePreference {
@@ -83,27 +92,76 @@ impl ThemePreference {
     pub fn swatch(self) -> (u32, u32, u32) {
         match self.palette() {
             Some(palette) => (palette.background, palette.foreground, palette.primary),
-            None => match self {
-                Self::Dark => (0x1e1f22, 0xe6e6e6, 0x5b8def),
-                _ => (0xffffff, 0x1f2328, 0x2563c9),
-            },
+            None => (0xf6f5f2, 0x1c1917, 0x0f766e),
         }
     }
 
     fn palette(self) -> Option<Palette> {
         Some(match self {
+            // 浅色：暖纸底，侧边栏再沉一点，强调色用青绿，和中性灰默认主题拉开。
+            Self::Light => Palette {
+                name: "Thread Light",
+                dark: false,
+                background: 0xf6f5f2,
+                foreground: 0x1c1917,
+                sidebar: 0xeeece7,
+                sidebar_foreground: 0x1c1917,
+                sidebar_border: 0xe4e0d8,
+                sidebar_accent: 0xe0dbd1,
+                border: 0xe4e0d8,
+                muted: 0xeeece7,
+                muted_foreground: 0x78716c,
+                primary: 0x0f766e,
+                primary_foreground: 0xf6f5f2,
+                accent: 0xe7e2d8,
+                accent_foreground: 0x1c1917,
+                secondary: 0xfbfaf7,
+                input_border: 0xd6d1c7,
+                list_active: 0xd5f5f0,
+                popover: 0xfffdf8,
+            },
+            // 深色：分层表面，文字用暖灰而不是纯白，选中条用深青。
+            Self::Dark => Palette {
+                name: "Thread Dark",
+                dark: true,
+                background: 0x14161a,
+                foreground: 0xe7e5e4,
+                sidebar: 0x0f1114,
+                sidebar_foreground: 0xe7e5e4,
+                sidebar_border: 0x2a2d34,
+                sidebar_accent: 0x23262e,
+                border: 0x2a2d34,
+                muted: 0x1c1f26,
+                muted_foreground: 0xa8a29e,
+                primary: 0x2dd4bf,
+                primary_foreground: 0x042f2e,
+                accent: 0x23262e,
+                accent_foreground: 0xe7e5e4,
+                secondary: 0x1c1f26,
+                input_border: 0x3f4450,
+                list_active: 0x134e4a,
+                popover: 0x1c1f26,
+            },
             Self::Solarized => Palette {
                 name: "Thread Solarized Light",
                 dark: false,
                 background: 0xfdf6e3,
                 foreground: 0x586e75,
                 sidebar: 0xeee8d5,
+                sidebar_foreground: 0x586e75,
+                sidebar_border: 0xd9d1b8,
+                sidebar_accent: 0xe6dfc8,
                 border: 0xd9d1b8,
                 muted: 0xeee8d5,
                 muted_foreground: 0x839496,
                 primary: 0x268bd2,
                 primary_foreground: 0xfdf6e3,
                 accent: 0xe6dfc8,
+                accent_foreground: 0x586e75,
+                secondary: 0xfdf6e3,
+                input_border: 0xd9d1b8,
+                list_active: 0xd6eee8,
+                popover: 0xfdf6e3,
             },
             Self::Nord => Palette {
                 name: "Thread Nord",
@@ -111,12 +169,20 @@ impl ThemePreference {
                 background: 0x2e3440,
                 foreground: 0xd8dee9,
                 sidebar: 0x3b4252,
+                sidebar_foreground: 0xd8dee9,
+                sidebar_border: 0x4c566a,
+                sidebar_accent: 0x434c5e,
                 border: 0x4c566a,
                 muted: 0x3b4252,
                 muted_foreground: 0x81a1c1,
                 primary: 0x88c0d0,
                 primary_foreground: 0x2e3440,
                 accent: 0x434c5e,
+                accent_foreground: 0xd8dee9,
+                secondary: 0x3b4252,
+                input_border: 0x4c566a,
+                list_active: 0x4c566a,
+                popover: 0x3b4252,
             },
             Self::Dracula => Palette {
                 name: "Thread Dracula",
@@ -124,14 +190,22 @@ impl ThemePreference {
                 background: 0x282a36,
                 foreground: 0xf8f8f2,
                 sidebar: 0x21222c,
+                sidebar_foreground: 0xf8f8f2,
+                sidebar_border: 0x44475a,
+                sidebar_accent: 0x44475a,
                 border: 0x44475a,
                 muted: 0x343746,
                 muted_foreground: 0x6272a4,
                 primary: 0xbd93f9,
                 primary_foreground: 0x282a36,
                 accent: 0x44475a,
+                accent_foreground: 0xf8f8f2,
+                secondary: 0x343746,
+                input_border: 0x44475a,
+                list_active: 0x44475a,
+                popover: 0x343746,
             },
-            Self::System | Self::Light | Self::Dark => return None,
+            Self::System => return None,
         })
     }
 
@@ -167,13 +241,30 @@ fn theme_set_json(palette: &Palette) -> String {
         "colors": {
             "background": hex(palette.background),
             "foreground": hex(palette.foreground),
+            "caret": hex(palette.foreground),
             "sidebar.background": hex(palette.sidebar),
+            "sidebar.foreground": hex(palette.sidebar_foreground),
+            "sidebar.border": hex(palette.sidebar_border),
+            "sidebar.accent.background": hex(palette.sidebar_accent),
+            "sidebar.accent.foreground": hex(palette.sidebar_foreground),
             "border": hex(palette.border),
+            "input.border": hex(palette.input_border),
+            "ring": hex(palette.primary),
             "muted.background": hex(palette.muted),
             "muted.foreground": hex(palette.muted_foreground),
             "primary.background": hex(palette.primary),
             "primary.foreground": hex(palette.primary_foreground),
             "accent.background": hex(palette.accent),
+            "accent.foreground": hex(palette.accent_foreground),
+            "secondary.background": hex(palette.secondary),
+            "secondary.foreground": hex(palette.foreground),
+            "popover.background": hex(palette.popover),
+            "popover.foreground": hex(palette.foreground),
+            "list.background": hex(palette.background),
+            "list.active.background": hex(palette.list_active),
+            "list.active.border": hex(palette.primary),
+            "list.hover.background": hex(palette.accent),
+            "selection.background": hex(palette.list_active),
         }
     });
     serde_json::json!({ "name": palette.name, "themes": [config] }).to_string()
@@ -196,6 +287,12 @@ fn register(palette: &Palette, cx: &mut App) -> Option<Rc<ThemeConfig>> {
 fn apply(preference: ThemePreference, cx: &mut App) {
     let dark = system_dark(cx);
     let mode = preference.mode(dark);
+    // 跟随系统时套用同一套 Thread 浅色/深色，而不是组件库的中性默认色。
+    let concrete = match preference {
+        ThemePreference::System if dark => ThemePreference::Dark,
+        ThemePreference::System => ThemePreference::Light,
+        other => other,
+    };
     let (mut light, mut dark_config) = {
         let registry = ThemeRegistry::global(cx);
         (
@@ -203,7 +300,7 @@ fn apply(preference: ThemePreference, cx: &mut App) {
             registry.default_dark_theme().clone(),
         )
     };
-    if let Some(palette) = preference.palette()
+    if let Some(palette) = concrete.palette()
         && let Some(config) = register(&palette, cx)
     {
         if palette.dark {

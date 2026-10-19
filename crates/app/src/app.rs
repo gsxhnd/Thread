@@ -25,7 +25,7 @@ use gpui_kit::{
 };
 use thread_core::AppCore;
 use thread_core::error::AppError;
-use thread_core::services::http::HttpResponse;
+use thread_core::services::http::{HttpRequestConfig, HttpResponse};
 use thread_core::workspace::index::RequestNode;
 
 use crate::state::{MainView, WorkspaceEvent, WorkspaceModel};
@@ -48,6 +48,23 @@ pub struct LocalRun {
     pub status: u16,
     pub duration_ms: i64,
     pub url: String,
+    /// 发出去的请求。点这一行时和响应一起显示。
+    pub request: Option<HttpRequestConfig>,
+    /// 这次发送的响应。点时间线时把响应区切回这一条。
+    pub response: Option<HttpResponse>,
+}
+
+/// 集合树里正在原位编辑的名称。回车提交，Esc 取消。
+pub struct InlineRename {
+    pub node_id: String,
+    pub path: String,
+    pub request: bool,
+    pub input: Entity<InputState>,
+    /// 输入框真正拿到焦点之后，失焦才提交。打开菜单的那一下失焦不算。
+    pub armed: bool,
+    /// 持有输入框订阅。字段本身不读，丢掉这次重命名时订阅一起取消。
+    #[expect(dead_code)]
+    pub(crate) watch: Subscription,
 }
 
 /// 一个打开的请求标签页（保存的请求或临时请求）。
@@ -67,6 +84,12 @@ pub struct RequestTab {
     pub url_watch: Option<Subscription>,
     /// 临时请求的时间线。保存进工作区之后改走历史库。
     pub local_runs: Vec<LocalRun>,
+    /// 时间线上选中的记录。点一行同时看到那次的请求和响应。
+    pub timeline_selected: Option<String>,
+    /// 选中那次发送的请求。只在时间线里展示，不改正在编辑的表单。
+    pub timeline_request: Option<HttpRequestConfig>,
+    /// 这条展示用的是已经替换过变量、真正发出去的内容。认证已经进了请求头。
+    pub timeline_wire: bool,
     pub params: Vec<views::request::KvRow>,
     pub headers: Vec<views::request::KvRow>,
     /// 表单请求体，和查询参数分开存。文件字段带本地路径。
@@ -169,6 +192,8 @@ pub struct AppView {
     /// 临时请求保存成功后要关掉的标签 id。
     pub(crate) close_after_save: Option<String>,
     pub tree: Entity<gpui_kit::component::tree::TreeState>,
+    /// 侧边栏里正在原位重命名的节点。
+    pub rename: Option<InlineRename>,
     pub tabs: Vec<RequestTab>,
     pub active_tab: Option<usize>,
     pub url_assist: views::url_vars::UrlAssist,
@@ -257,6 +282,8 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "变量名", "Variable")));
         let env_value =
             cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "值", "Value")));
+        let var_editor =
+            cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "值", "Value")));
         let workspace_root = workspace.read(cx).root();
 
         let theme_pref = theme::stored(&core.config);
@@ -308,9 +335,10 @@ impl AppView {
             closing_tab: None,
             close_after_save: None,
             tree,
+            rename: None,
             tabs: Vec::new(),
             active_tab: None,
-            url_assist: views::url_vars::UrlAssist::default(),
+            url_assist: views::url_vars::UrlAssist::new(var_editor),
             tab_close_armed: false,
             timeline: Vec::new(),
             timeline_for: None,
@@ -767,6 +795,20 @@ impl AppView {
         cx.notify();
     }
 
+    /// 在已打开的请求标签之间循环。`delta` 为 1 去下一个，-1 去上一个。
+    pub fn cycle_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let len = self.tabs.len() as isize;
+        let current = self.active_tab.unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len) as usize;
+        self.open_collection = None;
+        self.view = crate::state::MainView::Request;
+        self.active_tab = Some(next);
+        cx.notify();
+    }
+
     /// 关掉标签页时释放还活着的长连接。
     fn release_live_session(&self, index: usize) {
         let Some(tab) = self.tabs.get(index) else {
@@ -1017,7 +1059,7 @@ impl AppView {
         }
     }
 
-    /// 顶部标题栏右侧按钮组：布局切换、设置、关闭工作区。主题在设置页里选。
+    /// 顶部标题栏右侧：布局切换和设置。关闭工作区在左侧的工作区菜单里。
     fn titlebar_trailing(&mut self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
         let open = self.workspace.read(cx).is_open();
         let layout_icon = match self.editor_layout {
@@ -1030,10 +1072,16 @@ impl AppView {
                 Button::new("editor-layout")
                     .ghost()
                     .icon(layout_icon)
-                    .tooltip(match self.editor_layout {
-                        theme::EditorLayout::Stacked => tr!(cx, "上下布局", "Stacked layout"),
-                        theme::EditorLayout::Columns => tr!(cx, "左右布局", "Side by side layout"),
-                    })
+                    .tooltip_with_action(
+                        match self.editor_layout {
+                            theme::EditorLayout::Stacked => tr!(cx, "上下布局", "Stacked layout"),
+                            theme::EditorLayout::Columns => {
+                                tr!(cx, "左右布局", "Side by side layout")
+                            }
+                        },
+                        &crate::ToggleLayout,
+                        None,
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_editor_layout(cx);
                     }))
@@ -1044,24 +1092,12 @@ impl AppView {
             Button::new("open-settings")
                 .ghost()
                 .icon(IconName::Settings)
-                .tooltip(tr!(cx, "设置", "Settings"))
+                .tooltip_with_action(tr!(cx, "设置", "Settings"), &crate::OpenSettings, None)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.open_settings(window, cx);
                 }))
                 .into_any_element(),
         );
-        if open {
-            buttons.push(
-                Button::new("close-workspace")
-                    .ghost()
-                    .icon(IconName::CircleSlash)
-                    .tooltip(tr!(cx, "关闭工作区", "Close workspace"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.close_workspace(window, cx);
-                    }))
-                    .into_any_element(),
-            );
-        }
         buttons
     }
 }
@@ -1110,7 +1146,10 @@ fn workspace_switcher(
             }
             let open_weak = weak.clone();
             let create_weak = weak.clone();
-            menu.separator()
+            let close_weak = weak.clone();
+            let workspace_open = current.is_some();
+            let mut menu = menu
+                .separator()
                 .item(
                     PopupMenuItem::new(tr!(cx, "打开工作区…", "Open workspace…")).on_click(
                         move |_, window, cx| {
@@ -1130,7 +1169,20 @@ fn workspace_switcher(
                             let _ = window;
                         },
                     ),
-                )
+                );
+            if workspace_open {
+                menu = menu.separator().item(
+                    PopupMenuItem::new(tr!(cx, "关闭工作区", "Close workspace")).on_click(
+                        move |_, window, cx| {
+                            let _ = close_weak.update_in(cx, |view, window, cx| {
+                                view.close_workspace(window, cx);
+                            });
+                            let _ = window;
+                        },
+                    ),
+                );
+            }
+            menu
         })
 }
 
@@ -1165,11 +1217,15 @@ impl Render for AppView {
                                     } else {
                                         IconName::PanelLeftClose
                                     })
-                                    .tooltip(if self.sidebar_collapsed {
-                                        tr!(cx, "展开侧边栏", "Show sidebar")
-                                    } else {
-                                        tr!(cx, "收起侧边栏", "Hide sidebar")
-                                    })
+                                    .tooltip_with_action(
+                                        if self.sidebar_collapsed {
+                                            tr!(cx, "展开侧边栏", "Show sidebar")
+                                        } else {
+                                            tr!(cx, "收起侧边栏", "Hide sidebar")
+                                        },
+                                        &crate::ToggleSidebar,
+                                        None,
+                                    )
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_sidebar(cx);
                                     })),

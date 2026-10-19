@@ -7,12 +7,14 @@ use std::rc::Rc;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::tree::{TreeItem, tree};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, FontWeight, IntoElement, MouseButton, ParentElement as _,
@@ -79,10 +81,6 @@ pub fn render(
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
     let index = this.workspace.read(cx).index().cloned();
-    let index_name = index
-        .as_ref()
-        .map(|index| index.name.clone())
-        .unwrap_or_default();
     let request_count = index.as_ref().map(|index| index.request_count).unwrap_or(0);
     let collection_count = index
         .as_ref()
@@ -95,6 +93,8 @@ pub fn render(
     let menu_weak = weak.clone();
     let header_weak = weak.clone();
     let open_collection = this.open_collection.clone();
+    let renaming_id = this.rename.as_ref().map(|rename| rename.node_id.clone());
+    let renaming_input = this.rename.as_ref().map(|rename| rename.input.clone());
 
     let tree = tree(&this.tree, move |ix, entry, selected, _, _| {
         let item = entry.item();
@@ -121,6 +121,7 @@ pub fn render(
         let folder = !is_request && entry.is_folder();
         let expanded = entry.is_expanded();
         let open_here = open_collection.as_deref() == id.strip_prefix("coll:");
+        let editing = renaming_id.as_deref() == Some(id.as_ref());
         let mut row = ListItem::new(ix)
             .selected(selected || open_here)
             .pl(px(8.) + px(12.) * entry.depth() as f32)
@@ -171,10 +172,33 @@ pub fn render(
                         )
                     })
                     .child(Icon::new(icon).xsmall())
-                    .child(div().text_sm().text_ellipsis().child(item.label.clone())),
+                    .child(if editing {
+                        renaming_input
+                            .clone()
+                            .map(|input| {
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Input::new(&input).small())
+                                    .into_any_element()
+                            })
+                            .unwrap_or_else(|| {
+                                div()
+                                    .text_sm()
+                                    .text_ellipsis()
+                                    .child(item.label.clone())
+                                    .into_any_element()
+                            })
+                    } else {
+                        div()
+                            .text_sm()
+                            .text_ellipsis()
+                            .child(item.label.clone())
+                            .into_any_element()
+                    }),
             );
 
-        if is_request {
+        if is_request && !editing {
             let weak = weak.clone();
             let click_id = id.clone();
             row = row.on_click(move |_, window, cx| {
@@ -216,7 +240,7 @@ pub fn render(
                     })
                 },
             );
-        } else {
+        } else if !editing {
             let weak = weak.clone();
             let click_id = id.clone();
             row = row
@@ -268,55 +292,26 @@ pub fn render(
         node_context_menu(menu, entry.item().id.clone(), menu_weak.clone(), cx)
     });
 
-    let nav = v_flex().px_2().py_2().gap_0p5().children(
+    let nav = h_flex().px_2().pt_2().pb_1().gap_0p5().children(
         MainView::ALL
             .iter()
             .map(|view| nav_button(cx, this.view == *view, *view)),
     );
 
     v_flex()
+        .id("sidebar")
         .size_full()
         .min_w_0()
         .min_h_0()
         .overflow_hidden()
         .bg(theme.sidebar)
         .text_color(theme.sidebar_foreground)
-        // 工作区身份
-        .child(
-            v_flex()
-                .gap_0p5()
-                .px_3()
-                .pt_3()
-                .pb_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(index_name),
-                )
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(tr!(
-                            cx,
-                            format!("{collection_count} 个集合 · {request_count} 个请求"),
-                            format!("{collection_count} collections · {request_count} requests")
-                        )),
-                )
-                .when_some(active_env, |this, env| {
-                    this.child(
-                        h_flex()
-                            .gap_1()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::new(IconName::Braces).xsmall())
-                            .child(env),
-                    )
-                }),
+        .on_action(
+            cx.listener(|this, _: &gpui_kit::component::input::Escape, _, cx| {
+                this.cancel_inline_rename(cx);
+            }),
         )
-        // 导航：一排图标，悬停显示名称。设置在标题栏，不占这里。
+        // 导航收成一排图标，把高度留给集合树。名称在悬停提示里。
         .child(nav)
         .child(div().mx_3().border_t_1().border_color(theme.border))
         // 集合树
@@ -381,6 +376,32 @@ pub fn render(
                 .px_2()
                 .child(tree),
         )
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(tr!(
+                    cx,
+                    format!("{collection_count} 个集合 · {request_count} 个请求"),
+                    format!("{collection_count} collections · {request_count} requests")
+                ))
+                .when_some(active_env, |row, env| {
+                    row.child(div().child("·")).child(
+                        h_flex()
+                            .gap_1()
+                            .min_w_0()
+                            .child(Icon::new(IconName::Braces).xsmall())
+                            .child(div().text_ellipsis().child(env)),
+                    )
+                }),
+        )
 }
 
 fn draft_icon(
@@ -401,28 +422,12 @@ fn draft_icon(
 }
 
 fn nav_button(cx: &mut Context<AppView>, active: bool, view: MainView) -> gpui_kit::AnyElement {
-    let theme = cx.theme().clone();
-    h_flex()
-        .id(nav_id(view))
-        .w_full()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .text_sm()
-        .cursor_pointer()
-        .when(active, |this| {
-            this.bg(theme.accent)
-                .text_color(theme.foreground)
-                .font_weight(FontWeight::SEMIBOLD)
-        })
-        .when(!active, |this| {
-            this.text_color(theme.muted_foreground)
-                .hover(|this| this.bg(theme.muted).text_color(theme.foreground))
-        })
-        .child(Icon::new(icon_for(view)).xsmall())
-        .child(view.label(cx))
+    Button::new(nav_id(view))
+        .ghost()
+        .small()
+        .icon(icon_for(view))
+        .selected(active)
+        .tooltip(view.label(cx))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.switch_view(view, window, cx);
         }))
@@ -639,36 +644,11 @@ fn rename_item(
 ) -> PopupMenuItem {
     PopupMenuItem::new(label).on_click(move |_, window, cx| {
         let path = path.clone();
-        let locale = crate::i18n::current(cx);
-        prompt_name(
-            window,
-            cx,
-            tr!(cx, "重命名", "Rename"),
-            tr!(cx, "新名称", "New name"),
-            weak.clone(),
-            move |root, name| {
-                if request {
-                    thread_core::workspace::ops::rename_request(&root, &path, &name).map(|file| {
-                        let file_name = file.name().to_string();
-                        crate::i18n::owned(
-                            locale,
-                            format!("已重命名为 {file_name}"),
-                            format!("Renamed to {file_name}"),
-                        )
-                    })
-                } else {
-                    thread_core::workspace::ops::update_collection(&root, &path, Some(name), None)
-                        .map(|meta| {
-                            let collection_name = meta.name.clone();
-                            crate::i18n::owned(
-                                locale,
-                                format!("已重命名为 {collection_name}"),
-                                format!("Renamed to {collection_name}"),
-                            )
-                        })
-                }
-            },
-        );
+        let _ = weak.update_in(cx, |view, window, cx| {
+            let name = view.node_name(&path, request, cx).unwrap_or_default();
+            view.begin_inline_rename(path, request, name, window, cx);
+        });
+        let _ = window;
     })
 }
 
@@ -875,6 +855,182 @@ fn move_before(order: &mut Vec<String>, path: &str, before: &str) {
 }
 
 impl AppView {
+    /// 回车：请求在原位置改名，集合则展开或收起。
+    pub fn rename_or_toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.tree.read(cx).selected_item().cloned() else {
+            return;
+        };
+        let id = item.id.to_string();
+        if let Some(path) = id.strip_prefix("req:") {
+            self.begin_inline_rename(path.to_string(), true, item.label.to_string(), window, cx);
+        } else if let Some(path) = id.strip_prefix("coll:") {
+            let path = path.to_string();
+            if !self.collapsed_collections.remove(&path) {
+                self.collapsed_collections.insert(path);
+            }
+            rebuild_tree(self, cx);
+        }
+    }
+
+    pub fn node_name(&self, path: &str, request: bool, cx: &App) -> Option<String> {
+        let index = self.workspace.read(cx).index()?;
+        if request {
+            return index
+                .find_request(path)
+                .map(|location| location.request.name);
+        }
+        fn walk(nodes: &[CollectionNode], path: &str) -> Option<String> {
+            for node in nodes {
+                if node.path == path {
+                    return Some(node.name.clone());
+                }
+                if let Some(name) = walk(&node.children, path) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        walk(&index.collections, path)
+    }
+
+    /// 在集合树原来的那一行里编辑名称，不弹对话框。
+    pub fn begin_inline_rename(
+        &mut self,
+        path: String,
+        request: bool,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename = None;
+        let node_id = if request {
+            format!("req:{path}")
+        } else {
+            format!("coll:{path}")
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let watched = input.clone();
+        let watch = cx.subscribe_in(
+            &watched,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.commit_inline_rename(true, window, cx),
+                InputEvent::Blur => {
+                    let armed = this.rename.as_ref().is_some_and(|rename| rename.armed);
+                    if armed {
+                        this.commit_inline_rename(false, window, cx);
+                    }
+                }
+                InputEvent::Change | InputEvent::Focus => {}
+            },
+        );
+        self.rename = Some(crate::app::InlineRename {
+            node_id,
+            path,
+            request,
+            input: input.clone(),
+            armed: false,
+            watch,
+        });
+        cx.notify();
+
+        let view = cx.entity().downgrade();
+        let input_id = input.entity_id();
+        // 右键菜单关掉时会把焦点抢回去。等两帧再聚焦，避免刚打开就被失焦提交。
+        window.on_next_frame(move |window, _cx| {
+            window.on_next_frame(move |window, cx| {
+                let Some(view) = view.upgrade() else {
+                    return;
+                };
+                view.update(cx, |this, cx| {
+                    let same = this
+                        .rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.input.entity_id() == input_id);
+                    if !same {
+                        return;
+                    }
+                    if let Some(rename) = this.rename.as_mut() {
+                        rename.armed = true;
+                    }
+                    let Some(input) = this.rename.as_ref().map(|rename| rename.input.clone())
+                    else {
+                        return;
+                    };
+                    input.update(cx, |state, cx| {
+                        state.select_all(window, cx);
+                        state.focus(window, cx);
+                    });
+                });
+            });
+        });
+    }
+
+    pub fn cancel_inline_rename(&mut self, cx: &mut Context<Self>) {
+        if self.rename.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn commit_inline_rename(
+        &mut self,
+        from_enter: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        let name = rename.input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            if from_enter {
+                self.rename = Some(rename);
+                window.push_notification(tr!(cx, "名称不能为空。", "Name cannot be empty."), cx);
+            }
+            cx.notify();
+            return;
+        }
+        if self.node_name(&rename.path, rename.request, cx).as_deref() == Some(name.as_str()) {
+            cx.notify();
+            return;
+        }
+        if rename.request {
+            for tab in &mut self.tabs {
+                if tab.path.as_deref() == Some(rename.path.as_str()) {
+                    tab.name = name.clone();
+                }
+            }
+        }
+        let path = rename.path.clone();
+        let request = rename.request;
+        let locale = crate::i18n::current(cx);
+        self.workspace.update(cx, |model, cx| {
+            model.run(cx, move |root| {
+                if request {
+                    thread_core::workspace::ops::rename_request(&root, &path, &name).map(|file| {
+                        let file_name = file.name().to_string();
+                        crate::i18n::owned(
+                            locale,
+                            format!("已重命名为 {file_name}"),
+                            format!("Renamed to {file_name}"),
+                        )
+                    })
+                } else {
+                    thread_core::workspace::ops::update_collection(&root, &path, Some(name), None)
+                        .map(|meta| {
+                            let collection_name = meta.name.clone();
+                            crate::i18n::owned(
+                                locale,
+                                format!("已重命名为 {collection_name}"),
+                                format!("Renamed to {collection_name}"),
+                            )
+                        })
+                }
+            });
+        });
+        cx.notify();
+    }
+
     /// 拖拽请求：同一个集合里改顺序，丢到别的集合里就移动文件。
     fn place_dragged_request(
         &mut self,
