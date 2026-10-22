@@ -46,6 +46,27 @@ impl ResponseSection {
     }
 }
 
+/// 响应体的展示方式。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResponseBodyMode {
+    #[default]
+    Pretty,
+    Raw,
+    Preview,
+}
+
+impl ResponseBodyMode {
+    const ALL: [Self; 3] = [Self::Pretty, Self::Raw, Self::Preview];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pretty => "Pretty",
+            Self::Raw => "Raw",
+            Self::Preview => "Preview",
+        }
+    }
+}
+
 /// 响应到达后把分栏切回响应体。没有响应时不动。
 pub fn auto_select_section(tab: &mut RequestTab) {
     if tab.response.is_some() {
@@ -86,6 +107,7 @@ pub fn render(
         return empty_response(sending, cx);
     };
     let section = tab.response_section;
+    let body_mode = tab.response_body_mode;
     let timing = &response.timing;
     let unresolved = &response.unresolved_variables;
 
@@ -110,8 +132,11 @@ pub fn render(
 
     let content = match section {
         ResponseSection::Body => body_view(
+            tab_ix,
             response.body.as_deref(),
             response.body_file_path.as_deref(),
+            response.content_type.as_deref(),
+            body_mode,
             cx,
         ),
         ResponseSection::Headers => headers_view(&response.headers, cx),
@@ -244,8 +269,15 @@ fn response_sections(selected: ResponseSection, cx: &App) -> impl IntoElement {
         }))
 }
 
-/// 响应体：JSON 自动美化，其余原样展示。
-fn body_view(body: Option<&str>, body_file_path: Option<&str>, cx: &App) -> AnyElement {
+/// 响应体支持自动格式化、原始文本和静态预览。
+fn body_view(
+    tab_ix: usize,
+    body: Option<&str>,
+    body_file_path: Option<&str>,
+    content_type: Option<&str>,
+    mode: ResponseBodyMode,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let Some(body) = body else {
         let hint = body_file_path
@@ -266,42 +298,395 @@ fn body_view(body: Option<&str>, body_file_path: Option<&str>, cx: &App) -> AnyE
             .into_any_element();
     };
 
-    // 能解析成 JSON 就展示缩进版，否则原样展示。
-    let display = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| body.to_string());
-
+    let formatted = format_response_body(body, content_type);
+    let display = match mode {
+        ResponseBodyMode::Pretty => formatted.text.clone(),
+        ResponseBodyMode::Raw => body.to_string(),
+        ResponseBodyMode::Preview => preview_body(body, content_type, cx),
+    };
     let mono = theme.mono_font_family.clone();
+
     v_flex()
         .min_h_0()
         .flex_1()
         .gap_1()
         .child(
-            // 复制的是展示文本：看到的 JSON 就是拿到的 JSON。
-            h_flex().justify_end().child(
-                Clipboard::new("copy-response-body")
-                    .small()
-                    .value(display.clone())
-                    .tooltip(tr!(cx, "复制响应体", "Copy response body")),
-            ),
-        )
-        .child(
-            div()
-                .min_h_0()
-                .flex_1()
-                .id("response-body")
-                .overflow_y_scroll()
-                .rounded_md()
-                .bg(theme.muted)
-                .p_3()
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .flex_wrap()
                 .child(
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .font_family(mono)
-                        .child(display),
+                    h_flex()
+                        .gap_1()
+                        .children(ResponseBodyMode::ALL.map(|candidate| {
+                            let selected = mode == candidate;
+                            div()
+                                .id(SharedString::from(format!(
+                                    "response-body-mode-{candidate:?}"
+                                )))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .cursor_pointer()
+                                .when(selected, |this| {
+                                    this.bg(theme.accent)
+                                        .text_color(theme.foreground)
+                                        .font_weight(FontWeight::MEDIUM)
+                                })
+                                .when(!selected, |this| {
+                                    this.text_color(theme.muted_foreground).hover(|this| {
+                                        this.bg(theme.muted).text_color(theme.foreground)
+                                    })
+                                })
+                                .child(candidate.label())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(tab) = this.tabs.get_mut(tab_ix) {
+                                        tab.response_body_mode = candidate;
+                                        cx.notify();
+                                    }
+                                }))
+                        })),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(widgets::mini_tag(cx, formatted.format))
+                        .when(
+                            mode == ResponseBodyMode::Pretty && formatted.parse_error,
+                            |row| {
+                                row.child(div().text_xs().text_color(theme.muted_foreground).child(
+                                    tr!(
+                                        cx,
+                                        "格式解析失败，显示原始文本",
+                                        "Could not parse; showing raw text"
+                                    ),
+                                ))
+                            },
+                        )
+                        .child(
+                            Clipboard::new("copy-response-body")
+                                .small()
+                                .value(display.clone())
+                                .tooltip(tr!(cx, "复制当前视图", "Copy current view")),
+                        ),
                 ),
+        )
+        .child(if mode == ResponseBodyMode::Preview {
+            preview_panel(body, content_type, &theme, cx)
+        } else {
+            code_panel(&display, &mono, &theme)
+        })
+        .into_any_element()
+}
+
+struct FormattedBody {
+    text: String,
+    format: &'static str,
+    parse_error: bool,
+}
+
+fn format_response_body(body: &str, content_type: Option<&str>) -> FormattedBody {
+    let mime = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let detected = if mime.contains("json")
+        || (mime.is_empty()
+            && (body.trim_start().starts_with('{') || body.trim_start().starts_with('[')))
+    {
+        Some(("JSON", pretty_json as fn(&str) -> Option<String>))
+    } else if mime.contains("yaml")
+        || mime.contains("yml")
+        || ((mime.is_empty() || mime == "text/plain") && looks_like_yaml(body))
+    {
+        Some(("YAML", pretty_yaml as fn(&str) -> Option<String>))
+    } else if mime.contains("html") {
+        return FormattedBody {
+            text: body.to_string(),
+            format: "HTML",
+            parse_error: false,
+        };
+    } else if mime.contains("xml")
+        || (mime.is_empty()
+            && (body.trim_start().starts_with("<?xml") || body.trim_start().starts_with('<')))
+    {
+        Some(("XML", pretty_xml as fn(&str) -> Option<String>))
+    } else {
+        None
+    };
+
+    let Some((format, parser)) = detected else {
+        return FormattedBody {
+            text: body.to_string(),
+            format: "TEXT",
+            parse_error: false,
+        };
+    };
+    match parser(body) {
+        Some(text) => FormattedBody {
+            text,
+            format,
+            parse_error: false,
+        },
+        None => FormattedBody {
+            text: body.to_string(),
+            format,
+            parse_error: true,
+        },
+    }
+}
+
+fn pretty_json(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn pretty_xml(body: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+    use quick_xml::writer::Writer;
+
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(event) => writer.write_event(event).ok()?,
+            Err(_) => return None,
+        }
+    }
+    String::from_utf8(writer.into_inner()).ok()
+}
+
+fn looks_like_yaml(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with("---")
+        && !trimmed.starts_with("- ")
+        && !trimmed.lines().any(|line| {
+            let line = line.trim_start();
+            line.find(':').is_some_and(|colon| colon > 0)
+        })
+    {
+        return false;
+    }
+    matches!(
+        serde_yaml::from_str::<serde_yaml::Value>(body),
+        Ok(serde_yaml::Value::Mapping(_) | serde_yaml::Value::Sequence(_))
+    )
+}
+
+fn pretty_yaml(body: &str) -> Option<String> {
+    let value = serde_yaml::from_str::<serde_yaml::Value>(body).ok()?;
+    serde_yaml::to_string(&value).ok()
+}
+
+fn is_html(content_type: Option<&str>, body: &str) -> bool {
+    let mime = content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    mime.contains("html")
+        || body
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<!doctype html")
+        || body.trim_start().to_ascii_lowercase().starts_with("<html")
+}
+
+/// Preview renders HTML as safe text; scripts, styles, and embedded resources are never executed.
+fn preview_body(body: &str, content_type: Option<&str>, cx: &App) -> String {
+    if is_html(content_type, body) {
+        html_to_text(body)
+    } else if content_type.is_some_and(|mime| {
+        let mime = mime.to_ascii_lowercase();
+        mime.starts_with("image/") || mime.contains("pdf")
+    }) {
+        tr!(
+            cx,
+            "此响应类型暂不支持内嵌预览，请切换到 Raw 查看内容。",
+            "Inline preview is unavailable for this response type. Switch to Raw to inspect it."
+        )
+        .to_string()
+    } else {
+        body.to_string()
+    }
+}
+
+fn html_to_text(html: &str) -> String {
+    let mut output = String::new();
+    let mut rest = html;
+    let mut hidden_tag: Option<String> = None;
+    while !rest.is_empty() {
+        if let Some(tag_start) = rest.find('<') {
+            if tag_start > 0 && hidden_tag.is_none() {
+                output.push_str(&decode_html_entities(&rest[..tag_start]));
+            }
+            rest = &rest[tag_start..];
+            let Some(tag_end) = rest.find('>') else {
+                break;
+            };
+            let raw_tag = rest[1..tag_end].trim();
+            let closing = raw_tag.starts_with('/');
+            let name = raw_tag
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "script" | "style" | "iframe" | "object" | "svg"
+            ) {
+                if closing && hidden_tag.as_deref() == Some(name.as_str()) {
+                    hidden_tag = None;
+                } else if !closing {
+                    hidden_tag = Some(name);
+                }
+            } else if hidden_tag.is_none()
+                && matches!(
+                    name.as_str(),
+                    "br" | "hr"
+                        | "li"
+                        | "p"
+                        | "div"
+                        | "section"
+                        | "article"
+                        | "ul"
+                        | "ol"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "tr"
+                )
+            {
+                if name == "li" && !closing {
+                    output.push_str("\n• ");
+                } else {
+                    output.push('\n');
+                }
+            }
+            rest = &rest[tag_end + 1..];
+        } else {
+            if hidden_tag.is_none() {
+                output.push_str(&decode_html_entities(rest));
+            }
+            break;
+        }
+    }
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn decode_html_entities(text: &str) -> String {
+    let mut decoded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        decoded.push_str(&rest[..start]);
+        let entity_start = start + 1;
+        let Some(end) = rest[entity_start..].find(';') else {
+            decoded.push_str(&rest[start..]);
+            return decoded;
+        };
+        let entity = &rest[entity_start..entity_start + end];
+        let value = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                u32::from_str_radix(&entity[2..], 16)
+                    .ok()
+                    .and_then(char::from_u32)
+            }
+            _ if entity.starts_with('#') => {
+                entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+            }
+            _ => None,
+        };
+        if let Some(ch) = value {
+            decoded.push(ch);
+        } else {
+            decoded.push_str(&rest[start..entity_start + end + 1]);
+        }
+        rest = &rest[entity_start + end + 1..];
+    }
+    decoded.push_str(rest);
+    decoded
+}
+
+fn code_panel(body: &str, mono: &str, theme: &Theme) -> AnyElement {
+    let lines = body.split('\n').map(|line| {
+        let leading = line
+            .chars()
+            .take_while(|ch| *ch == ' ' || *ch == '\t')
+            .count();
+        let indent = "\u{00a0}".repeat(leading);
+        let content = line.trim_start_matches([' ', '\t']);
+        div()
+            .text_xs()
+            .whitespace_nowrap()
+            .font_family(mono.to_string())
+            .child(format!("{indent}{content}"))
+    });
+    div()
+        .min_h_0()
+        .flex_1()
+        .id("response-body")
+        .overflow_y_scroll()
+        .rounded_md()
+        .bg(theme.muted)
+        .p_3()
+        .child(v_flex().children(lines))
+        .into_any_element()
+}
+
+fn preview_panel(body: &str, content_type: Option<&str>, theme: &Theme, cx: &App) -> AnyElement {
+    let preview = preview_body(body, content_type, cx);
+    let is_html_response = is_html(content_type, body);
+    div()
+        .min_h_0()
+        .flex_1()
+        .id("response-preview")
+        .overflow_y_scroll()
+        .rounded_md()
+        .bg(theme.background)
+        .p_4()
+        .child(
+            v_flex()
+                .gap_2()
+                .when(is_html_response, |view| {
+                    view.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(tr!(
+                                cx,
+                                "安全静态预览：脚本、样式和外部资源不会执行。",
+                                "Safe static preview: scripts, styles, and external resources are not run."
+                            )),
+                    )
+                })
+                .child(v_flex().children(preview.lines().map(|line| {
+                    div().text_sm().py_0p5().child(line.to_string())
+                }))),
         )
         .into_any_element()
 }
@@ -496,4 +881,53 @@ fn timing_view(timing: &thread_core::services::http::Timing, cx: &App) -> AnyEle
                 .map(|(label, ms)| widgets::field_row(cx, label, format_duration(ms))),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod body_format_tests {
+    use super::{format_response_body, html_to_text};
+
+    #[test]
+    fn pretty_formats_json_from_content_type() {
+        let body = format_response_body(r#"{"ok":true,"count":2}"#, Some("application/json"));
+        assert_eq!(body.format, "JSON");
+        assert!(body.text.contains("\n  \"ok\": true"));
+        assert!(!body.parse_error);
+    }
+
+    #[test]
+    fn pretty_formats_xml_from_content_type() {
+        let body = format_response_body("<root><item>value</item></root>", Some("application/xml"));
+        assert_eq!(body.format, "XML");
+        assert!(body.text.contains("\n  <item>"));
+        assert!(!body.parse_error);
+    }
+
+    #[test]
+    fn pretty_formats_yaml_from_content_type() {
+        let body = format_response_body(
+            "name: Thread\nitems:\n- one\n- two",
+            Some("application/yaml"),
+        );
+        assert_eq!(body.format, "YAML");
+        assert!(body.text.contains("name: Thread"));
+        assert!(body.text.contains("- one"));
+        assert!(!body.parse_error);
+    }
+
+    #[test]
+    fn pretty_detects_yaml_with_plain_text_content_type() {
+        let body = format_response_body("name: Thread\nitems:\n- one", Some("text/plain"));
+        assert_eq!(body.format, "YAML");
+        assert!(!body.parse_error);
+    }
+
+    #[test]
+    fn html_preview_strips_active_content_and_decodes_entities() {
+        let text =
+            html_to_text("<h1>Hi &amp; welcome</h1><script>alert('x')</script><p>Safe text</p>");
+        assert!(text.contains("Hi & welcome"));
+        assert!(text.contains("Safe text"));
+        assert!(!text.contains("alert"));
+    }
 }

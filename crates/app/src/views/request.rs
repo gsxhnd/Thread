@@ -282,6 +282,7 @@ impl RequestTab {
             section: RequestSection::Body,
             pane: EditorPane::Primary,
             response_section: response::ResponseSection::Body,
+            response_body_mode: response::ResponseBodyMode::Pretty,
             task_id: None,
             sending: false,
             response: None,

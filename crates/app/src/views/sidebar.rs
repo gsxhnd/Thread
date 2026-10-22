@@ -12,9 +12,7 @@ use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::tree::{TreeItem, tree};
-use gpui_kit::component::{
-    ActiveTheme as _, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, FontWeight, IntoElement, MouseButton, ParentElement as _,
@@ -297,11 +295,25 @@ pub fn render(
         node_context_menu(menu, entry.item().id.clone(), menu_weak.clone(), cx)
     });
 
-    let nav = h_flex().px_2().pt_2().pb_1().gap_0p5().children(
-        MainView::ALL
-            .iter()
-            .map(|view| nav_button(cx, this.view == *view, *view)),
-    );
+    let nav = v_flex()
+        .gap_1()
+        .px_2()
+        .pt_3()
+        .pb_2()
+        .child(
+            div()
+                .px_2()
+                .pb_1()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.muted_foreground)
+                .child(tr!(cx, "工作台", "WORKSPACE")),
+        )
+        .children(
+            MainView::ALL
+                .iter()
+                .map(|view| nav_button(cx, this.view == *view, *view)),
+        );
 
     v_flex()
         .id("sidebar")
@@ -316,7 +328,7 @@ pub fn render(
                 this.cancel_inline_rename(cx);
             }),
         )
-        // 导航收成一排图标，把高度留给集合树。名称在悬停提示里。
+        // 具名工作区导航保持在集合树上方，活动页用强调色标出。
         .child(nav)
         .child(div().mx_3().border_t_1().border_color(theme.border))
         // 集合树
@@ -443,12 +455,28 @@ fn draft_icon(
 }
 
 fn nav_button(cx: &mut Context<AppView>, active: bool, view: MainView) -> gpui_kit::AnyElement {
-    Button::new(nav_id(view))
-        .ghost()
-        .small()
-        .icon(icon_for(view))
-        .selected(active)
-        .tooltip(view.label(cx))
+    let theme = cx.theme().clone();
+    h_flex()
+        .id(nav_id(view))
+        .w_full()
+        .h(px(32.))
+        .items_center()
+        .gap_2()
+        .px_2()
+        .rounded_md()
+        .text_sm()
+        .cursor_pointer()
+        .when(active, |this| {
+            this.bg(theme.accent)
+                .text_color(theme.foreground)
+                .font_weight(FontWeight::MEDIUM)
+        })
+        .when(!active, |this| {
+            this.text_color(theme.muted_foreground)
+                .hover(|this| this.bg(theme.muted).text_color(theme.foreground))
+        })
+        .child(Icon::new(icon_for(view)).xsmall())
+        .child(view.label(cx))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.switch_view(view, window, cx);
         }))

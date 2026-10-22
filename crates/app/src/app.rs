@@ -114,6 +114,8 @@ pub struct RequestTab {
     pub section: views::request::RequestSection,
     pub pane: views::request::EditorPane,
     pub response_section: views::response::ResponseSection,
+    /// 响应体格式/预览模式，按标签页分别记忆。
+    pub response_body_mode: views::response::ResponseBodyMode,
     /// 发送中的任务 id，用于取消。
     pub task_id: Option<String>,
     pub sending: bool,

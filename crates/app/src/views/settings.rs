@@ -1,4 +1,4 @@
-//! 设置子窗口：通用页和单独的快捷键页。
+//! 设置子窗口：通用、外观主题、快捷键与关于页面。
 
 use std::sync::Arc;
 
@@ -23,7 +23,9 @@ use crate::widgets;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     General,
+    Appearance,
     Shortcuts,
+    About,
 }
 
 pub struct SettingsWindow {
@@ -91,7 +93,6 @@ impl SettingsWindow {
     fn render_general(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.core.config.app_settings();
         let paths = self.core.paths();
-        let theme_pref = self.theme_preference(cx);
         let locale = crate::i18n::current(cx);
 
         v_flex()
@@ -103,8 +104,8 @@ impl SettingsWindow {
                 tr!(cx, "通用", "General"),
                 tr!(
                     cx,
-                    "主题、语言和 HTTP 默认值保存在本机配置里。代理端口和当前环境属于工作区。",
-                    "Theme, language, and HTTP defaults are stored on this machine. The proxy port and active environment belong to the workspace."
+                    "语言与 HTTP 默认值保存在本机配置里；代理端口和当前环境属于工作区。",
+                    "Language and HTTP defaults are stored on this machine. The proxy port and active environment belong to the workspace."
                 ),
                 Vec::<AnyElement>::new(),
             ))
@@ -147,75 +148,6 @@ impl SettingsWindow {
                                 if let Some(app) = this.app.upgrade() {
                                     app.update(cx, |view, cx| {
                                         view.set_locale(choice, window, cx);
-                                    });
-                                }
-                                cx.notify();
-                            }))
-                    })),
-            ))
-            .child(widgets::section(
-                cx,
-                tr!(cx, "外观", "Appearance"),
-                tr!(
-                    cx,
-                    "选择会记住，下次启动恢复。",
-                    "The choice is remembered and restored on the next launch."
-                ),
-                h_flex()
-                    .w_full()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(ThemePreference::ALL.map(|preference| {
-                        let selected = theme_pref == preference;
-                        let (background, foreground, accent) = preference.swatch();
-                        v_flex()
-                            .id(SharedString::from(format!(
-                                "theme-pref-{}",
-                                preference.code()
-                            )))
-                            .w(px(150.))
-                            .gap_2()
-                            .p_2()
-                            .rounded_md()
-                            .border_1()
-                            .cursor_pointer()
-                            .when(selected, |this| {
-                                this.border_color(cx.theme().primary)
-                                    .bg(cx.theme().accent)
-                            })
-                            .when(!selected, |this| {
-                                this.border_color(cx.theme().border)
-                                    .hover(|this| this.bg(cx.theme().muted))
-                            })
-                            .child(
-                                h_flex()
-                                    .h(px(28.))
-                                    .w_full()
-                                    .rounded_sm()
-                                    .overflow_hidden()
-                                    .bg(gpui_kit::rgb(background))
-                                    .border_1()
-                                    .border_color(gpui_kit::rgb(foreground))
-                                    .child(div().w(px(10.)).h_full().bg(gpui_kit::rgb(accent)))
-                                    .child(
-                                        div()
-                                            .ml_2()
-                                            .w(px(40.))
-                                            .h(px(4.))
-                                            .rounded_sm()
-                                            .bg(gpui_kit::rgb(foreground)),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
-                                    .child(preference.label(cx)),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(app) = this.app.upgrade() {
-                                    app.update(cx, |view, cx| {
-                                        view.set_theme(preference, window, cx);
                                     });
                                 }
                                 cx.notify();
@@ -309,6 +241,240 @@ impl SettingsWindow {
             ))
             .into_any_element()
     }
+
+    fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme_pref = self.theme_preference(cx);
+        let layout = self
+            .app
+            .read_with(cx, |view, _| view.editor_layout)
+            .unwrap_or_default();
+
+        v_flex()
+            .gap_5()
+            .px_6()
+            .py_5()
+            .child(widgets::page_header(
+                cx,
+                tr!(cx, "外观", "Appearance"),
+                tr!(
+                    cx,
+                    "为工作台选择主题，并调整请求与响应面板的默认布局。",
+                    "Choose a workspace theme and set the default request/response layout."
+                ),
+                Vec::<AnyElement>::new(),
+            ))
+            .child(widgets::section(
+                cx,
+                tr!(cx, "主题", "Theme"),
+                tr!(
+                    cx,
+                    "选择会立即应用，并保存在本机配置中。",
+                    "Changes apply immediately and are saved to this machine."
+                ),
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(ThemePreference::ALL.map(|preference| {
+                        let selected = theme_pref == preference;
+                        let (background, foreground, accent) = preference.swatch();
+                        v_flex()
+                            .id(SharedString::from(format!(
+                                "theme-pref-{}",
+                                preference.code()
+                            )))
+                            .w(px(150.))
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .cursor_pointer()
+                            .when(selected, |this| {
+                                this.border_color(cx.theme().primary).bg(cx.theme().accent)
+                            })
+                            .when(!selected, |this| {
+                                this.border_color(cx.theme().border)
+                                    .hover(|this| this.bg(cx.theme().muted))
+                            })
+                            .child(
+                                h_flex()
+                                    .h(px(34.))
+                                    .w_full()
+                                    .rounded_sm()
+                                    .overflow_hidden()
+                                    .bg(gpui_kit::rgb(background))
+                                    .border_1()
+                                    .border_color(gpui_kit::rgb(foreground))
+                                    .child(div().w(px(12.)).h_full().bg(gpui_kit::rgb(accent)))
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .justify_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .child(
+                                                div()
+                                                    .w(px(42.))
+                                                    .h(px(4.))
+                                                    .rounded_sm()
+                                                    .bg(gpui_kit::rgb(foreground)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(26.))
+                                                    .h(px(3.))
+                                                    .rounded_sm()
+                                                    .bg(gpui_kit::rgb(foreground))
+                                                    .opacity(0.55),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .when(selected, |this| this.font_weight(FontWeight::MEDIUM))
+                                    .child(preference.label(cx)),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(app) = this.app.upgrade() {
+                                    app.update(cx, |view, cx| {
+                                        view.set_theme(preference, window, cx)
+                                    });
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            ))
+            .child(widgets::section(
+                cx,
+                tr!(cx, "请求 / 响应布局", "Request / response layout"),
+                tr!(
+                    cx,
+                    "控制编辑器与响应面板的默认排列方式。",
+                    "Choose how the editor and response panel are arranged by default."
+                ),
+                h_flex().gap_2().children(
+                    [
+                        (
+                            crate::theme::EditorLayout::Stacked,
+                            tr!(cx, "上下排列", "Stacked"),
+                        ),
+                        (
+                            crate::theme::EditorLayout::Columns,
+                            tr!(cx, "左右并排", "Side by side"),
+                        ),
+                    ]
+                    .map(|(choice, label)| {
+                        let selected = layout == choice;
+                        h_flex()
+                            .id(SharedString::from(format!(
+                                "editor-layout-{}",
+                                match choice {
+                                    crate::theme::EditorLayout::Stacked => "stacked",
+                                    crate::theme::EditorLayout::Columns => "columns",
+                                }
+                            )))
+                            .flex_1()
+                            .h(px(42.))
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .text_sm()
+                            .cursor_pointer()
+                            .when(selected, |this| {
+                                this.border_color(cx.theme().primary).bg(cx.theme().accent)
+                            })
+                            .when(!selected, |this| {
+                                this.border_color(cx.theme().border)
+                                    .hover(|this| this.bg(cx.theme().muted))
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(app) = this.app.upgrade() {
+                                    app.update(cx, |view, cx| view.set_editor_layout(choice, cx));
+                                }
+                                cx.notify();
+                            }))
+                    }),
+                ),
+            ))
+            .into_any_element()
+    }
+
+    fn render_about(&self, cx: &mut Context<Self>) -> AnyElement {
+        let paths = self.core.paths();
+        let version = env!("CARGO_PKG_VERSION");
+        v_flex()
+            .gap_5()
+            .px_6()
+            .py_5()
+            .child(widgets::page_header(
+                cx,
+                tr!(cx, "关于 Thread", "About Thread"),
+                tr!(cx, "应用信息、支持的协议与本地数据说明。", "App information, supported protocols, and local data details."),
+                Vec::<AnyElement>::new(),
+            ))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_4()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().secondary)
+                    .p_5()
+                    .child(
+                        div()
+                            .size_12()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(cx.theme().primary)
+                            .text_color(cx.theme().primary_foreground)
+                            .text_size(px(22.))
+                            .font_weight(FontWeight::BOLD)
+                            .child("T"),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Thread / 灰线"))
+                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(tr!(cx, "本地优先的 API 开发与调试工作台", "A local-first API development and debugging workbench")))
+                            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(format!("{} · {}", tr!(cx, "版本", "Version"), version))),
+                    ),
+            )
+            .child(widgets::section(
+                cx,
+                tr!(cx, "为 API 工作流而建", "Built for API workflows"),
+                tr!(cx, "集合与请求以文件形式保存在工作区；运行记录与代理数据留在本机。", "Collections and requests are files in your workspace; run history and proxy data stay local."),
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(["HTTP", "GraphQL", "WebSocket", "gRPC", "MQTT", "Proxy"].map(|label| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(cx.theme().muted)
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(label)
+                    })),
+            ))
+            .child(widgets::section(
+                cx,
+                tr!(cx, "本机存储位置", "Local storage"),
+                tr!(cx, "工作区可使用 Git 管理；以下路径仅供本机应用数据参考。", "Workspaces can be managed with Git. These paths contain local app data."),
+                v_flex()
+                    .gap_3()
+                    .child(path_row(cx, tr!(cx, "配置文件", "Config file"), paths.config_file))
+                    .child(path_row(cx, tr!(cx, "数据目录", "Data folder"), paths.data_dir)),
+            ))
+            .into_any_element()
+    }
 }
 
 impl Render for SettingsWindow {
@@ -345,10 +511,24 @@ impl Render for SettingsWindow {
                             ))
                             .child(page_tab(
                                 cx,
+                                "settings-page-appearance",
+                                tr!(cx, "外观与主题", "Appearance & theme"),
+                                page == SettingsPage::Appearance,
+                                SettingsPage::Appearance,
+                            ))
+                            .child(page_tab(
+                                cx,
                                 "settings-page-shortcuts",
                                 tr!(cx, "快捷键", "Shortcuts"),
                                 page == SettingsPage::Shortcuts,
                                 SettingsPage::Shortcuts,
+                            ))
+                            .child(page_tab(
+                                cx,
+                                "settings-page-about",
+                                tr!(cx, "关于", "About"),
+                                page == SettingsPage::About,
+                                SettingsPage::About,
                             )),
                     )
                     .child(
@@ -361,9 +541,11 @@ impl Render for SettingsWindow {
                             .overflow_y_scroll()
                             .child(match page {
                                 SettingsPage::General => self.render_general(cx),
+                                SettingsPage::Appearance => self.render_appearance(cx),
                                 SettingsPage::Shortcuts => {
                                     shortcuts::render(window, cx).into_any_element()
                                 }
+                                SettingsPage::About => self.render_about(cx),
                             }),
                     ),
             )
