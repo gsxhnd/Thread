@@ -6,6 +6,7 @@ use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IndexPath, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
@@ -122,6 +123,26 @@ pub enum KvKind {
 }
 
 pub const BODY_KINDS: [&str; 5] = ["none", "json", "raw", "form", "form-data"];
+
+/// 回填一个 HTTP 请求时需要的全部字段（来自文件文档或历史快照）。
+struct HttpFields<'a> {
+    name: &'a str,
+    method: &'a str,
+    url: &'a str,
+    params: &'a [KeyValue],
+    headers: &'a [KeyValue],
+    body: &'a HttpBody,
+    auth: &'a AuthSpec,
+}
+
+/// 渲染键值行时用的快照，拷出实体句柄后就不再借用标签页。
+struct KvRowView {
+    key: Entity<InputState>,
+    value: Entity<InputState>,
+    enabled: bool,
+    file: bool,
+    file_path: Option<String>,
+}
 
 /// 一行键值编辑（参数 / 请求头 / 表单字段共用）。
 pub struct KvRow {
@@ -324,13 +345,15 @@ impl RequestTab {
         cx: &mut Context<AppView>,
     ) {
         self.fill_http(
-            &doc.name,
-            &doc.method,
-            &doc.url,
-            &doc.query_params,
-            &doc.headers,
-            &doc.body,
-            &doc.auth,
+            HttpFields {
+                name: &doc.name,
+                method: &doc.method,
+                url: &doc.url,
+                params: &doc.query_params,
+                headers: &doc.headers,
+                body: &doc.body,
+                auth: &doc.auth,
+            },
             window,
             cx,
         );
@@ -353,13 +376,15 @@ impl RequestTab {
             .map(|config| {
                 let name = self.name.clone();
                 self.fill_http(
-                    &name,
-                    &config.method,
-                    &config.url,
-                    &config.query_params,
-                    &config.headers,
-                    &config.body,
-                    &config.auth,
+                    HttpFields {
+                        name: &name,
+                        method: &config.method,
+                        url: &config.url,
+                        params: &config.query_params,
+                        headers: &config.headers,
+                        body: &config.body,
+                        auth: &config.auth,
+                    },
                     window,
                     cx,
                 );
@@ -384,13 +409,15 @@ impl RequestTab {
                         .unwrap_or(&self.name)
                         .to_string();
                     self.fill_http(
-                        &name,
-                        &config.method,
-                        &config.url,
-                        &config.query_params,
-                        &config.headers,
-                        &config.body,
-                        &config.auth,
+                        HttpFields {
+                            name: &name,
+                            method: &config.method,
+                            url: &config.url,
+                            params: &config.query_params,
+                            headers: &config.headers,
+                            body: &config.body,
+                            auth: &config.auth,
+                        },
                         window,
                         cx,
                     );
@@ -407,16 +434,19 @@ impl RequestTab {
 
     fn fill_http(
         &mut self,
-        name: &str,
-        method: &str,
-        url: &str,
-        params: &[KeyValue],
-        headers: &[KeyValue],
-        body: &HttpBody,
-        auth: &AuthSpec,
+        fields: HttpFields<'_>,
         window: &mut Window,
         cx: &mut Context<AppView>,
     ) {
+        let HttpFields {
+            name,
+            method,
+            url,
+            params,
+            headers,
+            body,
+            auth,
+        } = fields;
         if !name.is_empty() {
             self.name = name.to_string();
         }
@@ -704,10 +734,11 @@ impl RequestTab {
 
     /// 序列化成保存到磁盘的请求文档。
     pub fn to_document(&self, cx: &App) -> serde_json::Value {
-        if self.protocol == Protocol::Mqtt {
-            if let Some(value) = self.preserved.clone() {
-                return value;
-            }
+        // MQTT 只展示不发送，保存时原样写回读入的文档，不丢字段。
+        if self.protocol == Protocol::Mqtt
+            && let Some(value) = self.preserved.clone()
+        {
+            return value;
         }
         let file = match self.protocol {
             Protocol::Http | Protocol::Mqtt => {
@@ -856,7 +887,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     };
 
     // 先把要用的实体句柄拷出来，避免下面与标签条遍历打架。
-    let (method, url, body, body_kind, section, error, sending, has_path, _task_id) = {
+    let (method, url, body, body_kind, section, error, sending, has_path) = {
         let tab = &this.tabs[active];
         (
             tab.method.clone(),
@@ -867,7 +898,6 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
             tab.error.clone(),
             tab.sending,
             tab.path.is_some(),
-            tab.task_id.is_some(),
         )
     };
 
@@ -1118,7 +1148,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
             .child(kv_editor(this, active, KvKind::Headers, cx))
             .into_any_element(),
         RequestSection::Auth => auth_editor(this, active, cx),
-        RequestSection::Body => body_editor(this, active, &method, &body_kind, &body, cx),
+        RequestSection::Body => body_editor(this, active, &body_kind, &body, cx),
         RequestSection::Timeline => crate::views::history::request_timeline(this, active, cx),
     };
     let response_panel = Some(response::render(this, active, window, cx));
@@ -1186,8 +1216,8 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                                         })
                                         .tooltip(tr!(cx, "复制为 cURL", "Copy as cURL")),
                                 )
-                                .child(send_button)
-                                .child(save_button),
+                                .child(save_button)
+                                .child(send_button),
                         )
                         .child(section_bar),
                 ))
@@ -1201,7 +1231,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                             .items_center()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child(gpui_kit::component::spinner::Spinner::new())
+                            .child(Spinner::new())
                             .child(tr!(cx, "请求发送中…", "Sending…")),
                     ))
                 })
@@ -1267,7 +1297,7 @@ fn section_label_with_count(
     }
 }
 
-/// 键值编辑表（参数/请求头）。`window` 保留给未来弹窗使用。
+/// 键值编辑表（参数 / 请求头 / 表单字段）。
 pub(crate) fn kv_editor(
     this: &mut AppView,
     active: usize,
@@ -1281,13 +1311,7 @@ pub(crate) fn kv_editor(
             .get(active)
             .and_then(|tab| tab.body_kind.read(cx).selected_value().copied())
             == Some("form-data");
-    let rows: Vec<(
-        Entity<InputState>,
-        Entity<InputState>,
-        bool,
-        bool,
-        Option<String>,
-    )> = {
+    let rows: Vec<KvRowView> = {
         let Some(tab) = this.tabs.get(active) else {
             return div().into_any_element();
         };
@@ -1297,14 +1321,12 @@ pub(crate) fn kv_editor(
             KvKind::Form => &tab.form_fields,
         };
         rows.iter()
-            .map(|row| {
-                (
-                    row.key.clone(),
-                    row.value.clone(),
-                    row.enabled,
-                    row.file,
-                    row.file_path.clone(),
-                )
+            .map(|row| KvRowView {
+                key: row.key.clone(),
+                value: row.value.clone(),
+                enabled: row.enabled,
+                file: row.file,
+                file_path: row.file_path.clone(),
             })
             .collect()
     };
@@ -1342,77 +1364,80 @@ pub(crate) fn kv_editor(
         } else {
             v_flex()
                 .gap_1()
-                .children(rows.into_iter().enumerate().map(
-                    |(ix, (key, value, enabled, file, file_path))| {
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(kv_toggle(active, ix, kind, enabled, &theme, cx))
-                            .child(div().w(px(200.)).child(Input::new(&key).small()))
-                            .when(form_files, |row| {
-                                row.child(form_mode_button(active, ix, file, cx))
-                            })
-                            .child(if form_files && file {
-                                h_flex()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_ellipsis()
-                                            .text_color(theme.muted_foreground)
-                                            .child(file_path.unwrap_or_else(|| {
-                                                tr!(cx, "未选择文件", "No file chosen").to_string()
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(SharedString::from(format!(
-                                            "kv-file-{}-{ix}",
-                                            kind_tag(kind)
-                                        )))
-                                        .outline()
-                                        .small()
-                                        .label(tr!(cx, "选择文件", "Choose file"))
-                                        .on_click(
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.pick_form_file(active, ix, window, cx);
-                                            }),
-                                        ),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&value).small())
-                                    .into_any_element()
-                            })
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "kv-remove-{}-{ix}",
+                .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                    let KvRowView {
+                        key,
+                        value,
+                        enabled,
+                        file,
+                        file_path,
+                    } = row;
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(kv_toggle(active, ix, kind, enabled, &theme, cx))
+                        .child(div().w(px(200.)).child(Input::new(&key).small()))
+                        .when(form_files, |row| {
+                            row.child(form_mode_button(active, ix, file, cx))
+                        })
+                        .child(if form_files && file {
+                            h_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap_1()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_xs()
+                                        .text_ellipsis()
+                                        .text_color(theme.muted_foreground)
+                                        .child(file_path.unwrap_or_else(|| {
+                                            tr!(cx, "未选择文件", "No file chosen").to_string()
+                                        })),
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "kv-file-{}-{ix}",
                                         kind_tag(kind)
                                     )))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .size_5()
-                                    .rounded_sm()
-                                    .hover(|this| this.bg(theme.muted))
-                                    .cursor_pointer()
-                                    .child(Icon::new(IconName::Delete).xsmall())
-                                    .on_click(cx.listener(
-                                        move |this, _: &gpui_kit::ClickEvent, _, cx| {
-                                            this.remove_kv_row(active, ix, kind, cx);
-                                        },
-                                    )),
-                            )
-                            .into_any_element()
-                    },
-                ))
+                                    .outline()
+                                    .small()
+                                    .label(tr!(cx, "选择文件", "Choose file"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.pick_form_file(active, ix, window, cx);
+                                    })),
+                                )
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex_1()
+                                .child(Input::new(&value).small())
+                                .into_any_element()
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "kv-remove-{}-{ix}",
+                                    kind_tag(kind)
+                                )))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size_5()
+                                .rounded_sm()
+                                .hover(|this| this.bg(theme.muted))
+                                .cursor_pointer()
+                                .child(Icon::new(IconName::Delete).xsmall())
+                                .on_click(cx.listener(
+                                    move |this, _: &gpui_kit::ClickEvent, _, cx| {
+                                        this.remove_kv_row(active, ix, kind, cx);
+                                    },
+                                )),
+                        )
+                        .into_any_element()
+                }))
                 .into_any_element()
         })
         .child(
@@ -1649,6 +1674,18 @@ fn body_placeholder(kind: &str, cx: &App) -> SharedString {
     }
 }
 
+/// Body 子标签的显示名。
+fn body_kind_label(kind: &'static str, cx: &App) -> &'static str {
+    match kind {
+        "none" => tr!(cx, "无", "None"),
+        "json" => "JSON",
+        "raw" => tr!(cx, "文本", "Raw"),
+        "form" => tr!(cx, "表单", "Form"),
+        "form-data" => tr!(cx, "表单数据", "Form data"),
+        other => other,
+    }
+}
+
 pub(crate) fn response_from_history(detail: &HistoryDetail) -> Option<HttpResponse> {
     let snap = detail.response_snapshot.as_ref()?;
     let timing = snap
@@ -1708,7 +1745,6 @@ pub(crate) fn response_from_history(detail: &HistoryDetail) -> Option<HttpRespon
 fn body_editor(
     this: &mut AppView,
     active: usize,
-    _method: &Entity<SelectState<Vec<&'static str>>>,
     body_kind: &Entity<SelectState<Vec<&'static str>>>,
     body: &Entity<EditorState>,
     cx: &mut Context<AppView>,
@@ -1719,7 +1755,25 @@ fn body_editor(
         .selected_value()
         .copied()
         .unwrap_or("none");
-    let body_kind = body_kind.clone();
+
+    // 类型分段按钮在左，JSON 的格式化/压缩动作靠右，两组不混在一起。
+    let kind_tabs = h_flex()
+        .gap_0p5()
+        .items_center()
+        .children(BODY_KINDS.map(|candidate| {
+            let selected = kind == candidate;
+            let button = Button::new(SharedString::from(format!("body-kind-{candidate}")))
+                .small()
+                .label(body_kind_label(candidate, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_body_kind(active, candidate, window, cx);
+                }));
+            if selected {
+                button.primary()
+            } else {
+                button.ghost()
+            }
+        }));
 
     v_flex()
         .size_full()
@@ -1728,38 +1782,31 @@ fn body_editor(
         .child(
             h_flex()
                 .flex_shrink_0()
-                .gap_2()
+                .justify_between()
                 .items_center()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(tr!(cx, "类型", "Type")),
-                )
-                .child(
-                    div()
-                        .w(px(128.))
-                        .flex_shrink_0()
-                        .child(Select::new(&body_kind).small()),
-                )
+                .child(kind_tabs)
                 .when(kind == "json", |row| {
                     row.child(
-                        Button::new("format-json")
-                            .ghost()
-                            .small()
-                            .label(tr!(cx, "格式化", "Format"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.format_json_body(active, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("compact-json")
-                            .ghost()
-                            .small()
-                            .label(tr!(cx, "压缩", "Compact"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.compact_json_body(active, window, cx);
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Button::new("format-json")
+                                    .ghost()
+                                    .small()
+                                    .label(tr!(cx, "格式化", "Format"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.format_json_body(active, window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("compact-json")
+                                    .ghost()
+                                    .small()
+                                    .label(tr!(cx, "压缩", "Compact"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.compact_json_body(active, window, cx);
+                                    })),
+                            ),
                     )
                 }),
         )
@@ -1933,6 +1980,34 @@ impl AppView {
         cx.notify();
     }
 
+    /// 切换请求体类型（Body 子标签）。select 是数据源，程序化设置不触发
+    /// Confirm 事件，所以标脏和占位提示在这里一并处理。
+    pub fn set_body_kind(
+        &mut self,
+        tab_ix: usize,
+        kind: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = BODY_KINDS.iter().position(|candidate| *candidate == kind) else {
+            return;
+        };
+        let Some(tab) = self.tabs.get_mut(tab_ix) else {
+            return;
+        };
+        if tab.body_kind.read(cx).selected_value().copied() == Some(kind) {
+            return;
+        }
+        let select = tab.body_kind.clone();
+        let body = tab.body.clone();
+        tab.dirty = true;
+        select.update(cx, |state, cx| {
+            state.set_selected_index(Some(IndexPath::default().row(index)), window, cx);
+        });
+        sync_body_placeholder(&body, kind, window, cx);
+        cx.notify();
+    }
+
     pub fn set_form_file_mode(
         &mut self,
         tab_ix: usize,
@@ -2088,8 +2163,9 @@ impl AppView {
         cx.notify();
 
         let core = self.core.clone();
-        let task_core = self.core.clone();
-        let receiver = core.spawn(async move { task_core.send_http(payload).await });
+        let receiver = self
+            .core
+            .spawn(async move { core.send_http(payload).await });
 
         cx.spawn(async move |this, cx| {
             let result: thread_core::AppResult<thread_core::services::http::HttpResponse> =
@@ -2102,7 +2178,7 @@ impl AppView {
                     let Some(tab) = view.tabs.get_mut(tab_ix) else {
                         return;
                     };
-                    if !tab.task_id.is_some() {
+                    if tab.task_id.is_none() {
                         return; // 标签页已被替换或取消重置
                     }
                     tab.sending = false;
@@ -2283,12 +2359,7 @@ pub fn watch_tab_edits(
         tab.auth_key.clone(),
         tab.auth_value.clone(),
     ];
-    for row in tab
-        .params
-        .iter()
-        .chain(tab.headers.iter())
-        .chain(tab.form_fields.iter())
-    {
+    for row in tab.kv_rows() {
         inputs.push(row.key.clone());
         inputs.push(row.value.clone());
     }
@@ -2300,7 +2371,7 @@ pub fn watch_tab_edits(
         watches.push(
             cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    mark_input_dirty(this, input, cx);
+                    mark_dirty(this, cx, |tab| tab.owns_input(input));
                 }
             }),
         );
@@ -2311,7 +2382,7 @@ pub fn watch_tab_edits(
             window,
             |this, editor, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
-                    mark_editor_dirty(this, editor, cx);
+                    mark_dirty(this, cx, |tab| tab.owns_editor(editor));
                 }
             },
         ));
@@ -2320,21 +2391,15 @@ pub fn watch_tab_edits(
         watches.push(cx.subscribe_in(
             &select,
             window,
-            move |this, select, event: &SelectEvent<Vec<&'static str>>, window, cx| {
+            |this, select, event: &SelectEvent<Vec<&'static str>>, window, cx| {
                 if !matches!(event, SelectEvent::Confirm(_)) {
                     return;
                 }
-                mark_select_dirty(this, select, cx);
-                // 切换请求体类型时同步占位提示。
-                if let Some(tab) = this.tabs.get(tab_ix)
-                    && tab.body_kind == *select
-                {
+                mark_dirty(this, cx, |tab| tab.owns_select(select));
+                // 切换请求体类型时同步占位提示。按实体找标签页，不依赖可能已变动的下标。
+                if let Some(tab) = this.tabs.iter().find(|tab| tab.body_kind == *select) {
                     let kind = select.read(cx).selected_value().copied().unwrap_or("none");
-                    let placeholder = body_placeholder(kind, cx);
-                    let body = tab.body.clone();
-                    body.update(cx, |state, cx| {
-                        state.set_placeholder(placeholder, window, cx)
-                    });
+                    sync_body_placeholder(&tab.body, kind, window, cx);
                 }
             },
         ));
@@ -2344,61 +2409,22 @@ pub fn watch_tab_edits(
     }
 }
 
-fn mark_input_dirty(this: &mut AppView, input: &Entity<InputState>, cx: &mut Context<AppView>) {
-    let Some(tab) = this.tabs.iter_mut().find(|tab| input_belongs(tab, input)) else {
-        return;
-    };
-    if tab.dirty {
-        return;
-    }
-    tab.dirty = true;
-    cx.notify();
-}
-
-fn input_belongs(tab: &RequestTab, input: &Entity<InputState>) -> bool {
-    tab.url == *input
-        || tab.service == *input
-        || tab.rpc_method == *input
-        || tab.operation_name == *input
-        || tab.message == *input
-        || tab.auth_token == *input
-        || tab.auth_username == *input
-        || tab.auth_password == *input
-        || tab.auth_key == *input
-        || tab.auth_value == *input
-        || tab
-            .params
-            .iter()
-            .chain(tab.headers.iter())
-            .chain(tab.form_fields.iter())
-            .any(|row| row.key == *input || row.value == *input)
-}
-
-fn mark_editor_dirty(this: &mut AppView, editor: &Entity<EditorState>, cx: &mut Context<AppView>) {
-    let Some(tab) = this
-        .tabs
-        .iter_mut()
-        .find(|tab| tab.body == *editor || tab.variables == *editor)
-    else {
-        return;
-    };
-    if tab.dirty {
-        return;
-    }
-    tab.dirty = true;
-    cx.notify();
-}
-
-fn mark_select_dirty(
-    this: &mut AppView,
-    select: &Entity<SelectState<Vec<&'static str>>>,
-    cx: &mut Context<AppView>,
+/// 切换 body 类型后，编辑器的占位提示跟着变。
+fn sync_body_placeholder(
+    body: &Entity<EditorState>,
+    kind: &str,
+    window: &mut Window,
+    cx: &mut App,
 ) {
-    let Some(tab) = this
-        .tabs
-        .iter_mut()
-        .find(|tab| tab.method == *select || tab.body_kind == *select)
-    else {
+    let placeholder = body_placeholder(kind, cx);
+    body.update(cx, |state, cx| {
+        state.set_placeholder(placeholder, window, cx)
+    });
+}
+
+/// 找到拥有该控件的标签页并标记为未保存。已经是脏的标签页不重复通知。
+fn mark_dirty(this: &mut AppView, cx: &mut Context<AppView>, owns: impl Fn(&RequestTab) -> bool) {
+    let Some(tab) = this.tabs.iter_mut().find(|tab| owns(tab)) else {
         return;
     };
     if tab.dirty {
@@ -2406,4 +2432,41 @@ fn mark_select_dirty(
     }
     tab.dirty = true;
     cx.notify();
+}
+
+impl RequestTab {
+    /// 所有键值行：参数、请求头、表单字段。
+    fn kv_rows(&self) -> impl Iterator<Item = &KvRow> {
+        self.params
+            .iter()
+            .chain(self.headers.iter())
+            .chain(self.form_fields.iter())
+    }
+
+    /// 这个输入框是否属于本标签页。
+    fn owns_input(&self, input: &Entity<InputState>) -> bool {
+        self.url == *input
+            || self.service == *input
+            || self.rpc_method == *input
+            || self.operation_name == *input
+            || self.message == *input
+            || self.auth_token == *input
+            || self.auth_username == *input
+            || self.auth_password == *input
+            || self.auth_key == *input
+            || self.auth_value == *input
+            || self
+                .kv_rows()
+                .any(|row| row.key == *input || row.value == *input)
+    }
+
+    /// 这个多行编辑器是否属于本标签页。
+    fn owns_editor(&self, editor: &Entity<EditorState>) -> bool {
+        self.body == *editor || self.variables == *editor
+    }
+
+    /// 这个下拉框是否属于本标签页。
+    fn owns_select(&self, select: &Entity<SelectState<Vec<&'static str>>>) -> bool {
+        self.method == *select || self.body_kind == *select
+    }
 }

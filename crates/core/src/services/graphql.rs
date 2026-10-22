@@ -678,10 +678,10 @@ pub fn complete_fields(schema: &GraphqlSchema, query: &str) -> Vec<FieldCompleti
                         stack.push(type_name);
                     }
                     pending = None;
-                } else if let Some(field) = pending.take() {
-                    if let Some(named) = field_named_type(schema, stack.last(), &field) {
-                        stack.push(named);
-                    }
+                } else if let Some(field) = pending.take()
+                    && let Some(named) = field_named_type(schema, stack.last(), &field)
+                {
+                    stack.push(named);
                 }
             }
             GqlToken::RBrace => {

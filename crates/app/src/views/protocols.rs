@@ -785,11 +785,13 @@ fn send_graphql(this: &mut AppView, tab_ix: usize, introspect: bool, cx: &mut Co
         subscribe_graphql(
             this,
             tab_ix,
-            endpoint,
-            query,
-            variables,
-            operation_name,
-            headers,
+            GraphqlSubscription {
+                endpoint,
+                query,
+                variables,
+                operation_name,
+                headers,
+            },
             cx,
         );
         return;
@@ -881,16 +883,28 @@ fn send_graphql(this: &mut AppView, tab_ix: usize, introspect: bool, cx: &mut Co
     .detach();
 }
 
-fn subscribe_graphql(
-    this: &mut AppView,
-    tab_ix: usize,
+/// 从标签页收集出来的 GraphQL 订阅内容。
+struct GraphqlSubscription {
     endpoint: String,
     query: String,
     variables: String,
     operation_name: Option<String>,
     headers: Vec<thread_core::workspace::formats::KeyValue>,
+}
+
+fn subscribe_graphql(
+    this: &mut AppView,
+    tab_ix: usize,
+    request: GraphqlSubscription,
     cx: &mut Context<AppView>,
 ) {
+    let GraphqlSubscription {
+        endpoint,
+        query,
+        variables,
+        operation_name,
+        headers,
+    } = request;
     let sender = this.core.live_sender();
     let sink = std::sync::Arc::new(move |event| {
         let _ = sender.send(thread_core::LiveEvent::Graphql(event));

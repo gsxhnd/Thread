@@ -514,7 +514,7 @@ impl std::io::Write for DailyLogWriter<'_> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        (&mut *self.0).flush()
+        self.0.flush()
     }
 }
 

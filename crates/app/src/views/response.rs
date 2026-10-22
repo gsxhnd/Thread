@@ -1,11 +1,13 @@
 //! 响应面板：状态行 + 响应体/响应头/Cookie/耗时。
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::clipboard::Clipboard;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString,
-    Styled as _, Window, div, px,
+    AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString, Styled,
+    Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 
@@ -24,6 +26,15 @@ pub enum ResponseSection {
 }
 
 impl ResponseSection {
+    /// 分栏的展示顺序。
+    pub const ALL: [Self; 5] = [
+        Self::Body,
+        Self::Headers,
+        Self::Cookies,
+        Self::Timing,
+        Self::Console,
+    ];
+
     fn label(self, cx: &App) -> &'static str {
         match self {
             Self::Body => tr!(cx, "响应体", "Body"),
@@ -35,13 +46,29 @@ impl ResponseSection {
     }
 }
 
-/// 响应到达后把视图切到最能说明问题的分区。
+/// 响应到达后把分栏切回响应体。没有响应时不动。
 pub fn auto_select_section(tab: &mut RequestTab) {
-    let Some(response) = &tab.response else {
-        return;
-    };
-    tab.response_section = ResponseSection::Body;
-    let _ = response;
+    if tab.response.is_some() {
+        tab.response_section = ResponseSection::Body;
+    }
+}
+
+/// 分栏标签的基础样式：选中态有底线并加粗，未选中态是弱化文字。
+fn tab_style<E: Styled + FluentBuilder>(element: E, selected: bool, theme: &Theme) -> E {
+    element
+        .px_2()
+        .py_1()
+        .text_xs()
+        .border_b_2()
+        .when(selected, |this| {
+            this.border_color(theme.primary)
+                .text_color(theme.foreground)
+                .font_weight(FontWeight::SEMIBOLD)
+        })
+        .when(!selected, |this| {
+            this.border_color(gpui_kit::transparent_black())
+                .text_color(theme.muted_foreground)
+        })
 }
 
 pub fn render(
@@ -59,37 +86,19 @@ pub fn render(
         return empty_response(sending, cx);
     };
     let section = tab.response_section;
-
     let timing = &response.timing;
-    let unresolved = response.unresolved_variables.clone();
+    let unresolved = &response.unresolved_variables;
 
-    let section_bar = h_flex().gap_1().children(
-        [
-            ResponseSection::Body,
-            ResponseSection::Headers,
-            ResponseSection::Cookies,
-            ResponseSection::Timing,
-            ResponseSection::Console,
-        ]
-        .map(|candidate| {
+    let section_bar = h_flex()
+        .gap_1()
+        .children(ResponseSection::ALL.map(|candidate| {
             let selected = section == candidate;
-            div()
+            tab_style(div(), selected, &theme)
                 .id(SharedString::from(format!("resp-section-{candidate:?}")))
-                .px_2()
-                .py_1()
-                .text_xs()
-                .border_b_2()
-                .when(selected, |this| {
-                    this.border_color(theme.primary)
-                        .text_color(theme.foreground)
-                        .font_weight(FontWeight::SEMIBOLD)
-                })
-                .when(!selected, |this| {
-                    this.border_color(gpui_kit::transparent_black())
-                        .text_color(theme.muted_foreground)
-                        .hover(|this| this.text_color(theme.foreground))
-                })
                 .cursor_pointer()
+                .when(!selected, |this| {
+                    this.hover(|this| this.text_color(theme.foreground))
+                })
                 .child(candidate.label(cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tab) = this.tabs.get_mut(tab_ix) {
@@ -97,12 +106,11 @@ pub fn render(
                         cx.notify();
                     }
                 }))
-        }),
-    );
+        }));
 
     let content = match section {
         ResponseSection::Body => body_view(
-            response.body.clone(),
+            response.body.as_deref(),
             response.body_file_path.as_deref(),
             cx,
         ),
@@ -180,15 +188,29 @@ pub fn render(
 /// 还没有响应时也画出同一块面板，分栏从打开请求起就占好位置。
 fn empty_response(sending: bool, cx: &App) -> AnyElement {
     let theme = cx.theme().clone();
-    let hint = if sending {
-        tr!(cx, "请求发送中…", "Sending…").to_string()
+    let center = if sending {
+        v_flex()
+            .gap_3()
+            .items_center()
+            .child(Spinner::new().large().color(theme.muted_foreground))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(tr!(cx, "请求发送中…", "Sending…")),
+            )
+            .into_any_element()
     } else {
-        tr!(
+        widgets::compact_empty(
             cx,
-            "发送请求后，响应会显示在这里。",
-            "The response shows up here after you send."
+            IconName::Inbox,
+            tr!(
+                cx,
+                "发送请求后，响应会显示在这里。",
+                "The response shows up here after you send."
+            ),
         )
-        .to_string()
+        .into_any_element()
     };
     v_flex()
         .size_full()
@@ -207,46 +229,23 @@ fn empty_response(sending: bool, cx: &App) -> AnyElement {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(hint),
+                .child(center),
         )
         .into_any_element()
 }
 
-fn response_sections(section: ResponseSection, cx: &App) -> impl IntoElement {
+/// 只读的分栏条，给空状态用：样式与可点击的分栏条一致，但不响应点击。
+fn response_sections(selected: ResponseSection, cx: &App) -> impl IntoElement {
     let theme = cx.theme().clone();
-    h_flex().gap_1().children(
-        [
-            ResponseSection::Body,
-            ResponseSection::Headers,
-            ResponseSection::Cookies,
-            ResponseSection::Timing,
-            ResponseSection::Console,
-        ]
-        .map(|candidate| {
-            let selected = section == candidate;
-            div()
-                .px_2()
-                .py_1()
-                .text_xs()
-                .border_b_2()
-                .when(selected, |this| {
-                    this.border_color(theme.primary)
-                        .text_color(theme.foreground)
-                        .font_weight(FontWeight::SEMIBOLD)
-                })
-                .when(!selected, |this| {
-                    this.border_color(gpui_kit::transparent_black())
-                        .text_color(theme.muted_foreground)
-                })
-                .child(candidate.label(cx))
-        }),
-    )
+    h_flex()
+        .gap_1()
+        .children(ResponseSection::ALL.map(|candidate| {
+            tab_style(div(), candidate == selected, &theme).child(candidate.label(cx))
+        }))
 }
 
 /// 响应体：JSON 自动美化，其余原样展示。
-fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> AnyElement {
+fn body_view(body: Option<&str>, body_file_path: Option<&str>, cx: &App) -> AnyElement {
     let theme = cx.theme().clone();
     let Some(body) = body else {
         let hint = body_file_path
@@ -267,12 +266,11 @@ fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> An
             .into_any_element();
     };
 
-    let mut display = body.clone();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.as_str())
-        && let Ok(pretty) = serde_json::to_string_pretty(&value)
-    {
-        display = pretty;
-    }
+    // 能解析成 JSON 就展示缩进版，否则原样展示。
+    let display = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| body.to_string());
 
     let mono = theme.mono_font_family.clone();
     v_flex()
@@ -308,6 +306,27 @@ fn body_view(body: Option<String>, body_file_path: Option<&str>, cx: &App) -> An
         .into_any_element()
 }
 
+/// 单行键值：左侧名称（定宽、弱化），右侧值。响应头和 Cookie 共用。
+fn kv_line(
+    theme: &Theme,
+    name: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+) -> impl IntoElement {
+    h_flex()
+        .gap_2()
+        .text_xs()
+        .py_0p5()
+        .child(
+            div()
+                .w(px(200.))
+                .flex_shrink_0()
+                .text_color(theme.muted_foreground)
+                .text_ellipsis()
+                .child(name.into()),
+        )
+        .child(div().flex_1().text_ellipsis().child(value.into()))
+}
+
 fn headers_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &App) -> AnyElement {
     let theme = cx.theme().clone();
     if headers.is_empty() {
@@ -317,7 +336,6 @@ fn headers_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &
             .child(tr!(cx, "响应没有头。", "No response headers."))
             .into_any_element();
     }
-    let muted = theme.muted_foreground;
     // 复制成 `k: v` 行，方便贴进 issue 或日志。
     let copy_text: String = headers
         .iter()
@@ -340,23 +358,8 @@ fn headers_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &
         .children(
             headers
                 .iter()
-                .flat_map(|(name, values)| values.iter().map(|value| (name.clone(), value.clone())))
-                .map(|(name, value)| {
-                    h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .py_0p5()
-                        .child(
-                            div()
-                                .w(px(200.))
-                                .flex_shrink_0()
-                                .text_color(muted)
-                                .text_ellipsis()
-                                .child(name),
-                        )
-                        .child(div().flex_1().text_ellipsis().child(value))
-                        .into_any_element()
-                }),
+                .flat_map(|(name, values)| values.iter().map(move |value| (name, value)))
+                .map(|(name, value)| kv_line(&theme, name.as_str(), value.as_str())),
         )
         .into_any_element()
 }
@@ -400,21 +403,11 @@ fn cookies_view(headers: &std::collections::BTreeMap<String, Vec<String>>, cx: &
         .overflow_y_scroll()
         .flex_1()
         .gap_1()
-        .children(cookies.into_iter().map(|(key, value)| {
-            h_flex()
-                .gap_2()
-                .text_xs()
-                .py_0p5()
-                .child(
-                    div()
-                        .w(px(200.))
-                        .flex_shrink_0()
-                        .text_color(theme.muted_foreground)
-                        .text_ellipsis()
-                        .child(key),
-                )
-                .child(div().flex_1().text_ellipsis().child(value))
-        }))
+        .children(
+            cookies
+                .into_iter()
+                .map(|(key, value)| kv_line(&theme, key, value)),
+        )
         .into_any_element()
 }
 

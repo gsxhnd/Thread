@@ -26,6 +26,7 @@ use thread_core::workspace::index::{CollectionNode, RequestNode, WorkspaceIndex}
 
 use crate::app::AppView;
 use crate::state::MainView;
+use crate::widgets;
 
 /// 由索引构建集合树（集合可嵌套，请求作为叶子）。
 fn build_items(
@@ -80,15 +81,19 @@ pub fn render(
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
-    let index = this.workspace.read(cx).index().cloned();
-    let request_count = index.as_ref().map(|index| index.request_count).unwrap_or(0);
-    let collection_count = index
-        .as_ref()
-        .map(|index| index.collection_count)
-        .unwrap_or(0);
-    let active_env = index
-        .as_ref()
-        .and_then(|index| index.active_environment.clone());
+    // 只取需要的字段，避免每次渲染都克隆整份工作区索引。
+    let (collection_count, request_count, active_env) = this
+        .workspace
+        .read(cx)
+        .index()
+        .map(|index| {
+            (
+                index.collection_count,
+                index.request_count,
+                index.active_environment.clone(),
+            )
+        })
+        .unwrap_or((0, 0, None));
     let weak: WeakEntity<AppView> = cx.entity().downgrade();
     let menu_weak = weak.clone();
     let header_weak = weak.clone();
@@ -374,7 +379,23 @@ pub fn render(
                 .id("collection-tree")
                 .overflow_y_scroll()
                 .px_2()
-                .child(tree),
+                .map(|container| {
+                    if collection_count == 0 && request_count == 0 {
+                        container.child(
+                            div().pt_10().child(widgets::compact_empty(
+                                cx,
+                                IconName::Inbox,
+                                tr!(
+                                    cx,
+                                    "还没有集合。右键点击「集合」标题即可新建。",
+                                    "No collections yet. Right-click the Collections heading to add one."
+                                ),
+                            )),
+                        )
+                    } else {
+                        container.child(tree)
+                    }
+                }),
         )
         .child(
             h_flex()

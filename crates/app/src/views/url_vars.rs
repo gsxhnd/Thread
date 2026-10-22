@@ -727,19 +727,20 @@ fn complete_variables(text: &str) -> Vec<VarSpan> {
     let bytes = text.as_bytes();
     let mut index = 0;
     while index + 3 < bytes.len() {
-        if bytes[index] == b'{' && bytes[index + 1] == b'{' {
-            if let Some(end_rel) = text[index + 2..].find("}}") {
-                let key = &text[index + 2..index + 2 + end_rel];
-                if is_key(key) {
-                    let end = index + 2 + end_rel + 2;
-                    spans.push(VarSpan {
-                        start: index,
-                        end,
-                        key: key.to_string(),
-                    });
-                    index = end;
-                    continue;
-                }
+        if bytes[index] == b'{'
+            && bytes[index + 1] == b'{'
+            && let Some(end_rel) = text[index + 2..].find("}}")
+        {
+            let key = &text[index + 2..index + 2 + end_rel];
+            if is_key(key) {
+                let end = index + 2 + end_rel + 2;
+                spans.push(VarSpan {
+                    start: index,
+                    end,
+                    key: key.to_string(),
+                });
+                index = end;
+                continue;
             }
         }
         index += text[index..]

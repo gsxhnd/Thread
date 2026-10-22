@@ -71,6 +71,33 @@ pub fn empty_state_with_action(
         .child(action)
 }
 
+/// 窄区域里的小号空提示：淡色图标 + 一行说明（侧栏、响应区等）。
+pub fn compact_empty(
+    cx: &App,
+    icon: IconName,
+    message: impl Into<SharedString>,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let message: SharedString = message.into();
+    v_flex()
+        .items_center()
+        .gap_3()
+        .px_4()
+        .child(
+            Icon::new(icon)
+                .with_size(px(28.))
+                .text_color(theme.muted_foreground.opacity(0.5)),
+        )
+        .child(
+            div()
+                .max_w(px(260.))
+                .text_xs()
+                .text_center()
+                .text_color(theme.muted_foreground)
+                .child(message),
+        )
+}
+
 /// 带标题的卡片区块，用于设置/详情页。
 pub fn section(
     cx: &App,
