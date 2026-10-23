@@ -498,7 +498,7 @@ fn toolbar(
         .flex_shrink_0()
         .gap_2()
         .items_start()
-        .child(crate::views::url_vars::field(this, active, url, cx))
+        .child(crate::views::url_vars::field(this, active, url, true, cx))
         .child(
             Button::new("proto-action")
                 .primary()

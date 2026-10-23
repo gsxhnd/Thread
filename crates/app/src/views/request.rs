@@ -2,8 +2,8 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::spinner::Spinner;
@@ -12,8 +12,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    PathPromptOptions, SharedString, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, IntoElement,
+    ParentElement as _, PathPromptOptions, SharedString, Styled as _, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use std::collections::BTreeMap;
@@ -56,7 +56,7 @@ impl RequestSection {
     fn label(self, cx: &App) -> &'static str {
         match self {
             Self::Params => tr!(cx, "参数", "Params"),
-            Self::Auth => tr!(cx, "认证", "Auth"),
+            Self::Auth => tr!(cx, "认证", "Authorization"),
             Self::Headers => tr!(cx, "请求头", "Headers"),
             Self::Body => tr!(cx, "请求体", "Body"),
             Self::Timeline => tr!(cx, "时间线", "Timeline"),
@@ -282,7 +282,7 @@ impl RequestTab {
             section: RequestSection::Body,
             pane: EditorPane::Primary,
             response_section: response::ResponseSection::Body,
-            response_body_mode: response::ResponseBodyMode::Pretty,
+            response_body_mode: response::ResponseBodyMode::Auto,
             task_id: None,
             sending: false,
             response: None,
@@ -837,8 +837,192 @@ fn push_pairs(
     }
 }
 
-/// 请求主区（标签条 + 编辑区 + 响应面板）。
+/// 主区域顶部的请求标签，样式对齐 Postman：活动标签与内容区同色，未保存只留一个圆点。
+fn request_tab_bar(this: &mut AppView, cx: &mut Context<AppView>) -> impl IntoElement + use<> {
+    let theme = cx.theme().clone();
+    let tab_count = this.tabs.len();
+    let collection_open = this.open_collection.is_some();
+    let collection_name = this.open_collection.as_ref().and_then(|path| {
+        this.workspace.read(cx).index().and_then(|index| {
+            crate::views::collection::find_collection(&index.collections, path)
+                .map(|node| node.name.clone())
+        })
+    });
+
+    h_flex()
+        .w_full()
+        .h(px(36.))
+        .flex_shrink_0()
+        .items_end()
+        .gap_1()
+        .px_2()
+        .bg(theme.sidebar)
+        .border_b_1()
+        .border_color(theme.border)
+        .id("request-tab-bar")
+        .overflow_x_scroll()
+        .when_some(collection_name, |bar, name| {
+            bar.child(
+                h_flex()
+                    .id("tab-collection")
+                    .h(px(32.))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .text_sm()
+                    .bg(theme.background)
+                    .border_b_2()
+                    .border_color(theme.primary)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(Icon::new(IconName::Folder).xsmall())
+                    .child(div().text_ellipsis().max_w(px(180.)).child(name))
+                    .child(
+                        div()
+                            .id("tab-collection-close")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size_4()
+                            .rounded_sm()
+                            .hover(|this| this.bg(theme.border))
+                            .cursor_pointer()
+                            .child(Icon::new(IconName::X).xsmall())
+                            .on_click(cx.listener(|this, _: &gpui_kit::ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_collection = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+        })
+        .children((0..tab_count).map(|ix| {
+            let name = this.tabs[ix].name.clone();
+            let dirty = this.tabs[ix].dirty;
+            let protocol = this.tabs[ix].protocol;
+            let method_name = this.tabs[ix]
+                .method
+                .read(cx)
+                .selected_value()
+                .copied()
+                .unwrap_or("GET");
+            let is_active = !collection_open && this.active_tab == Some(ix);
+            let badge = if protocol == Protocol::Http {
+                method_name.to_ascii_uppercase()
+            } else {
+                protocol.label().to_string()
+            };
+            let badge_color = if protocol == Protocol::Http {
+                let colors = crate::format::SemanticColors::for_theme(cx.theme());
+                crate::format::method_color(Some(method_name), &colors)
+            } else if is_active {
+                theme.primary
+            } else {
+                theme.muted_foreground
+            };
+            let tab_id = this.tabs[ix].id.clone();
+            let close_id = tab_id.clone();
+            h_flex()
+                .id(SharedString::from(format!("tab-{tab_id}")))
+                .h(px(32.))
+                .items_center()
+                .gap_2()
+                .px_3()
+                .text_sm()
+                .border_b_2()
+                .when(is_active, |this| {
+                    this.border_color(theme.primary)
+                        .bg(theme.background)
+                        .font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!is_active, |this| {
+                    this.border_color(theme.sidebar)
+                        .text_color(theme.muted_foreground)
+                        .hover(|this| this.bg(theme.muted))
+                })
+                .cursor_pointer()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(badge_color)
+                        .child(badge),
+                )
+                .when(dirty, |this| {
+                    this.child(div().size(px(6.)).rounded_full().bg(theme.primary))
+                })
+                .child(div().text_ellipsis().max_w(px(180.)).child(name))
+                .child(
+                    div()
+                        .id(SharedString::from(format!("tab-close-{close_id}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size_4()
+                        .rounded_sm()
+                        .hover(|this| this.bg(theme.border))
+                        .cursor_pointer()
+                        .child(Icon::new(IconName::X).xsmall())
+                        .on_click(cx.listener(
+                            move |this, _: &gpui_kit::ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                let Some(index) =
+                                    this.tabs.iter().position(|tab| tab.id == close_id)
+                                else {
+                                    return;
+                                };
+                                this.close_tab(index, window, cx);
+                            },
+                        )),
+                )
+                .on_click(cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
+                    this.open_collection = None;
+                    this.active_tab = Some(ix);
+                    cx.notify();
+                }))
+                .on_aux_click(
+                    cx.listener(move |this, _: &gpui_kit::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        let Some(index) = this.tabs.iter().position(|tab| tab.id == tab_id) else {
+                            return;
+                        };
+                        this.close_tab(index, window, cx);
+                    }),
+                )
+        }))
+        .child(
+            Button::new("tab-new")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Plus)
+                .tooltip_with_action(
+                    tr!(cx, "新建临时请求", "New untitled request"),
+                    &crate::NewRequest,
+                    None,
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.new_draft_tab(window, cx);
+                })),
+        )
+}
+
+/// 请求主区（标签条 + 编辑区 + 响应面板）。集合页开着时，标签条仍留在上面。
 pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) -> AnyElement {
+    if this.open_collection.is_some() {
+        let bar = (!this.tabs.is_empty()).then(|| request_tab_bar(this, cx).into_any_element());
+        return v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .when_some(bar, |column, bar| column.child(bar))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(crate::views::collection::render(this, window, cx)),
+            )
+            .into_any_element();
+    }
+
     let theme = cx.theme().clone();
     let Some(active) = this.active_tab.filter(|ix| *ix < this.tabs.len()) else {
         return v_flex()
@@ -902,121 +1086,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
         )
     };
 
-    let tab_count = this.tabs.len();
-    let theme_for_tabs = theme.clone();
-
-    let tab_bar = h_flex()
-        .w_full()
-        .flex_shrink_0()
-        .items_end()
-        .gap_1()
-        .px_2()
-        .bg(theme_for_tabs.sidebar)
-        .border_b_1()
-        .border_color(theme_for_tabs.border)
-        .id("request-tab-bar")
-        .overflow_x_scroll()
-        .children((0..tab_count).map(|ix| {
-            let name = this.tabs[ix].name.clone();
-            let dirty = this.tabs[ix].dirty;
-            let is_active = this.active_tab == Some(ix);
-            let tab_id = this.tabs[ix].id.clone();
-            let close_id = tab_id.clone();
-            h_flex()
-                .id(SharedString::from(format!("tab-{tab_id}")))
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .text_sm()
-                .border_b_2()
-                .when(is_active, |this| {
-                    this.border_color(theme_for_tabs.primary)
-                        .bg(theme_for_tabs.background)
-                        .font_weight(FontWeight::SEMIBOLD)
-                })
-                .when(!is_active, |this| {
-                    this.border_color(theme_for_tabs.sidebar)
-                        .text_color(theme_for_tabs.muted_foreground)
-                        .hover(|this| this.bg(theme_for_tabs.muted))
-                })
-                .cursor_pointer()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(if is_active {
-                            theme_for_tabs.primary
-                        } else {
-                            theme_for_tabs.muted_foreground
-                        })
-                        .child(this.tabs[ix].protocol.label()),
-                )
-                .when(dirty, |this| {
-                    this.child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(div().size(px(6.)).rounded_full().bg(theme_for_tabs.primary))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme_for_tabs.primary)
-                                    .child(tr!(cx, "未保存", "Unsaved")),
-                            ),
-                    )
-                })
-                .child(div().text_ellipsis().max_w(px(180.)).child(name))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("tab-close-{close_id}")))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size_4()
-                        .rounded_sm()
-                        .hover(|this| this.bg(theme_for_tabs.border))
-                        .cursor_pointer()
-                        .child(Icon::new(IconName::X).xsmall())
-                        .on_click(cx.listener(
-                            move |this, _: &gpui_kit::ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                let Some(index) =
-                                    this.tabs.iter().position(|tab| tab.id == close_id)
-                                else {
-                                    return;
-                                };
-                                this.close_tab(index, window, cx);
-                            },
-                        )),
-                )
-                .on_click(cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
-                    this.active_tab = Some(ix);
-                    cx.notify();
-                }))
-                .on_aux_click(
-                    cx.listener(move |this, _: &gpui_kit::ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        let Some(index) = this.tabs.iter().position(|tab| tab.id == tab_id) else {
-                            return;
-                        };
-                        this.close_tab(index, window, cx);
-                    }),
-                )
-        }))
-        .child(
-            Button::new("tab-new")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Plus)
-                .tooltip_with_action(
-                    tr!(cx, "新建临时请求", "New untitled request"),
-                    &crate::NewRequest,
-                    None,
-                )
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.new_draft_tab(window, cx);
-                })),
-        );
+    let tab_bar = request_tab_bar(this, cx);
 
     if this.tabs[active].protocol != Protocol::Http {
         let show_timeline = this.tabs[active].section == RequestSection::Timeline;
@@ -1064,6 +1134,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     let send_button = if sending {
         Button::new("cancel")
             .outline()
+            .small()
             .label(tr!(cx, "取消", "Cancel"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.cancel_request(active, window, cx);
@@ -1071,6 +1142,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     } else {
         Button::new("send")
             .primary()
+            .small()
             .label(tr!(cx, "发送", "Send"))
             .tooltip_with_action(tr!(cx, "发送", "Send"), &crate::SendRequest, None)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1081,6 +1153,7 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     let save_button = if has_path {
         Button::new("save")
             .outline()
+            .small()
             .label(tr!(cx, "保存", "Save"))
             .tooltip_with_action(tr!(cx, "保存", "Save"), &crate::SaveRequest, None)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1089,10 +1162,17 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
     } else {
         Button::new("save-as")
             .outline()
+            .small()
             .label(tr!(cx, "保存到工作区", "Save to workspace"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.save_request_as(active, window, cx);
             }))
+    };
+
+    let method_tint = {
+        let name = method.read(cx).selected_value().copied().unwrap_or("GET");
+        let colors = crate::format::SemanticColors::for_theme(&theme);
+        crate::format::method_color(Some(name), &colors)
     };
 
     let section_bar =
@@ -1182,43 +1262,92 @@ pub fn render(this: &mut AppView, window: &mut Window, cx: &mut Context<AppView>
                                 .flex_shrink_0()
                                 .gap_2()
                                 .items_center()
-                                .child(
-                                    div()
-                                        .w(px(108.))
-                                        .flex_shrink_0()
-                                        .child(Select::new(&method).small()),
-                                )
-                                .child(crate::views::url_vars::field(this, active, &url, cx))
-                                .child(
-                                    // 复制的是输入框当前内容，含未替换的 {{变量}}。
-                                    Clipboard::new("copy-request-url")
-                                        .small()
-                                        .value_fn(move |_, cx| url.read(cx).value())
-                                        .tooltip(tr!(cx, "复制 URL", "Copy URL")),
-                                )
-                                .child(
-                                    // 点击时按当前表单导出 cURL，含请求体与认证。
-                                    Clipboard::new("copy-curl")
-                                        .small()
-                                        .value_fn(move |_, cx| {
-                                            let Some(main) = cx.try_global::<crate::app::MainApp>()
-                                            else {
-                                                return SharedString::default();
-                                            };
-                                            let Some(view) = main.0.upgrade() else {
-                                                return SharedString::default();
-                                            };
-                                            let Some(tab) = view.read(cx).tabs.get(active) else {
-                                                return SharedString::default();
-                                            };
-                                            SharedString::from(crate::curl::command(
-                                                &tab.collect_config(cx),
-                                            ))
-                                        })
-                                        .tooltip(tr!(cx, "复制为 cURL", "Copy as cURL")),
-                                )
                                 .child(save_button)
-                                .child(send_button),
+                                .child(
+                                    Button::new("generate-code")
+                                        .outline()
+                                        .small()
+                                        .icon(IconName::Code)
+                                        .label(tr!(cx, "生成代码", "Code"))
+                                        .dropdown_menu(move |menu, _, _| {
+                                            let mut menu = menu;
+                                            for language in crate::codegen::SnippetLanguage::ALL {
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(language.label()).on_click(
+                                                        move |_, window, cx| {
+                                                            let Some(main) = cx
+                                                                .try_global::<crate::app::MainApp>(
+                                                                )
+                                                            else {
+                                                                return;
+                                                            };
+                                                            let Some(view) = main.0.upgrade()
+                                                            else {
+                                                                return;
+                                                            };
+                                                            let Some(tab) =
+                                                                view.read(cx).tabs.get(active)
+                                                            else {
+                                                                return;
+                                                            };
+                                                            let code = crate::codegen::render(
+                                                                &tab.collect_config(cx),
+                                                                language,
+                                                            );
+                                                            cx.write_to_clipboard(
+                                                                ClipboardItem::new_string(code),
+                                                            );
+                                                            window.push_notification(
+                                                                (
+                                                                    NotificationType::Success,
+                                                                    tr!(
+                                                                        cx,
+                                                                        "代码已复制",
+                                                                        "Code copied"
+                                                                    )
+                                                                    .to_string(),
+                                                                ),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    ),
+                                                );
+                                            }
+                                            menu
+                                        }),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .items_center()
+                                        .overflow_hidden()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.background)
+                                        .child(
+                                            div()
+                                                .w(px(3.))
+                                                .h(px(28.))
+                                                .flex_shrink_0()
+                                                .bg(method_tint),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(108.))
+                                                .flex_shrink_0()
+                                                .border_r_1()
+                                                .border_color(theme.border)
+                                                .child(
+                                                    Select::new(&method).small().appearance(false),
+                                                ),
+                                        )
+                                        .child(crate::views::url_vars::field(
+                                            this, active, &url, false, cx,
+                                        ))
+                                        .child(div().pr_1().flex_shrink_0().child(send_button)),
+                                ),
                         )
                         .child(section_bar),
                 ))
@@ -1260,6 +1389,15 @@ fn section_label_with_count(
     let Some(tab) = tabs.get(tab_ix) else {
         return SharedString::from(section.label(cx));
     };
+    if section == RequestSection::Auth {
+        let kind = match tab.auth_kind.as_str() {
+            "bearer" => "Bearer",
+            "basic" => "Basic",
+            "apiKey" => "API Key",
+            _ => return SharedString::from(section.label(cx)),
+        };
+        return SharedString::from(format!("{} · {kind}", section.label(cx)));
+    }
     let count = match section {
         RequestSection::Params => tab
             .params
@@ -1294,7 +1432,7 @@ fn section_label_with_count(
     if count == 0 {
         SharedString::from(section.label(cx))
     } else {
-        SharedString::from(format!("{} {}", section.label(cx), count))
+        SharedString::from(format!("{} ({count})", section.label(cx)))
     }
 }
 

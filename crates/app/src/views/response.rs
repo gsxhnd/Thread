@@ -1,7 +1,9 @@
 //! 响应面板：状态行 + 响应体/响应头/Cookie/耗时。
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
@@ -46,23 +48,29 @@ impl ResponseSection {
     }
 }
 
-/// 响应体的展示方式。
+/// 响应体按哪种格式展示。`Auto` 跟随 Content-Type，下拉里可以改成指定格式。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ResponseBodyMode {
     #[default]
-    Pretty,
+    Auto,
+    Json,
+    Xml,
+    Html,
+    Yaml,
     Raw,
-    Preview,
 }
 
 impl ResponseBodyMode {
-    const ALL: [Self; 3] = [Self::Pretty, Self::Raw, Self::Preview];
+    const CHOICES: [Self; 5] = [Self::Json, Self::Xml, Self::Html, Self::Yaml, Self::Raw];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Pretty => "Pretty",
+            Self::Auto => "Auto",
+            Self::Json => "JSON",
+            Self::Xml => "XML",
+            Self::Html => "HTML",
+            Self::Yaml => "YAML",
             Self::Raw => "Raw",
-            Self::Preview => "Preview",
         }
     }
 }
@@ -121,7 +129,7 @@ pub fn render(
                 .when(!selected, |this| {
                     this.hover(|this| this.text_color(theme.foreground))
                 })
-                .child(candidate.label(cx))
+                .child(response_section_label(candidate, &response.headers, cx))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tab) = this.tabs.get_mut(tab_ix) {
                         tab.response_section = candidate;
@@ -175,6 +183,9 @@ pub fn render(
                             cx,
                             format_duration(response.timing.total_ms),
                         ))
+                        .when_some(response.content_type.clone(), |row, content_type| {
+                            row.child(widgets::mini_tag(cx, content_type_label(&content_type)))
+                        })
                         .when(response.redirect_count > 0, |this| {
                             this.child(widgets::mini_tag(
                                 cx,
@@ -298,12 +309,12 @@ fn body_view(
             .into_any_element();
     };
 
-    let formatted = format_response_body(body, content_type);
-    let display = match mode {
-        ResponseBodyMode::Pretty => formatted.text.clone(),
-        ResponseBodyMode::Raw => body.to_string(),
-        ResponseBodyMode::Preview => preview_body(body, content_type, cx),
+    let detected = detect_format(body, content_type);
+    let selected = match mode {
+        ResponseBodyMode::Auto => detected,
+        chosen => chosen,
     };
+    let (display, parse_error) = render_body(body, selected);
     let mono = theme.mono_font_family.clone();
 
     v_flex()
@@ -315,57 +326,53 @@ fn body_view(
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .flex_wrap()
                 .child(
-                    h_flex()
-                        .gap_1()
-                        .children(ResponseBodyMode::ALL.map(|candidate| {
-                            let selected = mode == candidate;
-                            div()
-                                .id(SharedString::from(format!(
-                                    "response-body-mode-{candidate:?}"
-                                )))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .text_xs()
-                                .cursor_pointer()
-                                .when(selected, |this| {
-                                    this.bg(theme.accent)
-                                        .text_color(theme.foreground)
-                                        .font_weight(FontWeight::MEDIUM)
-                                })
-                                .when(!selected, |this| {
-                                    this.text_color(theme.muted_foreground).hover(|this| {
-                                        this.bg(theme.muted).text_color(theme.foreground)
-                                    })
-                                })
-                                .child(candidate.label())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(tab) = this.tabs.get_mut(tab_ix) {
-                                        tab.response_body_mode = candidate;
-                                        cx.notify();
-                                    }
-                                }))
-                        })),
+                    Button::new("response-body-format")
+                        .outline()
+                        .xsmall()
+                        .label(selected.label())
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for candidate in ResponseBodyMode::CHOICES {
+                                let label = if candidate == selected {
+                                    format!("✓ {}", candidate.label())
+                                } else {
+                                    candidate.label().to_string()
+                                };
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let Some(main) = cx.try_global::<crate::app::MainApp>()
+                                        else {
+                                            return;
+                                        };
+                                        let Some(view) = main.0.upgrade() else {
+                                            return;
+                                        };
+                                        view.update(cx, |this, cx| {
+                                            if let Some(tab) = this.tabs.get_mut(tab_ix) {
+                                                tab.response_body_mode = candidate;
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
                 )
                 .child(
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(widgets::mini_tag(cx, formatted.format))
-                        .when(
-                            mode == ResponseBodyMode::Pretty && formatted.parse_error,
-                            |row| {
-                                row.child(div().text_xs().text_color(theme.muted_foreground).child(
-                                    tr!(
-                                        cx,
-                                        "格式解析失败，显示原始文本",
-                                        "Could not parse; showing raw text"
-                                    ),
-                                ))
-                            },
-                        )
+                        .when(parse_error, |row| {
+                            row.child(div().text_xs().text_color(theme.muted_foreground).child(
+                                tr!(
+                                    cx,
+                                    "按所选格式解析失败，显示原始文本",
+                                    "Could not parse as the selected format; showing raw text"
+                                ),
+                            ))
+                        })
                         .child(
                             Clipboard::new("copy-response-body")
                                 .small()
@@ -374,21 +381,11 @@ fn body_view(
                         ),
                 ),
         )
-        .child(if mode == ResponseBodyMode::Preview {
-            preview_panel(body, content_type, &theme, cx)
-        } else {
-            code_panel(&display, &mono, &theme)
-        })
+        .child(code_panel(&display, &mono, &theme))
         .into_any_element()
 }
 
-struct FormattedBody {
-    text: String,
-    format: &'static str,
-    parse_error: bool,
-}
-
-fn format_response_body(body: &str, content_type: Option<&str>) -> FormattedBody {
+fn detect_format(body: &str, content_type: Option<&str>) -> ResponseBodyMode {
     let mime = content_type
         .unwrap_or_default()
         .split(';')
@@ -396,48 +393,48 @@ fn format_response_body(body: &str, content_type: Option<&str>) -> FormattedBody
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    let detected = if mime.contains("json")
+    if mime.contains("json")
         || (mime.is_empty()
             && (body.trim_start().starts_with('{') || body.trim_start().starts_with('[')))
     {
-        Some(("JSON", pretty_json as fn(&str) -> Option<String>))
+        ResponseBodyMode::Json
     } else if mime.contains("yaml")
         || mime.contains("yml")
         || ((mime.is_empty() || mime == "text/plain") && looks_like_yaml(body))
     {
-        Some(("YAML", pretty_yaml as fn(&str) -> Option<String>))
-    } else if mime.contains("html") {
-        return FormattedBody {
-            text: body.to_string(),
-            format: "HTML",
-            parse_error: false,
-        };
+        ResponseBodyMode::Yaml
+    } else if mime.contains("html")
+        || body
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("<!doctype html")
+        || body.trim_start().to_ascii_lowercase().starts_with("<html")
+    {
+        ResponseBodyMode::Html
     } else if mime.contains("xml")
         || (mime.is_empty()
             && (body.trim_start().starts_with("<?xml") || body.trim_start().starts_with('<')))
     {
-        Some(("XML", pretty_xml as fn(&str) -> Option<String>))
+        ResponseBodyMode::Xml
     } else {
-        None
-    };
+        ResponseBodyMode::Raw
+    }
+}
 
-    let Some((format, parser)) = detected else {
-        return FormattedBody {
-            text: body.to_string(),
-            format: "TEXT",
-            parse_error: false,
-        };
+fn render_body(body: &str, format: ResponseBodyMode) -> (String, bool) {
+    let parsed = match format {
+        ResponseBodyMode::Json => pretty_json(body),
+        ResponseBodyMode::Xml => pretty_xml(body),
+        ResponseBodyMode::Yaml => pretty_yaml(body),
+        ResponseBodyMode::Html | ResponseBodyMode::Raw | ResponseBodyMode::Auto => None,
     };
-    match parser(body) {
-        Some(text) => FormattedBody {
-            text,
-            format,
-            parse_error: false,
-        },
-        None => FormattedBody {
-            text: body.to_string(),
-            format,
-            parse_error: true,
+    match format {
+        ResponseBodyMode::Html | ResponseBodyMode::Raw | ResponseBodyMode::Auto => {
+            (body.to_string(), false)
+        }
+        ResponseBodyMode::Json | ResponseBodyMode::Xml | ResponseBodyMode::Yaml => match parsed {
+            Some(text) => (text, false),
+            None => (body.to_string(), true),
         },
     }
 }
@@ -487,151 +484,6 @@ fn pretty_yaml(body: &str) -> Option<String> {
     serde_yaml::to_string(&value).ok()
 }
 
-fn is_html(content_type: Option<&str>, body: &str) -> bool {
-    let mime = content_type
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    mime.contains("html")
-        || body
-            .trim_start()
-            .to_ascii_lowercase()
-            .starts_with("<!doctype html")
-        || body.trim_start().to_ascii_lowercase().starts_with("<html")
-}
-
-/// Preview renders HTML as safe text; scripts, styles, and embedded resources are never executed.
-fn preview_body(body: &str, content_type: Option<&str>, cx: &App) -> String {
-    if is_html(content_type, body) {
-        html_to_text(body)
-    } else if content_type.is_some_and(|mime| {
-        let mime = mime.to_ascii_lowercase();
-        mime.starts_with("image/") || mime.contains("pdf")
-    }) {
-        tr!(
-            cx,
-            "此响应类型暂不支持内嵌预览，请切换到 Raw 查看内容。",
-            "Inline preview is unavailable for this response type. Switch to Raw to inspect it."
-        )
-        .to_string()
-    } else {
-        body.to_string()
-    }
-}
-
-fn html_to_text(html: &str) -> String {
-    let mut output = String::new();
-    let mut rest = html;
-    let mut hidden_tag: Option<String> = None;
-    while !rest.is_empty() {
-        if let Some(tag_start) = rest.find('<') {
-            if tag_start > 0 && hidden_tag.is_none() {
-                output.push_str(&decode_html_entities(&rest[..tag_start]));
-            }
-            rest = &rest[tag_start..];
-            let Some(tag_end) = rest.find('>') else {
-                break;
-            };
-            let raw_tag = rest[1..tag_end].trim();
-            let closing = raw_tag.starts_with('/');
-            let name = raw_tag
-                .trim_start_matches('/')
-                .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if matches!(
-                name.as_str(),
-                "script" | "style" | "iframe" | "object" | "svg"
-            ) {
-                if closing && hidden_tag.as_deref() == Some(name.as_str()) {
-                    hidden_tag = None;
-                } else if !closing {
-                    hidden_tag = Some(name);
-                }
-            } else if hidden_tag.is_none()
-                && matches!(
-                    name.as_str(),
-                    "br" | "hr"
-                        | "li"
-                        | "p"
-                        | "div"
-                        | "section"
-                        | "article"
-                        | "ul"
-                        | "ol"
-                        | "h1"
-                        | "h2"
-                        | "h3"
-                        | "h4"
-                        | "h5"
-                        | "h6"
-                        | "tr"
-                )
-            {
-                if name == "li" && !closing {
-                    output.push_str("\n• ");
-                } else {
-                    output.push('\n');
-                }
-            }
-            rest = &rest[tag_end + 1..];
-        } else {
-            if hidden_tag.is_none() {
-                output.push_str(&decode_html_entities(rest));
-            }
-            break;
-        }
-    }
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn decode_html_entities(text: &str) -> String {
-    let mut decoded = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find('&') {
-        decoded.push_str(&rest[..start]);
-        let entity_start = start + 1;
-        let Some(end) = rest[entity_start..].find(';') else {
-            decoded.push_str(&rest[start..]);
-            return decoded;
-        };
-        let entity = &rest[entity_start..entity_start + end];
-        let value = match entity {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" | "#39" => Some('\''),
-            _ if entity.starts_with("#x") || entity.starts_with("#X") => {
-                u32::from_str_radix(&entity[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32)
-            }
-            _ if entity.starts_with('#') => {
-                entity[1..].parse::<u32>().ok().and_then(char::from_u32)
-            }
-            _ => None,
-        };
-        if let Some(ch) = value {
-            decoded.push(ch);
-        } else {
-            decoded.push_str(&rest[start..entity_start + end + 1]);
-        }
-        rest = &rest[entity_start + end + 1..];
-    }
-    decoded.push_str(rest);
-    decoded
-}
-
 fn code_panel(body: &str, mono: &str, theme: &Theme) -> AnyElement {
     let lines = body.split('\n').map(|line| {
         let leading = line
@@ -655,39 +507,6 @@ fn code_panel(body: &str, mono: &str, theme: &Theme) -> AnyElement {
         .bg(theme.muted)
         .p_3()
         .child(v_flex().children(lines))
-        .into_any_element()
-}
-
-fn preview_panel(body: &str, content_type: Option<&str>, theme: &Theme, cx: &App) -> AnyElement {
-    let preview = preview_body(body, content_type, cx);
-    let is_html_response = is_html(content_type, body);
-    div()
-        .min_h_0()
-        .flex_1()
-        .id("response-preview")
-        .overflow_y_scroll()
-        .rounded_md()
-        .bg(theme.background)
-        .p_4()
-        .child(
-            v_flex()
-                .gap_2()
-                .when(is_html_response, |view| {
-                    view.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(tr!(
-                                cx,
-                                "安全静态预览：脚本、样式和外部资源不会执行。",
-                                "Safe static preview: scripts, styles, and external resources are not run."
-                            )),
-                    )
-                })
-                .child(v_flex().children(preview.lines().map(|line| {
-                    div().text_sm().py_0p5().child(line.to_string())
-                }))),
-        )
         .into_any_element()
 }
 
@@ -862,72 +681,158 @@ fn console_view(response: &thread_core::services::http::HttpResponse, cx: &App) 
         .into_any_element()
 }
 
+fn response_section_label(
+    section: ResponseSection,
+    headers: &std::collections::BTreeMap<String, Vec<String>>,
+    cx: &App,
+) -> SharedString {
+    let base = section.label(cx);
+    let count = match section {
+        ResponseSection::Headers => headers.values().map(Vec::len).sum::<usize>(),
+        ResponseSection::Cookies => parse_cookies(headers).len(),
+        ResponseSection::Body | ResponseSection::Timing | ResponseSection::Console => 0,
+    };
+    if count == 0 {
+        SharedString::from(base)
+    } else {
+        SharedString::from(format!("{base} ({count})"))
+    }
+}
+
+fn content_type_label(content_type: &str) -> String {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "application/json" | "text/json" => "JSON".to_string(),
+        "application/xml" | "text/xml" => "XML".to_string(),
+        "text/html" => "HTML".to_string(),
+        "text/plain" => "Text".to_string(),
+        "application/yaml" | "text/yaml" | "application/x-yaml" => "YAML".to_string(),
+        "application/octet-stream" => "Binary".to_string(),
+        other => other
+            .rsplit('/')
+            .next()
+            .unwrap_or(other)
+            .to_ascii_uppercase(),
+    }
+}
+
 fn timing_view(timing: &thread_core::services::http::Timing, cx: &App) -> AnyElement {
+    let theme = cx.theme().clone();
+    let total = timing.total_ms.max(0.0);
     let rows = [
-        ("DNS", timing.dns_ms),
-        ("TCP", timing.tcp_ms),
-        ("TLS", timing.tls_ms),
-        (tr!(cx, "首字节", "First byte"), timing.ttfb_ms),
-        (tr!(cx, "下载", "Download"), timing.download_ms),
-        (tr!(cx, "总计", "Total"), timing.total_ms),
+        ("DNS", timing.dns_ms, false),
+        ("TCP", timing.tcp_ms, false),
+        ("TLS", timing.tls_ms, false),
+        (tr!(cx, "首字节", "First byte"), timing.ttfb_ms, false),
+        (tr!(cx, "下载", "Download"), timing.download_ms, false),
+        (tr!(cx, "总计", "Total"), timing.total_ms, true),
     ];
     v_flex()
         .id("response-timing")
         .overflow_y_scroll()
         .flex_1()
-        .gap_1()
-        .children(
-            rows.into_iter()
-                .map(|(label, ms)| widgets::field_row(cx, label, format_duration(ms))),
-        )
+        .gap_2()
+        .children(rows.into_iter().map(|(label, ms, total_row)| {
+            let ratio = if total > 0.0 {
+                (ms / total).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            v_flex()
+                .gap_1()
+                .child(widgets::field_row(cx, label, format_duration(ms)))
+                .child(
+                    div()
+                        .relative()
+                        .h(px(4.))
+                        .w_full()
+                        .rounded_full()
+                        .bg(theme.muted)
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .h(px(4.))
+                                .rounded_full()
+                                .bg(if total_row {
+                                    theme.foreground
+                                } else {
+                                    theme.primary
+                                })
+                                .w(gpui_kit::relative(ratio)),
+                        ),
+                )
+        }))
         .into_any_element()
 }
 
 #[cfg(test)]
 mod body_format_tests {
-    use super::{format_response_body, html_to_text};
+    use super::{ResponseBodyMode, detect_format, render_body};
 
     #[test]
-    fn pretty_formats_json_from_content_type() {
-        let body = format_response_body(r#"{"ok":true,"count":2}"#, Some("application/json"));
-        assert_eq!(body.format, "JSON");
-        assert!(body.text.contains("\n  \"ok\": true"));
-        assert!(!body.parse_error);
-    }
-
-    #[test]
-    fn pretty_formats_xml_from_content_type() {
-        let body = format_response_body("<root><item>value</item></root>", Some("application/xml"));
-        assert_eq!(body.format, "XML");
-        assert!(body.text.contains("\n  <item>"));
-        assert!(!body.parse_error);
-    }
-
-    #[test]
-    fn pretty_formats_yaml_from_content_type() {
-        let body = format_response_body(
-            "name: Thread\nitems:\n- one\n- two",
-            Some("application/yaml"),
+    fn formats_json_from_content_type() {
+        let raw = r#"{"ok":true,"count":2}"#;
+        assert_eq!(
+            detect_format(raw, Some("application/json")),
+            ResponseBodyMode::Json
         );
-        assert_eq!(body.format, "YAML");
-        assert!(body.text.contains("name: Thread"));
-        assert!(body.text.contains("- one"));
-        assert!(!body.parse_error);
+        let (text, parse_error) = render_body(raw, ResponseBodyMode::Json);
+        assert!(text.contains("\n  \"ok\": true"));
+        assert!(!parse_error);
     }
 
     #[test]
-    fn pretty_detects_yaml_with_plain_text_content_type() {
-        let body = format_response_body("name: Thread\nitems:\n- one", Some("text/plain"));
-        assert_eq!(body.format, "YAML");
-        assert!(!body.parse_error);
+    fn formats_xml_from_content_type() {
+        let raw = "<root><item>value</item></root>";
+        assert_eq!(
+            detect_format(raw, Some("application/xml")),
+            ResponseBodyMode::Xml
+        );
+        let (text, parse_error) = render_body(raw, ResponseBodyMode::Xml);
+        assert!(text.contains("\n  <item>"));
+        assert!(!parse_error);
     }
 
     #[test]
-    fn html_preview_strips_active_content_and_decodes_entities() {
-        let text =
-            html_to_text("<h1>Hi &amp; welcome</h1><script>alert('x')</script><p>Safe text</p>");
-        assert!(text.contains("Hi & welcome"));
-        assert!(text.contains("Safe text"));
-        assert!(!text.contains("alert"));
+    fn formats_yaml_from_content_type() {
+        let raw = "name: Thread\nitems:\n- one\n- two";
+        assert_eq!(
+            detect_format(raw, Some("application/yaml")),
+            ResponseBodyMode::Yaml
+        );
+        let (text, parse_error) = render_body(raw, ResponseBodyMode::Yaml);
+        assert!(text.contains("name: Thread"));
+        assert!(text.contains("- one"));
+        assert!(!parse_error);
+    }
+
+    #[test]
+    fn detects_yaml_with_plain_text_content_type() {
+        let raw = "name: Thread\nitems:\n- one";
+        assert_eq!(
+            detect_format(raw, Some("text/plain")),
+            ResponseBodyMode::Yaml
+        );
+        let (_, parse_error) = render_body(raw, ResponseBodyMode::Yaml);
+        assert!(!parse_error);
+    }
+
+    #[test]
+    fn html_stays_source() {
+        let raw = "<h1>Hi &amp; welcome</h1><script>alert('x')</script><p>Safe text</p>";
+        assert_eq!(
+            detect_format(raw, Some("text/html")),
+            ResponseBodyMode::Html
+        );
+        let (text, parse_error) = render_body(raw, ResponseBodyMode::Html);
+        assert_eq!(text, raw);
+        assert!(!parse_error);
     }
 }

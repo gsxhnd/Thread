@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -117,42 +119,35 @@ impl SettingsWindow {
                     "界面文字。选择会记住，下次启动恢复。",
                     "Interface language. The choice is remembered."
                 ),
-                h_flex()
-                    .w_full()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .overflow_hidden()
-                    .children(crate::i18n::Locale::ALL.map(|choice| {
-                        let selected = locale == choice;
-                        h_flex()
-                            .id(SharedString::from(format!("locale-{}", choice.code())))
-                            .flex_1()
-                            .h(px(32.))
-                            .items_center()
-                            .justify_center()
-                            .text_sm()
-                            .cursor_pointer()
-                            .when(selected, |this| {
-                                this.bg(cx.theme().primary)
-                                    .text_color(cx.theme().primary_foreground)
-                                    .font_weight(FontWeight::MEDIUM)
-                            })
-                            .when(!selected, |this| {
-                                this.text_color(cx.theme().muted_foreground)
-                                    .hover(|this| this.bg(cx.theme().muted))
-                            })
-                            .child(choice.label())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(app) = this.app.upgrade() {
-                                    app.update(cx, |view, cx| {
-                                        view.set_locale(choice, window, cx);
-                                    });
-                                }
-                                cx.notify();
-                            }))
-                    })),
+                {
+                    let app = self.app.clone();
+                    let settings = cx.entity().downgrade();
+                    Button::new("locale-menu")
+                        .outline()
+                        .small()
+                        .label(locale.label())
+                        .dropdown_menu(move |menu, _, _| {
+                            let mut menu = menu;
+                            for choice in crate::i18n::Locale::ALL {
+                                let label = if locale == choice {
+                                    format!("✓ {}", choice.label())
+                                } else {
+                                    choice.label().to_string()
+                                };
+                                let app = app.clone();
+                                let settings = settings.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        let _ = app.update_in(cx, |view, window, cx| {
+                                            view.set_locale(choice, window, cx);
+                                        });
+                                        let _ = settings.update(cx, |_, cx| cx.notify());
+                                    },
+                                ));
+                            }
+                            menu
+                        })
+                },
             ))
             .child(widgets::section(
                 cx,

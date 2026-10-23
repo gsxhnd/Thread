@@ -1,6 +1,7 @@
-//! 侧边栏：工作区身份 + 视图导航 + 集合树。
+//! 侧边栏：活动栏选中项的列表。集合、环境和历史各自占这一栏，主区域留作工作面。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -15,16 +16,25 @@ use gpui_kit::component::tree::{TreeItem, tree};
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, FontWeight, IntoElement, MouseButton, ParentElement as _,
-    PromptLevel, Render, SharedString, Styled as _, WeakEntity, Window, div, px,
+    AnyElement, App, AppContext as _, Context, FontWeight, IntoElement, MouseButton,
+    ParentElement as _, PathPromptOptions, PromptLevel, Render, SharedString, Styled as _,
+    WeakEntity, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::{AppError, AppResult};
 use thread_core::workspace::index::{CollectionNode, RequestNode, WorkspaceIndex};
 
 use crate::app::AppView;
+use crate::format::{SemanticColors, method_color};
 use crate::state::MainView;
 use crate::widgets;
+
+/// 集合树里一个请求的展示摘要。渲染时按路径查，不写进树节点。
+struct RequestMark {
+    protocol: String,
+    method: Option<String>,
+    broken: bool,
+}
 
 /// 由索引构建集合树（集合可嵌套，请求作为叶子）。
 fn build_items(
@@ -62,6 +72,79 @@ fn request_item(node: &RequestNode) -> TreeItem {
     )
 }
 
+fn collect_marks(collections: &[CollectionNode]) -> HashMap<String, RequestMark> {
+    let mut marks = HashMap::new();
+    fn walk(nodes: &[CollectionNode], marks: &mut HashMap<String, RequestMark>) {
+        for node in nodes {
+            for request in &node.requests {
+                marks.insert(
+                    request.path.clone(),
+                    RequestMark {
+                        protocol: request.protocol.clone(),
+                        method: request.method.clone(),
+                        broken: request.error.is_some(),
+                    },
+                );
+            }
+            walk(&node.children, marks);
+        }
+    }
+    walk(collections, &mut marks);
+    marks
+}
+
+/// 请求行左侧固定一格：HTTP 用方法色，其它协议用图标，解析失败用叹号。
+fn request_leading(app: &App, id: &str, marks: &HashMap<String, RequestMark>) -> AnyElement {
+    let path = id.strip_prefix("req:").unwrap_or("");
+    let slot = div().w(px(36.)).flex_shrink_0().flex().items_center();
+    let Some(mark) = marks.get(path) else {
+        return slot
+            .child(Icon::new(IconName::Send).xsmall())
+            .into_any_element();
+    };
+    if mark.broken {
+        let color = method_color(Some("DELETE"), &SemanticColors::for_theme(app.theme()));
+        return slot
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child("!"),
+            )
+            .into_any_element();
+    }
+    if mark.protocol == "http" {
+        let method = mark.method.as_deref().unwrap_or("GET");
+        let color = method_color(Some(method), &SemanticColors::for_theme(app.theme()));
+        return slot
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(color)
+                    .child(compact_method(method)),
+            )
+            .into_any_element();
+    }
+    let icon = match mark.protocol.as_str() {
+        "grpc" => IconName::Boxes,
+        "websocket" => IconName::Radio,
+        "graphql" => IconName::Share2,
+        "mqtt" => IconName::Satellite,
+        _ => IconName::Send,
+    };
+    slot.child(Icon::new(icon).xsmall()).into_any_element()
+}
+
+fn compact_method(method: &str) -> String {
+    match method.to_ascii_uppercase().as_str() {
+        "DELETE" => "DEL".to_string(),
+        "OPTIONS" => "OPT".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 打开/重建侧边栏树（工作区变化时调用）。
 pub fn rebuild_tree(this: &mut AppView, cx: &mut Context<AppView>) {
     let items = this
@@ -80,42 +163,30 @@ pub fn render(
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
     // 只取需要的字段，避免每次渲染都克隆整份工作区索引。
-    let (collection_count, request_count, active_env) = this
+    let (collection_count, request_count) = this
         .workspace
         .read(cx)
         .index()
-        .map(|index| {
-            (
-                index.collection_count,
-                index.request_count,
-                index.active_environment.clone(),
-            )
-        })
-        .unwrap_or((0, 0, None));
+        .map(|index| (index.collection_count, index.request_count))
+        .unwrap_or((0, 0));
     let weak: WeakEntity<AppView> = cx.entity().downgrade();
     let menu_weak = weak.clone();
     let header_weak = weak.clone();
     let open_collection = this.open_collection.clone();
     let renaming_id = this.rename.as_ref().map(|rename| rename.node_id.clone());
     let renaming_input = this.rename.as_ref().map(|rename| rename.input.clone());
+    let marks = this
+        .workspace
+        .read(cx)
+        .index()
+        .map(|index| collect_marks(&index.collections))
+        .unwrap_or_default();
 
-    let tree = tree(&this.tree, move |ix, entry, selected, _, _| {
+    let tree = tree(&this.tree, move |ix, entry, selected, _, app| {
         let item = entry.item();
         let id = item.id.clone();
         let is_request = id.starts_with("req:");
-        let icon = if is_request {
-            if id.ends_with(".grpc.json") {
-                IconName::Boxes
-            } else if id.ends_with(".ws.json") {
-                IconName::Radio
-            } else if id.ends_with(".graphql.json") {
-                IconName::Share2
-            } else if id.ends_with(".mqtt.json") {
-                IconName::Satellite
-            } else {
-                IconName::Send
-            }
-        } else if entry.is_expanded() {
+        let icon = if entry.is_expanded() {
             IconName::FolderOpen
         } else {
             IconName::Folder
@@ -174,7 +245,11 @@ pub fn render(
                                 }),
                         )
                     })
-                    .child(Icon::new(icon).xsmall())
+                    .child(if is_request {
+                        request_leading(app, id.as_ref(), &marks)
+                    } else {
+                        Icon::new(icon).xsmall().into_any_element()
+                    })
                     .child(if editing {
                         renaming_input
                             .clone()
@@ -295,25 +370,15 @@ pub fn render(
         node_context_menu(menu, entry.item().id.clone(), menu_weak.clone(), cx)
     });
 
-    let nav = v_flex()
-        .gap_1()
-        .px_2()
-        .pt_3()
-        .pb_2()
-        .child(
-            div()
-                .px_2()
-                .pb_1()
-                .text_size(px(10.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.muted_foreground)
-                .child(tr!(cx, "工作台", "WORKSPACE")),
-        )
-        .children(
-            MainView::ALL
-                .iter()
-                .map(|view| nav_button(cx, this.view == *view, *view)),
-        );
+    let view = this.view;
+    let header = panel_header(view, header_weak, cx);
+    let body = match view {
+        MainView::Request => collection_body(tree, collection_count, request_count, cx),
+        MainView::History => crate::views::history::sidebar(this, cx),
+        MainView::Environments => crate::views::environments::sidebar(this, cx),
+        MainView::Proxy => proxy_note(this, cx),
+        MainView::Certificates => certificate_note(this, cx),
+    };
 
     v_flex()
         .id("sidebar")
@@ -328,113 +393,8 @@ pub fn render(
                 this.cancel_inline_rename(cx);
             }),
         )
-        // 具名工作区导航保持在集合树上方，活动页用强调色标出。
-        .child(nav)
-        .child(div().mx_3().border_t_1().border_color(theme.border))
-        // 集合树
-        .child(
-            h_flex()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .pt_2()
-                .pb_1()
-                .child(
-                    div()
-                        .id("collection-heading")
-                        .flex_1()
-                        .text_xs()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.muted_foreground)
-                        .child(tr!(cx, "集合", "Collections"))
-                        .context_menu(move |menu, _window, cx| {
-                            root_collection_menu(menu, header_weak.clone(), cx)
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .child(draft_icon(
-                            cx,
-                            "draft-http",
-                            IconName::Send,
-                            tr!(cx, "新建 HTTP", "New HTTP"),
-                            crate::views::request::Protocol::Http,
-                        ))
-                        .child(draft_icon(
-                            cx,
-                            "draft-gql",
-                            IconName::Share2,
-                            tr!(cx, "新建 GraphQL", "New GraphQL"),
-                            crate::views::request::Protocol::Graphql,
-                        ))
-                        .child(draft_icon(
-                            cx,
-                            "draft-ws",
-                            IconName::Radio,
-                            tr!(cx, "新建 WebSocket", "New WebSocket"),
-                            crate::views::request::Protocol::Websocket,
-                        ))
-                        .child(draft_icon(
-                            cx,
-                            "draft-grpc",
-                            IconName::Boxes,
-                            tr!(cx, "新建 gRPC", "New gRPC"),
-                            crate::views::request::Protocol::Grpc,
-                        )),
-                ),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_h_0()
-                .id("collection-tree")
-                .overflow_y_scroll()
-                .px_2()
-                .map(|container| {
-                    if collection_count == 0 && request_count == 0 {
-                        container.child(
-                            div().pt_10().child(widgets::compact_empty(
-                                cx,
-                                IconName::Inbox,
-                                tr!(
-                                    cx,
-                                    "还没有集合。右键点击「集合」标题即可新建。",
-                                    "No collections yet. Right-click the Collections heading to add one."
-                                ),
-                            )),
-                        )
-                    } else {
-                        container.child(tree)
-                    }
-                }),
-        )
-        .child(
-            h_flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap_1()
-                .px_3()
-                .py_2()
-                .border_t_1()
-                .border_color(theme.border)
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(tr!(
-                    cx,
-                    format!("{collection_count} 个集合 · {request_count} 个请求"),
-                    format!("{collection_count} collections · {request_count} requests")
-                ))
-                .when_some(active_env, |row, env| {
-                    row.child(div().child("·")).child(
-                        h_flex()
-                            .gap_1()
-                            .min_w_0()
-                            .child(Icon::new(IconName::Braces).xsmall())
-                            .child(div().text_ellipsis().child(env)),
-                    )
-                }),
-        )
+        .child(header)
+        .child(body)
 }
 
 fn draft_icon(
@@ -454,53 +414,260 @@ fn draft_icon(
         }))
 }
 
-fn nav_button(cx: &mut Context<AppView>, active: bool, view: MainView) -> gpui_kit::AnyElement {
+fn panel_header(
+    view: MainView,
+    header_weak: WeakEntity<AppView>,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement + use<> {
     let theme = cx.theme().clone();
+    let title = view.label(cx);
     h_flex()
-        .id(nav_id(view))
-        .w_full()
-        .h(px(32.))
-        .items_center()
-        .gap_2()
+        .h(px(40.))
         .px_2()
-        .rounded_md()
-        .text_sm()
-        .cursor_pointer()
-        .when(active, |this| {
-            this.bg(theme.accent)
-                .text_color(theme.foreground)
-                .font_weight(FontWeight::MEDIUM)
+        .items_center()
+        .justify_between()
+        .gap_1()
+        .flex_shrink_0()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(match view {
+            MainView::Request => div()
+                .id("collection-heading")
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_ellipsis()
+                .child(title)
+                .context_menu(move |menu, _window, cx| {
+                    root_collection_menu(menu, header_weak.clone(), cx)
+                })
+                .into_any_element(),
+            _ => div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_ellipsis()
+                .child(title)
+                .into_any_element(),
         })
-        .when(!active, |this| {
-            this.text_color(theme.muted_foreground)
-                .hover(|this| this.bg(theme.muted).text_color(theme.foreground))
-        })
-        .child(Icon::new(icon_for(view)).xsmall())
-        .child(view.label(cx))
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.switch_view(view, window, cx);
-        }))
+        .child(header_actions(view, cx))
+}
+
+fn header_actions(view: MainView, cx: &mut Context<AppView>) -> AnyElement {
+    match view {
+        MainView::Request => h_flex()
+            .gap_0p5()
+            .child(draft_icon(
+                cx,
+                "draft-http",
+                IconName::Send,
+                tr!(cx, "新建 HTTP", "New HTTP"),
+                crate::views::request::Protocol::Http,
+            ))
+            .child(draft_icon(
+                cx,
+                "draft-gql",
+                IconName::Share2,
+                tr!(cx, "新建 GraphQL", "New GraphQL"),
+                crate::views::request::Protocol::Graphql,
+            ))
+            .child(draft_icon(
+                cx,
+                "draft-ws",
+                IconName::Radio,
+                tr!(cx, "新建 WebSocket", "New WebSocket"),
+                crate::views::request::Protocol::Websocket,
+            ))
+            .child(draft_icon(
+                cx,
+                "draft-grpc",
+                IconName::Boxes,
+                tr!(cx, "新建 gRPC", "New gRPC"),
+                crate::views::request::Protocol::Grpc,
+            ))
+            .into_any_element(),
+        MainView::History => Button::new("history-clear")
+            .ghost()
+            .xsmall()
+            .label(tr!(cx, "清空", "Clear"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.clear_history(window, cx);
+            }))
+            .into_any_element(),
+        MainView::Environments => Button::new("env-new")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Plus)
+            .tooltip(tr!(cx, "新建环境", "New environment"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.create_environment(window, cx);
+            }))
+            .into_any_element(),
+        MainView::Proxy | MainView::Certificates => div().into_any_element(),
+    }
+}
+
+fn collection_body(
+    tree: impl IntoElement,
+    collection_count: usize,
+    request_count: usize,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .id("collection-tree")
+                .overflow_y_scroll()
+                .px_2()
+                .py_1()
+                .map(|container| {
+                    if collection_count == 0 && request_count == 0 {
+                        let _hidden = tree;
+                        container.child(div().pt_10().child(widgets::compact_empty(
+                            cx,
+                            IconName::Inbox,
+                            tr!(
+                                cx,
+                                "还没有集合。右键点击「集合」标题即可新建。",
+                                "No collections yet. Right-click the Collections heading to add one."
+                            ),
+                        )))
+                    } else {
+                        container.child(tree)
+                    }
+                }),
+        )
+        .child(
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .px_3()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(tr!(
+                    cx,
+                    format!("{collection_count} 个集合 · {request_count} 个请求"),
+                    format!("{collection_count} collections · {request_count} requests")
+                )),
+        )
         .into_any_element()
 }
 
-fn nav_id(view: MainView) -> &'static str {
-    match view {
-        MainView::Request => "nav-request",
-        MainView::Environments => "nav-environments",
-        MainView::History => "nav-history",
-        MainView::Proxy => "nav-proxy",
-        MainView::Certificates => "nav-certificates",
-    }
+fn proxy_note(this: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+    let colors = SemanticColors::for_theme(cx.theme());
+    let running = this.proxy.status.running;
+    let paused = this.proxy.status.paused;
+    let (color, title, body) = if running {
+        let port = this.proxy.status.port.unwrap_or(0);
+        let count = this.proxy.entries.len();
+        let color = if paused { colors.post } else { colors.get };
+        let title = if paused {
+            tr!(cx, "已暂停", "Paused")
+        } else {
+            tr!(cx, "正在监听", "Listening")
+        };
+        let body = tr!(
+            cx,
+            format!("127.0.0.1:{port} · 已捕获 {count} 条。流量和设置在右侧。"),
+            format!(
+                "127.0.0.1:{port} · {count} flows captured. The list and settings are on the right."
+            )
+        );
+        (color, title.to_string(), body)
+    } else {
+        (
+            cx.theme().muted_foreground,
+            tr!(cx, "未启动", "Stopped").to_string(),
+            tr!(
+                cx,
+                "在右侧设置端口并开始抓包。",
+                "Set the port and start capture on the right."
+            )
+            .to_string(),
+        )
+    };
+    sidebar_status(cx, color, title, body)
 }
 
-fn icon_for(view: MainView) -> IconName {
-    match view {
-        MainView::Request => IconName::Send,
-        MainView::History => IconName::Clock,
-        MainView::Proxy => IconName::Network,
-        MainView::Certificates => IconName::ShieldCheck,
-        MainView::Environments => IconName::Braces,
-    }
+fn certificate_note(this: &AppView, cx: &mut Context<AppView>) -> AnyElement {
+    let colors = SemanticColors::for_theme(cx.theme());
+    let (color, title, body) = if let Some(error) = &this.certificate.error {
+        (
+            colors.delete,
+            tr!(cx, "证书不可用", "Certificate unavailable").to_string(),
+            error.clone(),
+        )
+    } else if let Some(info) = &this.certificate.info {
+        (
+            colors.get,
+            info.common_name.clone(),
+            tr!(
+                cx,
+                format!("指纹 {}。导出和重新生成在右侧。", info.fingerprint_sha256),
+                format!(
+                    "Fingerprint {}. Export and regenerate on the right.",
+                    info.fingerprint_sha256
+                )
+            ),
+        )
+    } else {
+        (
+            cx.theme().muted_foreground,
+            tr!(cx, "等待证书", "Waiting for the certificate").to_string(),
+            tr!(
+                cx,
+                "详情在右侧。信任 Thread CA 后才能解密 HTTPS。",
+                "Details are on the right. Trust the Thread CA to decrypt HTTPS."
+            )
+            .to_string(),
+        )
+    };
+    sidebar_status(cx, color, title, body)
+}
+
+fn sidebar_status(
+    cx: &App,
+    color: gpui_kit::Hsla,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+) -> AnyElement {
+    let theme = cx.theme().clone();
+    v_flex()
+        .flex_1()
+        .px_3()
+        .py_3()
+        .gap_2()
+        .child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(color))
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_ellipsis()
+                        .child(title.into()),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(body.into()),
+        )
+        .into_any_element()
 }
 
 fn node_context_menu(
@@ -549,6 +716,21 @@ fn node_context_menu(
                 weak.clone(),
             ))
             .separator()
+            .item(export_collection_item(
+                tr!(
+                    cx,
+                    "导出为 Postman Collection…",
+                    "Export as Postman Collection…"
+                ),
+                path.clone(),
+                weak.clone(),
+            ))
+            .item(export_openapi_collection_item(
+                tr!(cx, "导出为 OpenAPI 3.x…", "Export as OpenAPI 3.x…"),
+                path.clone(),
+                weak.clone(),
+            ))
+            .separator()
             .item(trash_item(
                 tr!(cx, "移到回收站", "Move to trash"),
                 path,
@@ -582,11 +764,111 @@ fn node_context_menu(
 }
 
 fn root_collection_menu(menu: PopupMenu, weak: WeakEntity<AppView>, cx: &App) -> PopupMenu {
+    let import_weak = weak.clone();
+    let import_postman_weak = weak.clone();
+    let import_openapi_weak = weak.clone();
+    let import_har_weak = weak.clone();
     menu.item(new_collection_item(
         tr!(cx, "新建集合", "New collection"),
         None,
         weak,
     ))
+    .separator()
+    .item(
+        PopupMenuItem::new(tr!(cx, "从剪贴板导入 cURL", "Import cURL from clipboard")).on_click(
+            move |_, window, cx| {
+                let Some(command) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    window.push_notification(
+                        (
+                            NotificationType::Error,
+                            tr!(
+                                cx,
+                                "剪贴板中没有文本。",
+                                "The clipboard does not contain text."
+                            ),
+                        ),
+                        cx,
+                    );
+                    return;
+                };
+                let command = command.to_string();
+                let _ = import_weak.update_in(cx, |view, window, cx| {
+                    match view.import_curl_command(&command, window, cx) {
+                        Ok(()) => window.push_notification(
+                            (
+                                NotificationType::Success,
+                                tr!(
+                                    cx,
+                                    "cURL 已导入为未保存请求。",
+                                    "Imported cURL as an unsaved request."
+                                ),
+                            ),
+                            cx,
+                        ),
+                        Err(error) => window
+                            .push_notification((NotificationType::Error, error.to_string()), cx),
+                    }
+                });
+            },
+        ),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(tr!(
+            cx,
+            "导入 Postman Collection…",
+            "Import Postman Collection…"
+        ))
+        .on_click(move |_, _window, cx| {
+            let _ = import_postman_weak.update_in(cx, |view, window, cx| {
+                view.prompt_postman_import(window, cx);
+            });
+        }),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(tr!(cx, "导入 OpenAPI 3.x…", "Import OpenAPI 3.x…")).on_click(
+            move |_, _window, cx| {
+                let _ = import_openapi_weak.update_in(cx, |view, window, cx| {
+                    view.prompt_openapi_import(window, cx);
+                });
+            },
+        ),
+    )
+    .separator()
+    .item(
+        PopupMenuItem::new(tr!(cx, "导入 HAR…", "Import HAR…")).on_click(move |_, _window, cx| {
+            let _ = import_har_weak.update_in(cx, |view, window, cx| {
+                view.prompt_har_import(window, cx);
+            });
+        }),
+    )
+}
+
+fn export_collection_item(
+    label: &'static str,
+    collection_path: String,
+    weak: WeakEntity<AppView>,
+) -> PopupMenuItem {
+    PopupMenuItem::new(label).on_click(move |_, _window, cx| {
+        let path = collection_path.clone();
+        let _ = weak.update_in(cx, |view, window, cx| {
+            view.prompt_postman_export(path, window, cx);
+        });
+    })
+}
+
+fn export_openapi_collection_item(
+    label: &'static str,
+    collection_path: String,
+    weak: WeakEntity<AppView>,
+) -> PopupMenuItem {
+    PopupMenuItem::new(label).on_click(move |_, _window, cx| {
+        let path = collection_path.clone();
+        let _ = weak.update_in(cx, |view, window, cx| {
+            view.prompt_openapi_export(path, window, cx);
+        });
+    })
 }
 
 fn open_request_item(
@@ -904,6 +1186,328 @@ fn move_before(order: &mut Vec<String>, path: &str, before: &str) {
 }
 
 impl AppView {
+    /// Import a Postman collection file into the workspace root.
+    pub fn prompt_postman_import(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                tr!(
+                    cx,
+                    "选择 Postman Collection v2.1 JSON 文件",
+                    "Choose a Postman Collection v2.1 JSON file"
+                )
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let imported = cx
+                .background_spawn(async move {
+                    let size = std::fs::metadata(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?
+                        .len();
+                    if size > thread_core::workspace::postman::MAX_COLLECTION_BYTES as u64 {
+                        return Err(AppError::Validation(
+                            "Postman collection exceeds the 32 MiB import limit".into(),
+                        ));
+                    }
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?;
+                    thread_core::workspace::postman::import_collection(&root, None, &source)
+                })
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| match imported {
+                Ok(report) => {
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(
+                                cx,
+                                format!(
+                                    "已导入 {} 个请求，清除了 {} 个疑似密钥字段。",
+                                    report.request_count, report.redacted_values
+                                ),
+                                format!(
+                                    "Imported {} requests; redacted {} likely secret fields.",
+                                    report.request_count, report.redacted_values
+                                )
+                            ),
+                        ),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Export one collection as Postman v2.1 JSON into a chosen folder.
+    pub fn prompt_postman_export(
+        &mut self,
+        collection_path: String,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let name = self
+            .node_name(&collection_path, false, cx)
+            .unwrap_or_else(|| "collection".to_string());
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择导出文件夹", "Choose an export folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(directory) = paths.into_iter().next() else {
+                return;
+            };
+            let exported = cx
+                .background_spawn(async move {
+                    let text = thread_core::workspace::postman::export_collection(
+                        &root,
+                        &collection_path,
+                    )?;
+                    let stem = format!(
+                        "{}.postman_collection",
+                        thread_core::workspace::layout::slugify(&name)
+                    );
+                    let path =
+                        thread_core::workspace::layout::unique_path(&directory, &stem, ".json");
+                    thread_core::workspace::files::write_text(&path, &text)?;
+                    Ok::<_, AppError>(path)
+                })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match exported {
+                Ok(path) => window.push_notification(
+                    (
+                        NotificationType::Success,
+                        tr!(
+                            cx,
+                            format!("已导出到 {}", path.display()),
+                            format!("Exported to {}", path.display())
+                        ),
+                    ),
+                    cx,
+                ),
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Import an OpenAPI 3.x JSON/YAML document into the workspace root.
+    pub fn prompt_openapi_import(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                tr!(
+                    cx,
+                    "选择 OpenAPI 3.x JSON/YAML 文件",
+                    "Choose an OpenAPI 3.x JSON/YAML file"
+                )
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let imported = cx
+                .background_spawn(async move {
+                    let size = std::fs::metadata(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?
+                        .len();
+                    if size > thread_core::workspace::openapi::MAX_OPENAPI_BYTES as u64 {
+                        return Err(AppError::Validation(
+                            "OpenAPI document exceeds the 32 MiB import limit".into(),
+                        ));
+                    }
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?;
+                    thread_core::workspace::openapi::import_collection(&root, None, &source)
+                })
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| match imported {
+                Ok(report) => {
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(
+                                cx,
+                                format!(
+                                    "导入了 {} 个请求；清除 {} 个疑似密钥字段。",
+                                    report.request_count, report.redacted_values
+                                ),
+                                format!(
+                                    "Imported {} requests; redacted {} likely secret fields.",
+                                    report.request_count, report.redacted_values
+                                )
+                            ),
+                        ),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Export a workspace collection as OpenAPI 3.0 JSON.
+    pub fn prompt_openapi_export(
+        &mut self,
+        collection_path: String,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let name = self
+            .node_name(&collection_path, false, cx)
+            .unwrap_or_else(|| "collection".to_string());
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择导出文件夹", "Choose an export folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(directory) = paths.into_iter().next() else {
+                return;
+            };
+            let exported = cx
+                .background_spawn(async move {
+                    let text = thread_core::workspace::openapi::export_collection(
+                        &root,
+                        &collection_path,
+                    )?;
+                    let stem =
+                        format!("{}.openapi", thread_core::workspace::layout::slugify(&name));
+                    let path =
+                        thread_core::workspace::layout::unique_path(&directory, &stem, ".json");
+                    thread_core::workspace::files::write_text(&path, &text)?;
+                    Ok::<_, AppError>(path)
+                })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match exported {
+                Ok(path) => window.push_notification(
+                    (
+                        NotificationType::Success,
+                        tr!(
+                            cx,
+                            format!("已导出到 {}", path.display()),
+                            format!("Exported to {}", path.display())
+                        ),
+                    ),
+                    cx,
+                ),
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Import a HAR 1.2 archive as HTTP requests in the workspace root.
+    pub fn prompt_har_import(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择 HAR 1.2 JSON 文件", "Choose a HAR 1.2 JSON file").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let imported = cx
+                .background_spawn(async move {
+                    let size = std::fs::metadata(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?
+                        .len();
+                    if size > thread_core::workspace::har::MAX_HAR_BYTES as u64 {
+                        return Err(AppError::Validation(
+                            "HAR file exceeds the 32 MiB import limit".into(),
+                        ));
+                    }
+                    let source = std::fs::read_to_string(&path)
+                        .map_err(|error| AppError::Io(error.to_string()))?;
+                    thread_core::workspace::har::import_har(&root, None, &source)
+                })
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| match imported {
+                Ok(report) => {
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(
+                                cx,
+                                format!(
+                                    "从 HAR 导入 {} 个请求；清除 {} 个疑似密钥字段。",
+                                    report.request_count, report.redacted_values
+                                ),
+                                format!(
+                                    "Imported {} HAR requests; redacted {} likely secret fields.",
+                                    report.request_count, report.redacted_values
+                                )
+                            ),
+                        ),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 回车：请求在原位置改名，集合则展开或收起。
     pub fn rename_or_toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.tree.read(cx).selected_item().cloned() else {

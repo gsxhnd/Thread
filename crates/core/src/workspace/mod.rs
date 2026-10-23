@@ -12,11 +12,15 @@
 //!     └── users/list-users.http.json
 //! ```
 
+pub mod backup;
 pub mod files;
 pub mod formats;
+pub mod har;
 pub mod index;
 pub mod layout;
+pub mod openapi;
 pub mod ops;
+pub mod postman;
 pub mod watcher;
 
 use std::path::{Path, PathBuf};

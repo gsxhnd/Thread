@@ -279,6 +279,7 @@ pub fn field(
     this: &mut AppView,
     tab: usize,
     url: &Entity<InputState>,
+    bordered: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     this.ensure_variables(cx);
@@ -292,7 +293,7 @@ pub fn field(
         .flex_1()
         .min_w(px(160.))
         .relative()
-        .child(styled_input(url, values))
+        .child(styled_input(url, values, bordered))
         .when_some(menu, |row, menu| {
             row.child(
                 deferred(
@@ -310,8 +311,12 @@ pub fn field(
         .into_any_element()
 }
 
-fn styled_input(url: &Entity<InputState>, values: BTreeMap<String, String>) -> Input {
-    Input::new(url).small().token(move |token, _, cx| {
+fn styled_input(
+    url: &Entity<InputState>,
+    values: BTreeMap<String, String>,
+    bordered: bool,
+) -> Input {
+    let input = Input::new(url).small().token(move |token, _, cx| {
         let theme = cx.theme().clone();
         let id = token.token().id().to_string();
         let key = id
@@ -349,7 +354,12 @@ fn styled_input(url: &Entity<InputState>, values: BTreeMap<String, String>) -> I
                 move |_, _, cx| var_card(&key, dynamic, shown.clone(), cx)
             })
             .into_any_element()
-    })
+    });
+    if bordered {
+        input
+    } else {
+        input.appearance(false)
+    }
 }
 
 fn begin_var_edit(key: &str, window: &mut Window, cx: &mut App) {
@@ -856,9 +866,11 @@ mod tests {
     fn concrete_config_fills_known_variables_and_keeps_missing_ones() {
         let mut values = BTreeMap::new();
         values.insert("base".to_string(), "https://example.com".to_string());
-        let mut config = HttpRequestConfig::default();
-        config.url = "{{base}}/users/{{id}}".into();
-        config.headers.push(KeyValue::new("X-Host", "{{base}}"));
+        let config = HttpRequestConfig {
+            url: "{{base}}/users/{{id}}".into(),
+            headers: vec![KeyValue::new("X-Host", "{{base}}")],
+            ..HttpRequestConfig::default()
+        };
         let shown = super::concrete_config(&config, &values);
         assert_eq!(shown.url, "https://example.com/users/{{id}}");
         assert_eq!(shown.headers[0].value, "https://example.com");

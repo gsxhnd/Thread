@@ -1,4 +1,4 @@
-//! 根视图：标题栏 + 侧边栏 + 内容区。
+//! 根视图：标题栏 + 活动栏 + 侧边栏 + 内容区。
 //!
 //! 所有视图共享同一个 `AppView` 实体：状态直接挂在字段上，事件直接用
 //! `cx.listener`，没有跨实体路由。渲染函数按视图拆在 `views/` 下，
@@ -13,6 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{EditorState, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::select::SelectState;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex, h_resizable, resizable_panel,
@@ -211,6 +212,8 @@ pub struct AppView {
     /// 环境页的变量表单。
     pub env_key: Entity<InputState>,
     pub env_value: Entity<InputState>,
+    /// 已有变量的名称输入。和详情里的变量按顺序对齐。
+    pub env_names: Vec<views::environments::EnvNameField>,
     /// 设置子窗口。关掉之后下一次打开会重新创建。
     pub settings_window: Option<AnyWindowHandle>,
     /// 设置窗口正在创建，避免同一次点击连开两个。
@@ -323,6 +326,7 @@ impl AppView {
             },
             env_key,
             env_value,
+            env_names: Vec::new(),
             settings_window: None,
             settings_pending: false,
             workspace_root,
@@ -385,6 +389,7 @@ impl AppView {
             self.dismiss_open_tabs();
             self.environment.selected_path = None;
             self.environment.detail = None;
+            self.env_names.clear();
             self.workspace_root = root;
         } else {
             self.sync_open_tabs(cx);
@@ -527,6 +532,108 @@ impl AppView {
         self.workspace.update(cx, |model, cx| model.close(cx));
     }
 
+    /// Backs up the open workspace files to a user-selected folder.
+    pub fn prompt_workspace_backup(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                tr!(
+                    cx,
+                    "选择备份保存位置",
+                    "Choose a folder for the workspace backup"
+                )
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else { return };
+            let Some(destination) = paths.into_iter().next() else { return };
+            let result = cx.background_spawn(async move {
+                thread_core::workspace::backup::backup_workspace(&root, &destination)
+            }).await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok(report) => window.push_notification((
+                    NotificationType::Success,
+                    tr!(cx,
+                        format!("工作区文件已备份到 {}（{} 个文件）。不含本机历史、代理数据、证书与应用密钥。", report.path.display(), report.file_count),
+                        format!("Workspace files backed up to {} ({} files). Local history, proxy data, certificates and app secrets are not included.", report.path.display(), report.file_count)
+                    ),
+                ), cx),
+                Err(error) => window.push_notification((NotificationType::Error, error.to_string()), cx),
+            });
+        }).detach();
+    }
+
+    /// Restores a backup as a new sibling workspace, never overwriting the current one.
+    pub fn prompt_workspace_restore(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(current_root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let destination_parent = current_root
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or(current_root);
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                tr!(
+                    cx,
+                    "选择 Thread 工作区备份文件夹",
+                    "Choose a Thread workspace backup folder"
+                )
+                .into(),
+            ),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(backup) = paths.into_iter().next() else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move {
+                    thread_core::workspace::backup::restore_workspace(&backup, &destination_parent)
+                })
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| match result {
+                Ok(report) => {
+                    view.open_workspace_path(report.workspace_path.clone(), cx);
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(
+                                cx,
+                                format!(
+                                    "已恢复为新工作区：{}（{} 个文件）。",
+                                    report.workspace_path.display(),
+                                    report.file_count
+                                ),
+                                format!(
+                                    "Restored as a new workspace: {} ({} files).",
+                                    report.workspace_path.display(),
+                                    report.file_count
+                                )
+                            ),
+                        ),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 侧边栏里点了一个集合：主区域换成这个集合的页面。
     pub fn open_collection(&mut self, path: String, cx: &mut Context<Self>) {
         self.view = crate::state::MainView::Request;
@@ -622,6 +729,24 @@ impl AppView {
         let index = self.tabs.len() - 1;
         views::request::watch_tab_edits(self, index, window, cx);
         cx.notify();
+    }
+
+    /// Imports a supported cURL command into a new unsaved HTTP request tab.
+    pub fn import_curl_command(
+        &mut self,
+        command: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), AppError> {
+        let document = crate::curl::parse_command(command)?;
+        self.new_draft_tab_for(views::request::Protocol::Http, window, cx);
+        let Some(index) = self.active_tab else {
+            return Err(AppError::Internal("request tab was not created".into()));
+        };
+        self.tabs[index].apply_http_doc(&document, window, cx);
+        self.tabs[index].dirty = true;
+        cx.notify();
+        Ok(())
     }
 
     pub fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -973,9 +1098,11 @@ impl AppView {
         }));
     }
 
-    /// 切换视图（侧边栏导航）。
+    /// 切换活动栏。已经停在集合页时再点「集合」不会把集合页关掉。
     pub fn switch_view(&mut self, view: MainView, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_collection = None;
+        if self.view != view {
+            self.open_collection = None;
+        }
         self.view = view;
         match view {
             MainView::History => self.reload_history(cx),
@@ -1070,6 +1197,7 @@ impl AppView {
         };
         let mut buttons = Vec::new();
         if open {
+            buttons.push(environment_switcher(self, cx).into_any_element());
             buttons.push(
                 Button::new("editor-layout")
                     .ghost()
@@ -1102,6 +1230,65 @@ impl AppView {
         );
         buttons
     }
+}
+
+/// 标题栏右侧的环境切换，对应 Postman 顶栏的环境下拉。
+fn environment_switcher(this: &AppView, cx: &mut Context<AppView>) -> impl gpui_kit::IntoElement {
+    let environments = this
+        .workspace
+        .read(cx)
+        .index()
+        .map(|index| index.environments.clone())
+        .unwrap_or_default();
+    let label = environments
+        .iter()
+        .find(|environment| environment.is_active)
+        .map(|environment| environment.name.clone())
+        .unwrap_or_else(|| tr!(cx, "无环境", "No environment").to_string());
+    let weak = cx.entity().downgrade();
+
+    Button::new("env-switch")
+        .ghost()
+        .small()
+        .icon(IconName::Braces)
+        .label(label)
+        .dropdown_menu(move |menu, _, cx| {
+            let none_weak = weak.clone();
+            let mut menu = menu.item(
+                PopupMenuItem::new(tr!(cx, "无环境", "No environment")).on_click(
+                    move |_, _window, cx| {
+                        let _ = none_weak.update_in(cx, |view, window, cx| {
+                            view.activate_environment(None, window, cx);
+                        });
+                    },
+                ),
+            );
+            for environment in &environments {
+                let path = environment.path.clone();
+                let name = if environment.is_active {
+                    format!("✓ {}", environment.name)
+                } else {
+                    environment.name.clone()
+                };
+                let item_weak = weak.clone();
+                menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _window, cx| {
+                    let path = path.clone();
+                    let _ = item_weak.update_in(cx, |view, window, cx| {
+                        view.activate_environment(Some(path), window, cx);
+                    });
+                }));
+            }
+            let manage_weak = weak.clone();
+            menu.separator().item(
+                PopupMenuItem::new(tr!(cx, "管理环境", "Manage environments")).on_click(
+                    move |_, _window, cx| {
+                        let _ = manage_weak.update_in(cx, |view, window, cx| {
+                            view.switch_view(MainView::Environments, window, cx);
+                        });
+                    },
+                ),
+            )
+        })
 }
 
 fn workspace_switcher(
@@ -1149,6 +1336,8 @@ fn workspace_switcher(
             let open_weak = weak.clone();
             let create_weak = weak.clone();
             let close_weak = weak.clone();
+            let backup_weak = weak.clone();
+            let restore_weak = weak.clone();
             let workspace_open = current.is_some();
             let mut menu = menu
                 .separator()
@@ -1173,16 +1362,39 @@ fn workspace_switcher(
                     ),
                 );
             if workspace_open {
-                menu = menu.separator().item(
-                    PopupMenuItem::new(tr!(cx, "关闭工作区", "Close workspace")).on_click(
-                        move |_, window, cx| {
-                            let _ = close_weak.update_in(cx, |view, window, cx| {
-                                view.close_workspace(window, cx);
+                menu = menu
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "备份工作区文件…", "Back up workspace files…"))
+                            .on_click(move |_, _window, cx| {
+                                let _ = backup_weak.update_in(cx, |view, window, cx| {
+                                    view.prompt_workspace_backup(window, cx);
+                                });
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new(tr!(
+                            cx,
+                            "从备份恢复为新工作区…",
+                            "Restore backup as a new workspace…"
+                        ))
+                        .on_click(move |_, _window, cx| {
+                            let _ = restore_weak.update_in(cx, |view, window, cx| {
+                                view.prompt_workspace_restore(window, cx);
                             });
-                            let _ = window;
-                        },
-                    ),
-                );
+                        }),
+                    )
+                    .separator()
+                    .item(
+                        PopupMenuItem::new(tr!(cx, "关闭工作区", "Close workspace")).on_click(
+                            move |_, window, cx| {
+                                let _ = close_weak.update_in(cx, |view, window, cx| {
+                                    view.close_workspace(window, cx);
+                                });
+                                let _ = window;
+                            },
+                        ),
+                    );
             }
             menu
         })
@@ -1238,24 +1450,27 @@ impl Render for AppView {
             )
             .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(
                 if self.workspace.read(cx).is_open() {
-                    div()
+                    h_flex()
                         .size_full()
+                        .child(views::rail::render(self, cx))
                         .child(
-                            h_resizable("app-sidebar")
-                                .child(
-                                    resizable_panel()
-                                        .visible(!self.sidebar_collapsed)
-                                        .size(px(240.))
-                                        .size_range(px(180.)..px(480.))
-                                        .child(
-                                            views::sidebar::render(self, window, cx)
-                                                .into_any_element(),
-                                        ),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .child(views::content::render(self, window, cx)),
-                                ),
+                            div().flex_1().h_full().min_w_0().child(
+                                h_resizable("app-sidebar")
+                                    .child(
+                                        resizable_panel()
+                                            .visible(!self.sidebar_collapsed)
+                                            .size(px(280.))
+                                            .size_range(px(200.)..px(480.))
+                                            .child(
+                                                views::sidebar::render(self, window, cx)
+                                                    .into_any_element(),
+                                            ),
+                                    )
+                                    .child(
+                                        resizable_panel()
+                                            .child(views::content::render(self, window, cx)),
+                                    ),
+                            ),
                         )
                         .into_any_element()
                 } else {

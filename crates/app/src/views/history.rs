@@ -7,8 +7,8 @@ use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, FontWeight, IntoElement, ParentElement as _, SharedString, Styled as _,
-    Window, div, px,
+    AnyElement, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _,
+    PathPromptOptions, SharedString, Styled as _, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::AppError;
@@ -28,22 +28,20 @@ fn history_title(cx: &gpui_kit::App, name: Option<&str>) -> String {
     }
 }
 
-pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) -> AnyElement {
+/// 侧边栏里的历史列表。详情留在主区域。
+pub fn sidebar(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
     let theme = cx.theme().clone();
     let colors = crate::format::SemanticColors::for_theme(cx.theme());
-
     if this.history.items.is_empty() {
-        return widgets::empty_state(
-            cx,
-            IconName::Clock,
-            tr!(cx, "还没有历史记录", "No history yet"),
-            tr!(
+        return div()
+            .flex_1()
+            .pt_8()
+            .child(widgets::compact_empty(
                 cx,
-                "每次发送的请求都会记录在这里（保存在本地数据目录，不进入工作区与 Git）。",
-                "Each sent request is recorded here, in the local data folder, outside the workspace and Git."
-            ),
-        )
-        .into_any_element();
+                IconName::Clock,
+                tr!(cx, "还没有历史记录。", "No history yet."),
+            ))
+            .into_any_element();
     }
 
     let items: Vec<(usize, HistorySummary)> = this
@@ -59,40 +57,16 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
         .as_ref()
         .map(|detail| detail.summary.id.clone());
 
-    v_flex()
+    div()
         .flex_1()
         .min_h_0()
-        .gap_3()
-        .px_4()
-        .py_3()
-        .child(widgets::page_header(
-            cx,
-            tr!(cx, "历史", "History"),
-            tr!(
-                cx,
-                format!("共 {} 条，只保存在本机", this.history.total),
-                format!("{} entries, stored on this machine", this.history.total)
-            ),
-            vec![
-                Button::new("clear-history")
-                    .outline()
-                    .small()
-                    .label(tr!(cx, "清空历史", "Clear history"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.clear_history(window, cx);
-                    })),
-            ],
-        ))
-        .child(widgets::horizontal_split(
-            "history-split",
-            360.,
+        .id("history-list")
+        .overflow_y_scroll()
+        .px_1()
+        .py_1()
+        .child(
             v_flex()
-                .size_full()
-                .min_h_0()
-                .id("history-list")
-                .overflow_y_scroll()
                 .gap_0p5()
-                .pr_2()
                 .children(items.into_iter().map(|(ix, item)| {
                     let method_color = method_color(item.method.as_deref(), &colors);
                     let status_color = status_color(item.status_code, &colors);
@@ -140,19 +114,35 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                                         .child(history_title(cx, item.name.as_deref())),
                                 )
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .text_ellipsis()
-                                        .child(item.url.clone().unwrap_or_default()),
+                                    h_flex()
+                                        .gap_2()
+                                        .min_w_0()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .text_ellipsis()
+                                                .child(item.url.clone().unwrap_or_default()),
+                                        )
+                                        .when_some(item.duration_ms, |row, ms| {
+                                            row.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .flex_shrink_0()
+                                                    .child(format_duration(ms as f64)),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .flex_shrink_0()
+                                                .child(format_relative_time(item.created_at, cx)),
+                                        ),
                                 ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .flex_shrink_0()
-                                .child(format_relative_time(item.created_at, cx)),
                         )
                         .on_click(
                             cx.listener(move |this, _: &gpui_kit::ClickEvent, window, cx| {
@@ -160,19 +150,64 @@ pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView
                             }),
                         )
                         .into_any_element()
-                }))
-                .into_any_element(),
+                })),
+        )
+        .into_any_element()
+}
+
+pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) -> AnyElement {
+    let theme = cx.theme().clone();
+
+    if this.history.items.is_empty() {
+        return widgets::empty_state(
+            cx,
+            IconName::Clock,
+            tr!(cx, "还没有历史记录", "No history yet"),
+            tr!(
+                cx,
+                "每次发送的请求都会记录在这里（保存在本地数据目录，不进入工作区与 Git）。",
+                "Each sent request is recorded here, in the local data folder, outside the workspace and Git."
+            ),
+        )
+        .into_any_element();
+    }
+
+    let export = this.history.selected.is_some().then(|| {
+        Button::new("export-selected-har")
+            .outline()
+            .small()
+            .label(tr!(cx, "导出所选 HAR…", "Export selected HAR…"))
+            .tooltip(tr!(
+                cx,
+                "HAR 含请求/响应正文、Headers 与 Cookie；分享前请检查。",
+                "HAR may contain request/response bodies, headers and cookies; review before sharing."
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.prompt_har_export(window, cx);
+            }))
+            .into_any_element()
+    });
+
+    v_flex()
+        .flex_1()
+        .min_h_0()
+        .gap_3()
+        .px_4()
+        .py_3()
+        .when_some(export, |column, export| {
+            column.child(h_flex().justify_end().child(export))
+        })
+        .child(
             div()
-                .size_full()
+                .flex_1()
                 .min_h_0()
                 .rounded_lg()
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.secondary)
                 .p_3()
-                .child(detail_view(this, cx))
-                .into_any_element(),
-        ))
+                .child(detail_view(this, cx)),
+        )
         .into_any_element()
 }
 
@@ -946,6 +981,61 @@ fn resolved_display(snapshot: &serde_json::Value) -> Option<HttpRequestConfig> {
 }
 
 impl AppView {
+    /// Export the selected HTTP history detail as a HAR 1.2 file.
+    pub fn prompt_har_export(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(detail) = self.history.selected.clone() else {
+            return;
+        };
+        let name = detail
+            .summary
+            .name
+            .clone()
+            .unwrap_or_else(|| "history".into());
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(tr!(cx, "选择 HAR 导出文件夹", "Choose a HAR export folder").into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(directory) = paths.into_iter().next() else {
+                return;
+            };
+            let exported = cx
+                .background_spawn(async move {
+                    let text = thread_core::workspace::har::export_history(&[detail])?;
+                    let path = thread_core::workspace::layout::unique_path(
+                        &directory,
+                        &thread_core::workspace::layout::slugify(&name),
+                        ".har",
+                    );
+                    thread_core::workspace::files::write_text(&path, &text)?;
+                    Ok::<_, AppError>(path)
+                })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| match exported {
+                Ok(path) => window.push_notification(
+                    (
+                        NotificationType::Success,
+                        tr!(
+                            cx,
+                            format!("HAR 已导出到 {}", path.display()),
+                            format!("HAR exported to {}", path.display())
+                        ),
+                    ),
+                    cx,
+                ),
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn reload_history(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.read(cx).root() else {
             self.history.items.clear();

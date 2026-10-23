@@ -3,6 +3,7 @@
 #[macro_use]
 mod i18n;
 mod app;
+mod codegen;
 mod curl;
 mod format;
 mod json_fold;

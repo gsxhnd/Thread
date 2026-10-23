@@ -7,6 +7,7 @@ pub mod environments;
 pub mod history;
 pub mod protocols;
 pub mod proxy;
+pub mod rail;
 pub mod request;
 pub mod response;
 pub mod settings;

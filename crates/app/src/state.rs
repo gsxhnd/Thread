@@ -225,7 +225,7 @@ impl WorkspaceModel {
 
 impl EventEmitter<WorkspaceEvent> for WorkspaceModel {}
 
-/// 侧边栏 / 主区域切换的视图。
+/// 活动栏选中的侧边栏。主区域跟着显示对应的工作面。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MainView {
     #[default]
@@ -237,17 +237,9 @@ pub enum MainView {
 }
 
 impl MainView {
-    pub const ALL: [MainView; 5] = [
-        MainView::Request,
-        MainView::Environments,
-        MainView::History,
-        MainView::Proxy,
-        MainView::Certificates,
-    ];
-
     pub fn label(self, cx: &gpui_kit::App) -> &'static str {
         match self {
-            Self::Request => crate::tr!(cx, "请求", "Requests"),
+            Self::Request => crate::tr!(cx, "集合", "Collections"),
             Self::History => crate::tr!(cx, "历史", "History"),
             Self::Proxy => crate::tr!(cx, "代理", "Proxy"),
             Self::Certificates => crate::tr!(cx, "证书", "Certificates"),

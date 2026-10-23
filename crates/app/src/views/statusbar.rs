@@ -1,7 +1,8 @@
 //! 主窗口底部状态栏：工作区、提示、代理、当前环境。
 
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::status_bar::StatusBar;
+use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{App, IntoElement, ParentElement as _, Styled as _, div, px};
 use thread_core::services::proxy::ProxyStatus;
 
@@ -16,17 +17,23 @@ pub fn render(this: &AppView, cx: &App) -> impl IntoElement {
         (Some(index), None) => index.name.clone(),
         _ => tr!(cx, "未打开工作区", "No workspace").to_string(),
     };
+    let environment_active = index
+        .and_then(|index| index.active_environment.as_ref())
+        .is_some();
     let environment = index
         .and_then(|index| index.active_environment.clone())
         .unwrap_or_else(|| tr!(cx, "无环境", "No environment").to_string());
     let notice = model.notice.clone();
-    let proxy = proxy_label(cx, &this.proxy.status);
 
     let mut bar = StatusBar::new()
         .flex_shrink_0()
         .left(div().max_w(px(480.)).text_ellipsis().child(workspace))
-        .right(proxy)
-        .right(environment);
+        .right(proxy_chip(cx, &this.proxy.status))
+        .right(status_chip(
+            environment,
+            environment_active,
+            cx.theme().primary,
+        ));
     if let Some(notice) = notice {
         bar = bar.child(
             div()
@@ -37,6 +44,28 @@ pub fn render(this: &AppView, cx: &App) -> impl IntoElement {
         );
     }
     bar
+}
+
+fn status_chip(label: String, marked: bool, color: gpui_kit::Hsla) -> impl IntoElement {
+    h_flex()
+        .gap_1()
+        .items_center()
+        .when(marked, |row| {
+            row.child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(color))
+        })
+        .child(label)
+}
+
+fn proxy_chip(cx: &App, status: &ProxyStatus) -> impl IntoElement {
+    let colors = crate::format::SemanticColors::for_theme(cx.theme());
+    let color = if !status.running {
+        cx.theme().muted_foreground
+    } else if status.paused {
+        colors.post
+    } else {
+        colors.get
+    };
+    status_chip(proxy_label(cx, status), true, color)
 }
 
 fn proxy_label(cx: &App, status: &ProxyStatus) -> String {

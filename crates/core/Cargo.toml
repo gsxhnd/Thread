@@ -7,6 +7,7 @@ edition = "2024"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9.34"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "io-util", "fs", "time", "net"] }
 dirs = "6.0.0"
 toml = "0.8.23"

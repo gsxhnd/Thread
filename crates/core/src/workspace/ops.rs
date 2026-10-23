@@ -696,6 +696,50 @@ pub fn set_env_variable(
     Ok(environment)
 }
 
+/// Renames a variable in place. Secret values move with the name and stay out
+/// of the workspace file.
+pub fn rename_env_variable(
+    root: &Path,
+    rel: &str,
+    from: &str,
+    to: &str,
+) -> AppResult<EnvironmentFile> {
+    let from = from.trim();
+    let to = to.trim();
+    crate::db::require_non_empty("variable key", to)?;
+    let path = layout::resolve_inside(root, rel)?;
+    let mut environment = files::read_json::<EnvironmentFile>(&path)?;
+    if from == to {
+        return Ok(environment);
+    }
+    if environment
+        .variables
+        .iter()
+        .any(|variable| variable.key == to)
+    {
+        return Err(AppError::Validation(format!(
+            "variable '{to}' already exists"
+        )));
+    }
+    let Some(variable) = environment
+        .variables
+        .iter_mut()
+        .find(|variable| variable.key == from)
+    else {
+        return Err(AppError::NotFound(format!("variable '{from}'")));
+    };
+    let secret = variable.secret;
+    variable.key = to.to_string();
+    if secret {
+        if let Some(value) = secrets::get(root, rel, from) {
+            secrets::set(root, rel, to, &value)?;
+        }
+        secrets::remove(root, rel, from)?;
+    }
+    files::write_json(&path, &environment)?;
+    Ok(environment)
+}
+
 pub fn delete_env_variable(root: &Path, rel: &str, key: &str) -> AppResult<EnvironmentFile> {
     let path = layout::resolve_inside(root, rel)?;
     let mut environment = files::read_json::<EnvironmentFile>(&path)?;
@@ -1096,6 +1140,13 @@ mod tests {
         let text = fs::read_to_string(root.join(&rel)).unwrap();
         assert!(text.contains("plain"));
 
+        rename_env_variable(&root, &rel, "baseUrl", "host").unwrap();
+        let renamed = environment_detail(&root, &rel, None).unwrap();
+        assert_eq!(renamed.variables[1].key, "host");
+        assert_eq!(renamed.variables[1].value, "http://localhost:3000");
+        let duplicate = rename_env_variable(&root, &rel, "host", "apiKey").unwrap_err();
+        assert_eq!(duplicate.code(), "VALIDATION");
+
         delete_env_variable(&root, &rel, "apiKey").unwrap();
         let deleted = environment_detail(&root, &rel, None).unwrap();
         assert!(
@@ -1104,6 +1155,40 @@ mod tests {
                 .iter()
                 .all(|variable| variable.key != "apiKey")
         );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash);
+    }
+
+    #[test]
+    fn renaming_a_secret_variable_moves_the_local_value() {
+        let (root, trash) = setup("rename-secret");
+        let (rel, _) = create_environment(&root, "dev").unwrap();
+        set_env_variable(
+            &root,
+            &rel,
+            "apiKey",
+            Some("sk-live-secret".into()),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .unwrap();
+
+        rename_env_variable(&root, &rel, "apiKey", "token").unwrap();
+
+        assert!(secrets::get(&root, &rel, "apiKey").is_none());
+        assert_eq!(
+            secrets::get(&root, &rel, "token").unwrap(),
+            "sk-live-secret"
+        );
+        let text = fs::read_to_string(root.join(&rel)).unwrap();
+        assert!(!text.contains("sk-live-secret"));
+        assert!(text.contains("token"));
+        let detail = environment_detail(&root, &rel, None).unwrap();
+        assert_eq!(detail.variables[0].key, "token");
+        assert!(detail.variables[0].secret);
+        assert_eq!(detail.variables[0].value, "");
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&trash);
     }
