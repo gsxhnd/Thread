@@ -200,6 +200,18 @@ pub fn proxy_client() -> AppResult<&'static ProxyClient> {
     Ok(PROXY.get_or_init(|| client))
 }
 
+/// Client config that accepts any certificate. Used when the user turns verification off.
+pub(crate) fn client_config_insecure() -> Arc<rustls::ClientConfig> {
+    let provider = crypto_provider();
+    let verifier = Arc::new(AcceptAnyCert { provider });
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth(),
+    )
+}
+
 fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     if let Some(installed) = rustls::crypto::CryptoProvider::get_default() {
         return Arc::clone(installed);

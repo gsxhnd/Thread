@@ -372,8 +372,11 @@ fn default_mqtt(name: &str) -> super::formats::MqttRequestDoc {
         username: String::new(),
         password: String::new(),
         subscriptions: Vec::new(),
+        publish_defaults: super::formats::MqttPublishDefaults::default(),
         tls_enabled: false,
         keep_alive_secs: 60,
+        clean_session: true,
+        protocol_level: 4,
     }
 }
 
@@ -1009,6 +1012,39 @@ mod tests {
         let trashed = delete_request(&root, &rel, &trash).unwrap();
         assert!(!root.join(&rel).exists());
         assert!(std::path::Path::new(&trashed).exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&trash);
+    }
+
+    #[test]
+    fn draft_request_saves_inside_a_collection_and_not_the_workspace_root() {
+        let (root, trash) = setup("draft-save");
+        let error = create_request(&root, "", "临时请求", "http").unwrap_err();
+        assert_eq!(error.code(), "VALIDATION");
+
+        let (collection, _) = create_collection(&root, None, "默认集合", None).unwrap();
+        let (rel, _) = create_request(&root, &collection, "临时请求", "http").unwrap();
+        let updated = update_request_document(
+            &root,
+            &rel,
+            serde_json::json!({
+                "protocol": "http",
+                "name": "临时请求",
+                "method": "POST",
+                "url": "https://example.com/users"
+            }),
+        )
+        .unwrap();
+        let RequestFile::Http(doc) = updated else {
+            panic!("expected HTTP document");
+        };
+        assert_eq!(doc.method, "POST");
+        assert_eq!(doc.url, "https://example.com/users");
+
+        let scanned = super::super::index::scan(&root, None).unwrap();
+        assert_eq!(scanned.index.request_count, 1);
+        assert!(scanned.index.find_request(&rel).is_some());
+
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&trash);
     }

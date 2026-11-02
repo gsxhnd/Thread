@@ -32,6 +32,7 @@ use services::history::{self, NewHistoryEntry};
 use services::http::{
     EffectiveSettings, HttpRequestConfig, HttpResponse, HttpTaskRegistry, SendOptions, execute,
 };
+use services::mqtt::MqttRegistry;
 use services::proxy::{ProxyEngine, ProxyEntrySummary, ProxyEventSink, ProxyStatus};
 use services::websocket::WsRegistry;
 use workspace::watcher;
@@ -55,6 +56,8 @@ pub enum LiveEvent {
     WsStatus(services::websocket::WsStatusEvent),
     Graphql(services::graphql::SubscriptionEvent),
     Grpc(services::grpc::StreamEvent),
+    MqttMessage(services::mqtt::MqttMessageEvent),
+    MqttStatus(services::mqtt::MqttStatusEvent),
 }
 
 /// Fan-out sink: turns the engine's `ProxyEventSink` callbacks into a queue the
@@ -85,6 +88,7 @@ pub struct AppCore {
     pub workspace: Arc<WorkspaceState>,
     pub http_tasks: Arc<HttpTaskRegistry>,
     pub websockets: Arc<WsRegistry>,
+    pub mqtt: Arc<MqttRegistry>,
     pub graphql: Arc<SubscriptionRegistry>,
     pub protos: Arc<ProtoCatalog>,
     pub proxy: Arc<ProxyEngine>,
@@ -111,9 +115,11 @@ impl AppCore {
         let http_tasks = Arc::new(HttpTaskRegistry::new());
         let io = runtime.handle().clone();
         let websockets = Arc::new(WsRegistry::new());
+        let mqtt = Arc::new(MqttRegistry::new());
         let graphql = Arc::new(SubscriptionRegistry::new());
         let protos = Arc::new(ProtoCatalog::new());
         websockets.bind_runtime(io.clone());
+        mqtt.bind_runtime(io.clone());
         graphql.bind_runtime(io.clone());
         protos.bind_runtime(io);
 
@@ -132,6 +138,7 @@ impl AppCore {
             workspace,
             http_tasks,
             websockets,
+            mqtt,
             graphql,
             protos,
             proxy,

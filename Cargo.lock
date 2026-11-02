@@ -4018,6 +4018,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mqtt_codec"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6800,6 +6808,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "mqtt_codec",
  "parking_lot",
  "pem",
  "prost",
@@ -6808,6 +6817,7 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -78,6 +78,8 @@ pub struct RequestTab {
     pub path: Option<String>,
     pub name: String,
     pub dirty: bool,
+    /// 每次改动加一。保存完成时用它判断期间有没有新的修改。
+    pub edit_rev: u64,
     pub protocol: views::request::Protocol,
     pub method: Entity<SelectState<Vec<&'static str>>>,
     pub url: Entity<InputState>,
@@ -138,8 +140,17 @@ pub struct RequestTab {
     pub proto_source: String,
     pub proto_file_path: Option<String>,
     pub timeout_ms: u64,
-    /// MQTT 等只读文档，保存时原样写回。
-    pub preserved: Option<serde_json::Value>,
+    pub mqtt_client_id: Entity<InputState>,
+    pub mqtt_keep_alive: Entity<InputState>,
+    pub mqtt_sub_topic: Entity<InputState>,
+    pub mqtt_publish_topic: Entity<InputState>,
+    pub mqtt_subscriptions: Vec<thread_core::workspace::formats::MqttSubscription>,
+    pub mqtt_draft_qos: u8,
+    pub mqtt_publish_qos: u8,
+    pub mqtt_retain: bool,
+    pub mqtt_clean_session: bool,
+    /// `4` is MQTT 3.1.1, `5` is MQTT 5.0.
+    pub mqtt_protocol_level: u8,
 }
 
 /// 代理页轮询与展示状态。
@@ -212,8 +223,8 @@ pub struct AppView {
     /// 环境页的变量表单。
     pub env_key: Entity<InputState>,
     pub env_value: Entity<InputState>,
-    /// 已有变量的名称输入。和详情里的变量按顺序对齐。
-    pub env_names: Vec<views::environments::EnvNameField>,
+    /// 已有变量的名称和值。和详情里的变量按顺序对齐。
+    pub env_fields: Vec<views::environments::EnvVariableField>,
     /// 设置子窗口。关掉之后下一次打开会重新创建。
     pub settings_window: Option<AnyWindowHandle>,
     /// 设置窗口正在创建，避免同一次点击连开两个。
@@ -326,7 +337,7 @@ impl AppView {
             },
             env_key,
             env_value,
-            env_names: Vec::new(),
+            env_fields: Vec::new(),
             settings_window: None,
             settings_pending: false,
             workspace_root,
@@ -389,7 +400,7 @@ impl AppView {
             self.dismiss_open_tabs();
             self.environment.selected_path = None;
             self.environment.detail = None;
-            self.env_names.clear();
+            self.env_fields.clear();
             self.workspace_root = root;
         } else {
             self.sync_open_tabs(cx);
@@ -744,7 +755,7 @@ impl AppView {
             return Err(AppError::Internal("request tab was not created".into()));
         };
         self.tabs[index].apply_http_doc(&document, window, cx);
-        self.tabs[index].dirty = true;
+        self.tabs[index].mark_unsaved();
         cx.notify();
         Ok(())
     }
@@ -954,7 +965,10 @@ impl AppView {
             views::request::Protocol::Grpc => {
                 self.core.protos.cancel_stream(id);
             }
-            views::request::Protocol::Http | views::request::Protocol::Mqtt => {}
+            views::request::Protocol::Mqtt => {
+                self.core.mqtt.disconnect(id);
+            }
+            views::request::Protocol::Http => {}
         }
     }
 
@@ -1003,6 +1017,26 @@ impl AppView {
                 }
                 if event.done || event.error.is_some() {
                     self.clear_session(&event.stream_id);
+                }
+            }
+            thread_core::LiveEvent::MqttMessage(message) => {
+                let retain = if message.retain { " retain" } else { "" };
+                let text = format!(
+                    "{} qos={}{retain} {}",
+                    message.topic, message.qos, message.payload
+                );
+                self.push_session_log(&message.connection_id, &message.direction, &text);
+            }
+            thread_core::LiveEvent::MqttStatus(status) => {
+                let detail = status.reason.unwrap_or_default();
+                let connection_id = status.connection_id.clone();
+                let kind = status.status.clone();
+                self.push_session_log(&connection_id, &kind, &detail);
+                if kind == "open" {
+                    self.set_session_idle(&connection_id);
+                }
+                if kind == "closed" || kind == "error" {
+                    self.clear_session(&connection_id);
                 }
             }
         }

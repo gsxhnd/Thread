@@ -478,10 +478,22 @@ pub struct MqttRequestDoc {
     pub password: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscriptions: Vec<MqttSubscription>,
+    /// Topic, QoS and retain used to prefill the publish row.
+    #[serde(default, skip_serializing_if = "publish_defaults_empty")]
+    pub publish_defaults: MqttPublishDefaults,
     #[serde(default)]
     pub tls_enabled: bool,
     #[serde(default = "default_keep_alive")]
     pub keep_alive_secs: u16,
+    /// `true` starts a new session (MQTT 3.1.1 clean session / MQTT 5 clean start).
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub clean_session: bool,
+    /// `4` is MQTT 3.1.1, `5` is MQTT 5.0.
+    #[serde(
+        default = "default_protocol_level",
+        skip_serializing_if = "is_protocol_v4"
+    )]
+    pub protocol_level: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +507,34 @@ pub struct MqttSubscription {
 
 fn default_keep_alive() -> u16 {
     60
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_protocol_level() -> u8 {
+    4
+}
+
+fn is_protocol_v4(level: &u8) -> bool {
+    *level == 4
+}
+
+fn publish_defaults_empty(value: &MqttPublishDefaults) -> bool {
+    value.topic.is_empty() && value.qos == 0 && !value.retain
+}
+
+/// Prefill for the publish row of an MQTT request.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MqttPublishDefaults {
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub qos: u8,
+    #[serde(default)]
+    pub retain: bool,
 }
 
 impl RequestFile {

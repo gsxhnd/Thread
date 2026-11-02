@@ -2,13 +2,15 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
+    PromptLevel, SharedString, Styled as _, Subscription, WeakEntity, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::AppError;
@@ -17,13 +19,20 @@ use thread_core::workspace::index::EnvironmentSummary;
 use crate::app::AppView;
 use crate::widgets;
 
-/// 环境变量名称的输入框。订阅先于输入框释放，避免销毁时的失焦再提交一次。
-pub struct EnvNameField {
-    original: String,
+/// 一行环境变量的名称和值。订阅写在输入框前面，丢掉这一行时先取消订阅，
+/// 避免输入框销毁时的失焦再提交一次。
+pub struct EnvVariableField {
+    key: String,
+    value: String,
+    secret: bool,
+    stored: bool,
     /// 持有输入框订阅。字段本身不读，丢掉这一行时订阅一起取消。
     #[expect(dead_code)]
-    watch: Subscription,
-    input: Entity<InputState>,
+    name_watch: Subscription,
+    #[expect(dead_code)]
+    value_watch: Subscription,
+    name_input: Entity<InputState>,
+    value_input: Entity<InputState>,
 }
 
 /// 侧边栏里的环境列表。变量编辑留在主区域。
@@ -36,13 +45,20 @@ pub fn sidebar(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         .map(|index| index.environments.clone())
         .unwrap_or_default();
     if environments.is_empty() {
+        let weak = cx.entity().downgrade();
         return div()
+            .id("env-empty")
             .flex_1()
             .pt_8()
+            .context_menu(move |menu, _, cx| menu.item(new_environment_item(weak.clone(), cx)))
             .child(widgets::compact_empty(
                 cx,
                 IconName::Braces,
-                tr!(cx, "还没有环境。", "No environments yet."),
+                tr!(
+                    cx,
+                    "还没有环境。右键可以新建。",
+                    "No environments yet. Right-click to create one."
+                ),
             ))
             .into_any_element();
     }
@@ -60,8 +76,13 @@ pub fn sidebar(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                 .gap_0p5()
                 .children(environments.into_iter().enumerate().map(|(ix, summary)| {
                     let selected = selected_path.as_deref() == Some(summary.path.as_str());
+                    let menu_path = summary.path.clone();
+                    let menu_name = summary.name.clone();
+                    let menu_active = summary.is_active;
+                    let menu_global = summary.is_global;
+                    let menu_weak = cx.entity().downgrade();
                     v_flex()
-                        .id(SharedString::from(format!("env-item-{ix}")))
+                        .id(SharedString::from(summary.path.clone()))
                         .gap_0p5()
                         .px_2()
                         .py_1p5()
@@ -108,10 +129,180 @@ pub fn sidebar(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                                 this.select_environment(ix, window, cx);
                             }),
                         )
+                        .context_menu(move |menu, _, cx| {
+                            environment_menu(
+                                menu,
+                                menu_path.clone(),
+                                menu_name.clone(),
+                                menu_active,
+                                menu_global,
+                                menu_weak.clone(),
+                                cx,
+                            )
+                        })
                         .into_any_element()
                 })),
         )
         .into_any_element()
+}
+
+pub(crate) fn heading_menu(menu: PopupMenu, weak: WeakEntity<AppView>, cx: &App) -> PopupMenu {
+    menu.item(new_environment_item(weak, cx))
+}
+
+fn new_environment_item(weak: WeakEntity<AppView>, cx: &App) -> PopupMenuItem {
+    PopupMenuItem::new(tr!(cx, "新建环境", "New environment")).on_click(move |_, _window, cx| {
+        let _ = weak.update_in(cx, |view, window, cx| view.create_environment(window, cx));
+    })
+}
+
+fn environment_menu(
+    menu: PopupMenu,
+    path: String,
+    name: String,
+    active: bool,
+    global: bool,
+    weak: WeakEntity<AppView>,
+    cx: &App,
+) -> PopupMenu {
+    let mut menu = if active {
+        let weak = weak.clone();
+        menu.item(PopupMenuItem::new(tr!(cx, "停用", "Deactivate")).on_click(
+            move |_, _window, cx| {
+                let _ = weak.update_in(cx, |view, window, cx| {
+                    view.activate_environment(None, window, cx);
+                });
+            },
+        ))
+    } else {
+        let weak = weak.clone();
+        let path = path.clone();
+        menu.item(
+            PopupMenuItem::new(tr!(cx, "设为当前环境", "Set active")).on_click(
+                move |_, _window, cx| {
+                    let path = path.clone();
+                    let _ = weak.update_in(cx, |view, window, cx| {
+                        view.activate_environment(Some(path), window, cx);
+                    });
+                },
+            ),
+        )
+    };
+    let rename_path = path.clone();
+    let rename_name = name.clone();
+    let rename_weak = weak.clone();
+    menu = menu
+        .separator()
+        .item(
+            PopupMenuItem::new(tr!(cx, "重命名", "Rename")).on_click(move |_, window, cx| {
+                prompt_environment_rename(
+                    window,
+                    cx,
+                    rename_path.clone(),
+                    rename_name.clone(),
+                    rename_weak.clone(),
+                );
+            }),
+        );
+    if !global {
+        let delete_path = path;
+        let delete_name = name;
+        let delete_weak = weak.clone();
+        menu = menu
+            .separator()
+            .item(
+                PopupMenuItem::new(tr!(cx, "删除", "Delete")).on_click(move |_, window, cx| {
+                    confirm_delete_environment(
+                        window,
+                        cx,
+                        delete_name.clone(),
+                        delete_path.clone(),
+                        delete_weak.clone(),
+                    );
+                }),
+            );
+    }
+    menu.separator().item(new_environment_item(weak, cx))
+}
+
+fn prompt_environment_rename(
+    window: &mut Window,
+    cx: &mut App,
+    path: String,
+    current: String,
+    weak: WeakEntity<AppView>,
+) {
+    let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let input = input.clone();
+        let weak = weak.clone();
+        let path = path.clone();
+        dialog
+            .title(tr!(cx, "重命名环境", "Rename environment"))
+            .w(px(360.))
+            .child(Input::new(&input))
+            .footer(
+                DialogFooter::new()
+                    .child(
+                        Button::new("env-rename-cancel")
+                            .label(tr!(cx, "取消", "Cancel"))
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("env-rename-ok")
+                            .primary()
+                            .label(tr!(cx, "确定", "OK"))
+                            .on_click(move |_, window, cx| {
+                                let name = input.read(cx).value().trim().to_string();
+                                if name.is_empty() {
+                                    window.push_notification(
+                                        tr!(cx, "名称不能为空。", "Name cannot be empty."),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                window.close_dialog(cx);
+                                let path = path.clone();
+                                let _ = weak.update_in(cx, |view, window, cx| {
+                                    view.rename_environment(path, name, window, cx);
+                                });
+                            }),
+                    ),
+            )
+    });
+}
+
+fn confirm_delete_environment(
+    window: &mut Window,
+    cx: &mut App,
+    name: String,
+    path: String,
+    weak: WeakEntity<AppView>,
+) {
+    let message = tr!(
+        cx,
+        format!("删除环境「{name}」？"),
+        format!("Delete environment “{name}”?")
+    );
+    let receiver = window.prompt(
+        PromptLevel::Warning,
+        &message,
+        Some(tr!(
+            cx,
+            "文件会移到应用回收站，可以稍后找回。",
+            "The file goes to the app trash and can be restored later."
+        )),
+        &[tr!(cx, "删除", "Delete"), tr!(cx, "取消", "Cancel")],
+        cx,
+    );
+    cx.spawn(async move |cx| {
+        if receiver.await == Ok(0) {
+            let _ = weak.update_in(cx, |view, window, cx| {
+                view.delete_environment(path, window, cx);
+            });
+        }
+    })
+    .detach();
 }
 
 pub fn render(this: &mut AppView, _window: &mut Window, cx: &mut Context<AppView>) -> AnyElement {
@@ -221,17 +412,18 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                                 })
                             })
                     })
-                    .child(
+                    .child({
+                        let path = detail.path.clone();
                         Button::new("env-delete")
                             .outline()
                             .small()
                             .danger()
                             .icon(IconName::Delete)
                             .label(tr!(cx, "删除环境", "Delete environment"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.delete_environment(window, cx);
-                            })),
-                    ),
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_environment(path.clone(), window, cx);
+                            }))
+                    }),
             )
             .into_any_element(),
     );
@@ -259,7 +451,9 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
         );
     } else {
         for (ix, variable) in detail.variables.iter().enumerate() {
-            let name_input = this.env_names.get(ix).map(|field| field.input.clone());
+            let field = this.env_fields.get(ix);
+            let name_input = field.map(|field| field.name_input.clone());
+            let value_input = field.map(|field| field.value_input.clone());
             rows.push(
                 h_flex()
                     .id(("env-var", ix))
@@ -280,27 +474,19 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                             .child(variable.key.clone())
                             .into_any_element(),
                     })
-                    .child(
-                        div()
+                    .child(match value_input {
+                        Some(input) => div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Input::new(&input).small())
+                            .into_any_element(),
+                        None => div()
                             .text_xs()
                             .flex_1()
                             .text_ellipsis()
-                            .child(if variable.secret {
-                                if variable.has_stored_value {
-                                    tr!(
-                                        cx,
-                                        "••••••（机密，已存本地）",
-                                        "•••••• (secret, stored locally)"
-                                    )
-                                    .to_string()
-                                } else {
-                                    tr!(cx, "••••••（机密，未设置值）", "•••••• (secret, no value)")
-                                        .to_string()
-                                }
-                            } else {
-                                variable.value.clone()
-                            }),
-                    )
+                            .child(variable.value.clone())
+                            .into_any_element(),
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -370,7 +556,7 @@ impl AppView {
     pub fn reload_environment(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.read(cx).root() else {
             self.environment.detail = None;
-            self.env_names.clear();
+            self.env_fields.clear();
             return;
         };
         let path = self.environment.selected_path.clone().or_else(|| {
@@ -381,7 +567,7 @@ impl AppView {
         });
         let Some(path) = path else {
             self.environment.detail = None;
-            self.env_names.clear();
+            self.env_fields.clear();
             return;
         };
         self.environment.selected_path = Some(path.clone());
@@ -397,7 +583,7 @@ impl AppView {
                 .and_then(|outcome| outcome);
             let _ = this.update_in(cx, |view, window, cx| {
                 view.environment.detail = result.ok();
-                view.sync_env_names(window, cx);
+                view.sync_env_fields(window, cx);
                 cx.notify();
             });
         })
@@ -490,14 +676,11 @@ impl AppView {
         .detach();
     }
 
-    pub fn delete_environment(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn delete_environment(&mut self, path: String, _: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.read(cx).root() else {
             return;
         };
-        let Some(detail) = &self.environment.detail else {
-            return;
-        };
-        let path = detail.path.clone();
+        let selected = self.environment.selected_path.as_deref() == Some(path.as_str());
         let core = self.core.clone();
         let receiver = core.spawn(async move {
             thread_core::workspace::ops::delete_environment(
@@ -512,15 +695,12 @@ impl AppView {
                 .map_err(|error| AppError::Internal(error.to_string()))
                 .and_then(|outcome| outcome);
             let _ = this.update_in(cx, |view, window, cx| {
-                view.environment.selected_path = None;
-                view.environment.detail = None;
-                view.env_names.clear();
-                view.workspace.update(cx, |model, cx| {
-                    let snapshot = model.core.workspace.snapshot().ok();
-                    model.snapshot = snapshot;
-                    cx.emit(crate::state::WorkspaceEvent::Changed);
-                    cx.notify();
-                });
+                if selected && result.is_ok() {
+                    view.environment.selected_path = None;
+                    view.environment.detail = None;
+                    view.env_fields.clear();
+                }
+                view.workspace.update(cx, |model, cx| model.refresh(cx));
                 match result {
                     Ok(_) => window.push_notification(
                         tr!(
@@ -543,9 +723,45 @@ impl AppView {
         .detach();
     }
 
-    /// 按当前环境详情重建名称输入框。名称列表没变时保留正在编辑的输入框。
-    pub fn sync_env_names(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let keys: Vec<String> = self
+    pub fn rename_environment(
+        &mut self,
+        path: String,
+        name: String,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let selected = self.environment.selected_path.as_deref() == Some(path.as_str());
+        let core = self.core.clone();
+        let receiver = core.spawn(async move {
+            thread_core::workspace::ops::update_environment(&root, &path, Some(name))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))
+                .and_then(|outcome| outcome);
+            let _ = this.update_in(cx, |view, window, cx| match result {
+                Ok(_) => {
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    if selected {
+                        view.reload_environment(cx);
+                    }
+                    window.push_notification(tr!(cx, "环境已重命名。", "Environment renamed."), cx);
+                }
+                Err(error) => {
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 按当前环境详情重建名称和值的输入框。列表没变时保留正在编辑的输入框。
+    pub fn sync_env_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows: Vec<(String, String, bool, bool)> = self
             .environment
             .detail
             .as_ref()
@@ -553,25 +769,51 @@ impl AppView {
                 detail
                     .variables
                     .iter()
-                    .map(|variable| variable.key.clone())
+                    .map(|variable| {
+                        (
+                            variable.key.clone(),
+                            variable.value.clone(),
+                            variable.secret,
+                            variable.has_stored_value,
+                        )
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        let unchanged = self.env_names.len() == keys.len()
-            && self
-                .env_names
-                .iter()
-                .zip(&keys)
-                .all(|(field, key)| field.original == *key);
+        let unchanged =
+            self.env_fields.len() == rows.len()
+                && self.env_fields.iter().zip(&rows).all(
+                    |(field, (key, value, secret, stored))| {
+                        field.key == *key
+                            && field.value == *value
+                            && field.secret == *secret
+                            && field.stored == *stored
+                    },
+                );
         if unchanged {
             return;
         }
-        self.env_names.clear();
-        for key in keys {
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(key.clone()));
-            let watched = input.clone();
-            let watch = cx.subscribe_in(
-                &watched,
+        self.env_fields.clear();
+        for (key, value, secret, stored) in rows {
+            let name_input = cx.new(|cx| InputState::new(window, cx).default_value(key.clone()));
+            let value_placeholder = if secret {
+                if stored {
+                    tr!(cx, "输入新值以替换", "Type a new value to replace").to_string()
+                } else {
+                    tr!(cx, "机密值", "Secret value").to_string()
+                }
+            } else {
+                tr!(cx, "值", "Value").to_string()
+            };
+            let value_input = cx.new(|cx| {
+                let state = InputState::new(window, cx)
+                    .placeholder(value_placeholder)
+                    .default_value(if secret { String::new() } else { value.clone() });
+                if secret { state.masked(true) } else { state }
+            });
+            let watched_name = name_input.clone();
+            let name_watch = cx.subscribe_in(
+                &watched_name,
                 window,
                 |this, input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -579,10 +821,25 @@ impl AppView {
                     }
                 },
             );
-            self.env_names.push(EnvNameField {
-                original: key,
-                watch,
-                input,
+            let watched_value = value_input.clone();
+            let value_watch = cx.subscribe_in(
+                &watched_value,
+                window,
+                |this, input, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        this.commit_env_value(input, window, cx);
+                    }
+                },
+            );
+            self.env_fields.push(EnvVariableField {
+                key,
+                value: if secret { String::new() } else { value },
+                secret,
+                stored,
+                name_input,
+                value_input,
+                name_watch,
+                value_watch,
             });
         }
     }
@@ -595,13 +852,13 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self
-            .env_names
+            .env_fields
             .iter()
-            .position(|field| field.input == *input)
+            .position(|field| field.name_input == *input)
         else {
             return;
         };
-        let from = self.env_names[ix].original.clone();
+        let from = self.env_fields[ix].key.clone();
         let to = input.read(cx).value().trim().to_string();
         if to.is_empty() || to == from {
             if input.read(cx).value() != from {
@@ -623,7 +880,7 @@ impl AppView {
         if input.read(cx).value() != to {
             input.update(cx, |state, cx| state.set_value(&to, window, cx));
         }
-        self.env_names[ix].original = to.clone();
+        self.env_fields[ix].key = to.clone();
         let saved_from = from.clone();
         let saved_to = to.clone();
         let core = self.core.clone();
@@ -642,13 +899,103 @@ impl AppView {
                     window.push_notification(tr!(cx, "变量名已更新。", "Variable renamed."), cx);
                 }
                 Err(error) => {
-                    if let Some(field) =
-                        view.env_names.iter_mut().find(|field| field.original == to)
-                    {
-                        field.original = from.clone();
+                    if let Some(field) = view.env_fields.iter_mut().find(|field| field.key == to) {
+                        field.key = from.clone();
                         field
-                            .input
+                            .name_input
                             .update(cx, |state, cx| state.set_value(&from, window, cx));
+                    }
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 失焦或回车时把变量值写回。机密值留空表示不改，避免一点输入框就把原值清掉。
+    pub fn commit_env_value(
+        &mut self,
+        input: &Entity<InputState>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .env_fields
+            .iter()
+            .position(|field| field.value_input == *input)
+        else {
+            return;
+        };
+        let previous = self.env_fields[ix].value.clone();
+        let secret = self.env_fields[ix].secret;
+        let next = input.read(cx).value().to_string();
+        if next == previous || (secret && next.is_empty()) {
+            return;
+        }
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let Some(detail) = self.environment.detail.as_ref() else {
+            return;
+        };
+        let path = detail.path.clone();
+        let key = self.env_fields[ix].key.clone();
+        let enabled = detail
+            .variables
+            .iter()
+            .find(|variable| variable.key == key)
+            .is_none_or(|variable| variable.enabled);
+        self.env_fields[ix].value = if secret { String::new() } else { next.clone() };
+        let value_input = input.clone();
+        let core = self.core.clone();
+        let receiver = core.spawn(async move {
+            thread_core::workspace::ops::set_env_variable(
+                &root,
+                &path,
+                &key,
+                Some(next),
+                Some(enabled),
+                Some(secret),
+                None,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))
+                .and_then(|outcome| outcome);
+            let _ = this.update_in(cx, |view, window, cx| match result {
+                Ok(_) => {
+                    if let Some(field) = view
+                        .env_fields
+                        .iter_mut()
+                        .find(|field| field.value_input == value_input)
+                    {
+                        if field.secret {
+                            field.stored = true;
+                            field
+                                .value_input
+                                .update(cx, |state, cx| state.set_value("", window, cx));
+                        }
+                    }
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    view.reload_environment(cx);
+                    window
+                        .push_notification(tr!(cx, "变量值已更新。", "Variable value saved."), cx);
+                }
+                Err(error) => {
+                    if let Some(field) = view
+                        .env_fields
+                        .iter_mut()
+                        .find(|field| field.value_input == value_input)
+                    {
+                        field.value = previous.clone();
+                        if !field.secret {
+                            let restore = previous.clone();
+                            field.value_input.update(cx, |state, cx| {
+                                state.set_value(restore, window, cx);
+                            });
+                        }
                     }
                     window.push_notification((NotificationType::Error, error.to_string()), cx);
                 }

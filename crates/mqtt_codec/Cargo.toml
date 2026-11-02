@@ -1,0 +1,27 @@
+[package]
+name = "mqtt_codec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "MQTT v3.1.1 and v5.0 control packet codec."
+publish = false
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+
+[[example]]
+name = "v4_encode"
+path = "examples/v4_encode.rs"
+
+[[example]]
+name = "v4_builder"
+path = "examples/v4_builder.rs"
+
+[[example]]
+name = "v5_encode"
+path = "examples/v5_encode.rs"
+
+[[example]]
+name = "v5_builder"
+path = "examples/v5_builder.rs"

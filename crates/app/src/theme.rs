@@ -1,4 +1,4 @@
-//! 外观偏好：跟随系统、浅色/深色，以及若干内置配色主题。
+//! 外观偏好：跟随系统、白色/暖纸/深色，以及若干内置配色主题。
 //!
 //! 选择写入 `config.toml` 的 `ui_layout` section（沿用核心提供的
 //! `ThreadConfigStore::set_section`），下次启动时恢复。
@@ -12,13 +12,16 @@ use thread_core::config::{SECTION_UI_LAYOUT, ThreadConfigStore};
 
 use serde::{Deserialize, Serialize};
 
-/// 设置页里可选的外观。`System` / `Light` / `Dark` 使用内置默认配色，其余是内置的命名主题。
+/// 设置页里可选的外观。跟随系统时，浅色用白色主题，深色用深色主题。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreference {
     #[default]
     System,
-    Light,
+    White,
+    /// 原来的浅色。底色是暖纸色，不是白色。配置里的旧值 `light` 仍读成这一项。
+    #[serde(alias = "light")]
+    Paper,
     Dark,
     Solarized,
     Nord,
@@ -50,9 +53,10 @@ struct Palette {
 }
 
 impl ThemePreference {
-    pub const ALL: [ThemePreference; 6] = [
+    pub const ALL: [ThemePreference; 7] = [
         ThemePreference::System,
-        ThemePreference::Light,
+        ThemePreference::White,
+        ThemePreference::Paper,
         ThemePreference::Dark,
         ThemePreference::Solarized,
         ThemePreference::Nord,
@@ -62,7 +66,8 @@ impl ThemePreference {
     pub fn label(self, cx: &App) -> &'static str {
         match self {
             Self::System => crate::tr!(cx, "跟随系统", "System"),
-            Self::Light => crate::tr!(cx, "浅色", "Light"),
+            Self::White => crate::tr!(cx, "白色", "White"),
+            Self::Paper => crate::tr!(cx, "暖纸", "Paper"),
             Self::Dark => crate::tr!(cx, "深色", "Dark"),
             Self::Solarized => crate::tr!(cx, "Solarized 浅色", "Solarized Light"),
             Self::Nord => crate::tr!(cx, "Nord 深色", "Nord"),
@@ -74,7 +79,8 @@ impl ThemePreference {
     pub fn code(self) -> &'static str {
         match self {
             Self::System => "system",
-            Self::Light => "light",
+            Self::White => "white",
+            Self::Paper => "paper",
             Self::Dark => "dark",
             Self::Solarized => "solarized",
             Self::Nord => "nord",
@@ -83,24 +89,50 @@ impl ThemePreference {
     }
 
     pub fn from_code(code: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|preference| preference.code() == code)
+        match code {
+            // 旧配置里的 light 是暖纸色，不是现在的白色。
+            "light" => Some(Self::Paper),
+            _ => Self::ALL
+                .into_iter()
+                .find(|preference| preference.code() == code),
+        }
     }
 
     /// 设置页色块用的代表色：背景、文字、强调色。
     pub fn swatch(self) -> (u32, u32, u32) {
         match self.palette() {
             Some(palette) => (palette.background, palette.foreground, palette.primary),
-            None => (0xf6f5f2, 0x1c1917, 0x0f766e),
+            None => (0xffffff, 0x18181b, 0x0f766e),
         }
     }
 
     fn palette(self) -> Option<Palette> {
         Some(match self {
-            // 浅色：暖纸底，侧边栏再沉一点，强调色用青绿，和中性灰默认主题拉开。
-            Self::Light => Palette {
-                name: "Thread Light",
+            // 默认浅色：纯白工作区，侧栏只比白底沉一档，避免再看起来像米色。
+            Self::White => Palette {
+                name: "Thread White",
+                dark: false,
+                background: 0xffffff,
+                foreground: 0x18181b,
+                sidebar: 0xf4f4f5,
+                sidebar_foreground: 0x18181b,
+                sidebar_border: 0xe4e4e7,
+                sidebar_accent: 0xe4e4e7,
+                border: 0xe4e4e7,
+                muted: 0xf4f4f5,
+                muted_foreground: 0x71717a,
+                primary: 0x0f766e,
+                primary_foreground: 0xffffff,
+                accent: 0xf4f4f5,
+                accent_foreground: 0x18181b,
+                secondary: 0xfafafa,
+                input_border: 0xd4d4d8,
+                list_active: 0xccfbf1,
+                popover: 0xffffff,
+            },
+            // 暖纸：侧边栏再沉一点，强调色用青绿，和白色主题分开。
+            Self::Paper => Palette {
+                name: "Thread Paper",
                 dark: false,
                 background: 0xf6f5f2,
                 foreground: 0x1c1917,
@@ -213,7 +245,7 @@ impl ThemePreference {
     fn mode(self, system_dark: bool) -> ThemeMode {
         match self {
             Self::Dark | Self::Nord | Self::Dracula => ThemeMode::Dark,
-            Self::Light | Self::Solarized => ThemeMode::Light,
+            Self::White | Self::Paper | Self::Solarized => ThemeMode::Light,
             Self::System => {
                 if system_dark {
                     ThemeMode::Dark
@@ -287,10 +319,10 @@ fn register(palette: &Palette, cx: &mut App) -> Option<Rc<ThemeConfig>> {
 fn apply(preference: ThemePreference, cx: &mut App) {
     let dark = system_dark(cx);
     let mode = preference.mode(dark);
-    // 跟随系统时套用同一套 Thread 浅色/深色，而不是组件库的中性默认色。
+    // 跟随系统时套用白色或深色，而不是组件库的中性默认色。
     let concrete = match preference {
         ThemePreference::System if dark => ThemePreference::Dark,
-        ThemePreference::System => ThemePreference::Light,
+        ThemePreference::System => ThemePreference::White,
         other => other,
     };
     let (mut light, mut dark_config) = {
@@ -455,5 +487,13 @@ mod tests {
         }
         assert_eq!(ThemePreference::from_code("nonsense"), None);
         assert_eq!(ThemePreference::from_code(""), None);
+        assert_eq!(
+            ThemePreference::from_code("light"),
+            Some(ThemePreference::Paper)
+        );
+        assert_eq!(
+            ThemePreference::from_code("white"),
+            Some(ThemePreference::White)
+        );
     }
 }

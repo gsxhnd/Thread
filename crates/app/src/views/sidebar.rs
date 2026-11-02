@@ -443,6 +443,18 @@ fn panel_header(
                     root_collection_menu(menu, header_weak.clone(), cx)
                 })
                 .into_any_element(),
+            MainView::Environments => div()
+                .id("environment-heading")
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_ellipsis()
+                .child(title)
+                .context_menu(move |menu, _window, cx| {
+                    crate::views::environments::heading_menu(menu, header_weak.clone(), cx)
+                })
+                .into_any_element(),
             _ => div()
                 .flex_1()
                 .min_w_0()
@@ -486,6 +498,13 @@ fn header_actions(view: MainView, cx: &mut Context<AppView>) -> AnyElement {
                 IconName::Boxes,
                 tr!(cx, "新建 gRPC", "New gRPC"),
                 crate::views::request::Protocol::Grpc,
+            ))
+            .child(draft_icon(
+                cx,
+                "draft-mqtt",
+                IconName::Satellite,
+                tr!(cx, "新建 MQTT", "New MQTT"),
+                crate::views::request::Protocol::Mqtt,
             ))
             .into_any_element(),
         MainView::History => Button::new("history-clear")
@@ -700,6 +719,12 @@ fn node_context_menu(
             .item(new_request_item(
                 tr!(cx, "新建 gRPC 请求", "New gRPC request"),
                 "grpc",
+                &path,
+                weak.clone(),
+            ))
+            .item(new_request_item(
+                tr!(cx, "新建 MQTT 请求", "New MQTT request"),
+                "mqtt",
                 &path,
                 weak.clone(),
             ))

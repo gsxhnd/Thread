@@ -1,4 +1,4 @@
-//! GraphQL、WebSocket、gRPC 的编辑与发送。MQTT 只展示文件内容。
+//! GraphQL、WebSocket、gRPC、MQTT 的编辑与发送。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -11,8 +11,8 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, Context, Entity, IntoElement, ParentElement as _, PathPromptOptions,
-    SharedString, Styled as _, Window, div, px,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement as _,
+    PathPromptOptions, SharedString, Styled as _, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 use thread_core::error::AppError;
@@ -22,8 +22,9 @@ use thread_core::services::graphql::{
 };
 use thread_core::services::grpc::{GrpcInvoke, ServiceInfo};
 use thread_core::services::http::{HttpResponse, Timing};
+use thread_core::services::mqtt::{MqttConnect, MqttSink};
 use thread_core::services::websocket::{WsConnect, WsOutgoing, WsSink};
-use thread_core::workspace::formats::AuthSpec;
+use thread_core::workspace::formats::{AuthSpec, MqttSubscription};
 
 use crate::app::AppView;
 use crate::views::request::{self, EditorPane, KvKind, Protocol};
@@ -40,7 +41,7 @@ pub fn body(
         Protocol::Graphql => graphql_body(this, active, window, cx),
         Protocol::Websocket => websocket_body(this, active, cx),
         Protocol::Grpc => grpc_body(this, active, window, cx),
-        Protocol::Mqtt => mqtt_body(this, active, cx),
+        Protocol::Mqtt => mqtt_body(this, active, window, cx),
         Protocol::Http => div().into_any_element(),
     }
 }
@@ -51,6 +52,7 @@ pub fn send(this: &mut AppView, tab_ix: usize, cx: &mut Context<AppView>) {
         Some(Protocol::Graphql) => send_graphql(this, tab_ix, false, cx),
         Some(Protocol::Websocket) => toggle_websocket(this, tab_ix, cx),
         Some(Protocol::Grpc) => call_grpc(this, tab_ix, cx),
+        Some(Protocol::Mqtt) => toggle_mqtt(this, tab_ix, cx),
         _ => {}
     }
 }
@@ -206,7 +208,7 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
                         .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                             if let Some(tab) = this.tabs.get_mut(active) {
                                 tab.auto_reconnect = *checked;
-                                tab.dirty = true;
+                                tab.mark_unsaved();
                                 cx.notify();
                             }
                         })),
@@ -350,7 +352,7 @@ fn grpc_body(
                     move |this, checked: &bool, _, cx| {
                         if let Some(tab) = this.tabs.get_mut(active) {
                             tab.tls = *checked;
-                            tab.dirty = true;
+                            tab.mark_unsaved();
                             cx.notify();
                         }
                     },
@@ -453,27 +455,569 @@ fn grpc_body(
         .into_any_element()
 }
 
-fn mqtt_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> AnyElement {
+fn mqtt_body(
+    this: &mut AppView,
+    active: usize,
+    _window: &mut Window,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
     let theme = cx.theme().clone();
-    let broker = this.tabs[active].url.read(cx).value().to_string();
+    let (
+        url,
+        client_id,
+        username,
+        password,
+        keep_alive,
+        sub_topic,
+        publish_topic,
+        payload,
+        connected,
+        tls,
+        clean_session,
+        level,
+        draft_qos,
+        publish_qos,
+        retain,
+        error,
+        has_path,
+        subscriptions,
+    ) = {
+        let tab = &this.tabs[active];
+        (
+            tab.url.clone(),
+            tab.mqtt_client_id.clone(),
+            tab.auth_username.clone(),
+            tab.auth_password.clone(),
+            tab.mqtt_keep_alive.clone(),
+            tab.mqtt_sub_topic.clone(),
+            tab.mqtt_publish_topic.clone(),
+            tab.message.clone(),
+            tab.connection_id.is_some(),
+            tab.tls,
+            tab.mqtt_clean_session,
+            tab.mqtt_protocol_level,
+            tab.mqtt_draft_qos,
+            tab.mqtt_publish_qos,
+            tab.mqtt_retain,
+            tab.error.clone(),
+            tab.path.is_some(),
+            tab.mqtt_subscriptions.clone(),
+        )
+    };
+
+    let clean_label: SharedString = if level == 5 {
+        tr!(cx, "Clean start", "Clean start").into()
+    } else {
+        tr!(cx, "清理会话", "Clean session").into()
+    };
+    let status_label: SharedString = if connected {
+        tr!(cx, "已连接", "Connected").into()
+    } else {
+        tr!(cx, "未连接", "Disconnected").into()
+    };
+    let status_color = {
+        let colors = crate::format::SemanticColors::for_theme(&theme);
+        if connected {
+            colors.get
+        } else {
+            theme.muted_foreground
+        }
+    };
+    let sub_count = subscriptions.len();
+
     v_flex()
         .flex_1()
-        .gap_2()
-        .child(crate::widgets::notice_line(
-            cx,
-            tr!(
+        .min_h_0()
+        .child(widgets::band(
+            theme.border,
+            theme.background,
+            v_flex().gap_2().child(toolbar(
+                this,
+                active,
+                &url,
+                LiveAction::Mqtt,
+                if connected {
+                    tr!(cx, "断开", "Disconnect")
+                } else {
+                    tr!(cx, "连接", "Connect")
+                },
+                has_path,
                 cx,
-                "MQTT 不在当前版本里。文件会保留，但不会连接 Broker。",
-                "MQTT is not in this version. The file is kept, but Thread will not connect to a broker."
-            ),
+            )),
         ))
+        .child(widgets::band(
+            theme.border,
+            theme.background,
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(mqtt_heading(
+                            cx,
+                            SharedString::from(tr!(cx, "连接", "Connection")),
+                        ))
+                        .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(status_color))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(status_label),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_end()
+                        .flex_wrap()
+                        .child(mqtt_field(
+                            cx,
+                            tr!(cx, "客户端 ID", "Client ID"),
+                            &client_id,
+                            180.,
+                            true,
+                            false,
+                        ))
+                        .child(mqtt_field(
+                            cx,
+                            tr!(cx, "用户名", "Username"),
+                            &username,
+                            140.,
+                            false,
+                            false,
+                        ))
+                        .child(mqtt_field(
+                            cx,
+                            tr!(cx, "密码", "Password"),
+                            &password,
+                            140.,
+                            false,
+                            true,
+                        ))
+                        .child(mqtt_field(
+                            cx,
+                            tr!(cx, "心跳（秒）", "Keep alive (s)"),
+                            &keep_alive,
+                            96.,
+                            false,
+                            false,
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(protocol_button(this, active, level, 4, "3.1.1", cx))
+                        .child(protocol_button(this, active, level, 5, "5.0", cx))
+                        .child(
+                            Switch::new("mqtt-clean")
+                                .checked(clean_session)
+                                .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                                    if let Some(tab) = this.tabs.get_mut(active) {
+                                        tab.mqtt_clean_session = *checked;
+                                        tab.mark_unsaved();
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(clean_label),
+                        )
+                        .child(Switch::new("mqtt-tls").checked(tls).on_click(cx.listener(
+                            move |this, checked: &bool, _, cx| {
+                                if let Some(tab) = this.tabs.get_mut(active) {
+                                    tab.tls = *checked;
+                                    tab.mark_unsaved();
+                                    cx.notify();
+                                }
+                            },
+                        )))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child("TLS"),
+                        ),
+                ),
+        ))
+        .when_some(error, |column, error| {
+            column.child(widgets::band(
+                theme.border,
+                theme.background,
+                crate::widgets::notice_line(cx, error),
+            ))
+        })
+        .child(widgets::editor_split(
+            theme.muted,
+            this.editor_layout == crate::theme::EditorLayout::Stacked,
+            if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                "mqtt-editor-split"
+            } else {
+                "mqtt-editor-split-side"
+            },
+            widgets::pane_frame(
+                theme.border,
+                theme.background,
+                div()
+                    .id("mqtt-controls")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .gap_4()
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(mqtt_heading(cx, subscribe_title(sub_count, cx)))
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(div().flex_1().min_w_0().child(
+                                                Input::new(&sub_topic).small(),
+                                            ))
+                                            .child(qos_button(this, active, true, draft_qos, cx))
+                                            .child(
+                                                Button::new("mqtt-add-sub")
+                                                    .outline()
+                                                    .small()
+                                                    .label(tr!(cx, "订阅", "Subscribe"))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            add_mqtt_subscription(
+                                                                this, active, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .when(subscriptions.is_empty(), |column| {
+                                        column.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.muted_foreground)
+                                                .child(tr!(
+                                                    cx,
+                                                    "还没有订阅。填好主题后点订阅。",
+                                                    "No subscriptions yet. Enter a topic filter and subscribe."
+                                                )),
+                                        )
+                                    })
+                                    .children(subscriptions.iter().enumerate().map(
+                                        |(index, sub)| {
+                                            let topic = sub.topic.clone();
+                                            let qos = sub.qos;
+                                            h_flex()
+                                                .gap_2()
+                                                .items_center()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(theme.muted)
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .text_xs()
+                                                        .text_ellipsis()
+                                                        .child(topic),
+                                                )
+                                                .child(widgets::mini_tag(
+                                                    cx,
+                                                    format!("QoS {qos}"),
+                                                ))
+                                                .child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "mqtt-unsub-{index}"
+                                                    )))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .label(tr!(cx, "移除", "Remove"))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            remove_mqtt_subscription(
+                                                                this, active, index, window, cx,
+                                                            );
+                                                        },
+                                                    )),
+                                                )
+                                        },
+                                    )),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(mqtt_heading(
+                                        cx,
+                                        SharedString::from(tr!(cx, "发布", "Publish")),
+                                    ))
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(div().flex_1().min_w_0().child(
+                                                Input::new(&publish_topic).small(),
+                                            ))
+                                            .child(qos_button(this, active, false, publish_qos, cx))
+                                            .child(
+                                                Switch::new("mqtt-retain")
+                                                    .checked(retain)
+                                                    .on_click(cx.listener(
+                                                        move |this, checked: &bool, _, cx| {
+                                                            if let Some(tab) =
+                                                                this.tabs.get_mut(active)
+                                                            {
+                                                                tab.mqtt_retain = *checked;
+                                                                tab.mark_unsaved();
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child("Retain"),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(Input::new(&payload).small()),
+                                            )
+                                            .child(
+                                                Button::new("mqtt-publish")
+                                                    .outline()
+                                                    .small()
+                                                    .label(tr!(cx, "发布", "Publish"))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            publish_mqtt(this, active, window, cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            ),
+                    ),
+            ),
+            Some(mqtt_log(this, active, cx)),
+        ))
+        .into_any_element()
+}
+
+fn subscribe_title(count: usize, cx: &App) -> SharedString {
+    if count == 0 {
+        tr!(cx, "订阅", "Subscribe").into()
+    } else {
+        SharedString::from(tr!(
+            cx,
+            format!("订阅 · {count}"),
+            format!("Subscribe · {count}")
+        ))
+    }
+}
+
+fn message_title(count: usize, cx: &App) -> SharedString {
+    if count == 0 {
+        tr!(cx, "消息", "Messages").into()
+    } else {
+        SharedString::from(tr!(
+            cx,
+            format!("消息 · {count}"),
+            format!("Messages · {count}")
+        ))
+    }
+}
+
+fn mqtt_heading(cx: &App, title: SharedString) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(cx.theme().foreground)
+        .child(title)
+}
+
+fn mqtt_field(
+    cx: &App,
+    label: impl Into<SharedString>,
+    input: &Entity<InputState>,
+    width: f32,
+    grow: bool,
+    masked: bool,
+) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let mut field = Input::new(input).small();
+    if masked {
+        field = field.mask_toggle();
+    }
+    v_flex()
+        .w(px(width))
+        .when(grow, |column| column.flex_1().min_w(px(width)))
+        .gap_1()
         .child(
             div()
-                .text_sm()
-                .text_color(theme.foreground)
-                .child(format!("Broker：{broker}")),
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(label.into()),
         )
+        .child(field)
+}
+
+fn mqtt_log(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let colors = crate::format::SemanticColors::for_theme(&theme);
+    let log = this.tabs[active].log.clone();
+    let count = log.len();
+    v_flex()
+        .size_full()
+        .min_h_0()
+        .gap_2()
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .child(mqtt_heading(cx, message_title(count, cx))),
+        )
+        .child(if log.is_empty() {
+            div()
+                .flex_1()
+                .min_h(px(80.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .px_4()
+                .text_xs()
+                .text_center()
+                .text_color(theme.muted_foreground)
+                .child(tr!(
+                    cx,
+                    "连接之后，收到和发出的消息会显示在这里。",
+                    "Received and published messages show up here after you connect."
+                ))
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("mqtt-log")
+                .flex_1()
+                .min_h(px(80.))
+                .overflow_y_scroll()
+                .gap_1()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .p_2()
+                .children(log.iter().map(|line| {
+                    let (label, color) = mqtt_log_kind(&line.kind, &colors, &theme, cx);
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .w(px(52.))
+                                .flex_shrink_0()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(color)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .child(line.text.clone()),
+                        )
+                }))
+                .into_any_element()
+        })
         .into_any_element()
+}
+
+fn mqtt_log_kind(
+    kind: &str,
+    colors: &crate::format::SemanticColors,
+    theme: &gpui_kit::component::Theme,
+    cx: &App,
+) -> (SharedString, gpui_kit::Hsla) {
+    match kind {
+        "in" => (tr!(cx, "收到", "In").into(), colors.get),
+        "out" => (tr!(cx, "发出", "Out").into(), colors.put),
+        "error" => (tr!(cx, "错误", "Error").into(), colors.delete),
+        "open" => (tr!(cx, "连上", "Open").into(), colors.get),
+        "closed" => (tr!(cx, "断开", "Closed").into(), colors.other),
+        other => (other.to_string().into(), theme.muted_foreground),
+    }
+}
+
+fn protocol_button(
+    _this: &mut AppView,
+    active: usize,
+    current: u8,
+    level: u8,
+    label: &'static str,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let mut button = Button::new(SharedString::from(format!("mqtt-level-{level}")))
+        .small()
+        .label(label)
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(tab) = this.tabs.get_mut(active) {
+                tab.mqtt_protocol_level = level;
+                tab.mark_unsaved();
+                cx.notify();
+            }
+        }));
+    button = if current == level {
+        button.primary()
+    } else {
+        button.outline()
+    };
+    button
+}
+
+fn qos_button(
+    _this: &mut AppView,
+    active: usize,
+    draft: bool,
+    qos: u8,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
+    let name = if draft {
+        "mqtt-draft-qos"
+    } else {
+        "mqtt-pub-qos"
+    };
+    Button::new(name)
+        .outline()
+        .small()
+        .label(SharedString::from(format!("QoS {qos}")))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if let Some(tab) = this.tabs.get_mut(active) {
+                let next = (qos + 1) % 3;
+                if draft {
+                    tab.mqtt_draft_qos = next;
+                } else {
+                    tab.mqtt_publish_qos = next;
+                    tab.mark_unsaved();
+                }
+                cx.notify();
+            }
+        }))
 }
 
 #[derive(Clone, Copy)]
@@ -481,6 +1025,7 @@ enum LiveAction {
     Graphql,
     Websocket,
     Grpc,
+    Mqtt,
     Stop,
 }
 
@@ -507,6 +1052,7 @@ fn toolbar(
                     LiveAction::Graphql => send_graphql(this, active, false, cx),
                     LiveAction::Websocket => toggle_websocket(this, active, cx),
                     LiveAction::Grpc => call_grpc(this, active, cx),
+                    LiveAction::Mqtt => toggle_mqtt(this, active, cx),
                     LiveAction::Stop => {
                         this.stop_live(active);
                         cx.notify();
@@ -695,7 +1241,7 @@ fn method_list(
                             });
                         }
                         if let Some(tab) = this.tabs.get_mut(active) {
-                            tab.dirty = true;
+                            tab.mark_unsaved();
                         }
                         cx.notify();
                     }))
@@ -944,6 +1490,260 @@ fn subscribe_graphql(
         }
     }
     cx.notify();
+}
+
+fn toggle_mqtt(this: &mut AppView, tab_ix: usize, cx: &mut Context<AppView>) {
+    if this
+        .tabs
+        .get(tab_ix)
+        .is_some_and(|tab| tab.connection_id.is_some())
+    {
+        this.stop_live(tab_ix);
+        cx.notify();
+        return;
+    }
+    let Some(tab) = this.tabs.get(tab_ix) else {
+        return;
+    };
+    let broker_url = tab.url.read(cx).value().to_string();
+    let client_id = tab.mqtt_client_id.read(cx).value().to_string();
+    let username = tab.auth_username.read(cx).value().to_string();
+    let password = tab.auth_password.read(cx).value().to_string();
+    let keep_alive = tab
+        .mqtt_keep_alive
+        .read(cx)
+        .value()
+        .trim()
+        .parse::<u16>()
+        .unwrap_or(60);
+    let subscriptions = tab
+        .mqtt_subscriptions
+        .iter()
+        .map(|sub| (sub.topic.clone(), sub.qos))
+        .collect::<Vec<_>>();
+    let tls = tab.tls;
+    let clean_session = tab.mqtt_clean_session;
+    let protocol_level = tab.mqtt_protocol_level;
+    let variables = load_variables(&this.core);
+    let broker_url = match substitute_required(&broker_url, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    let client_id = match substitute_required(&client_id, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    let username = match substitute_required(&username, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    let password = match substitute_required(&password, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    let mut resolved_subscriptions = Vec::new();
+    for (topic, qos) in subscriptions {
+        match substitute_required(&topic, &variables) {
+            Ok(topic) => resolved_subscriptions.push((topic, qos)),
+            Err(missing) => {
+                reject_mqtt(this, tab_ix, &missing, cx);
+                return;
+            }
+        }
+    }
+    let sender = this.core.live_sender();
+    let sender_status = sender.clone();
+    let sink = MqttSink::new(
+        move |event| {
+            let _ = sender.send(thread_core::LiveEvent::MqttMessage(event));
+        },
+        move |event| {
+            let _ = sender_status.send(thread_core::LiveEvent::MqttStatus(event));
+        },
+    );
+    let verify_ssl = this.core.config.app_settings().verify_ssl;
+    match this.core.mqtt.connect(
+        MqttConnect {
+            broker_url,
+            tls,
+            verify_ssl,
+            client_id,
+            username,
+            password,
+            keep_alive,
+            clean_session,
+            protocol_level,
+            subscriptions: resolved_subscriptions,
+        },
+        sink,
+    ) {
+        Ok(id) => {
+            if let Some(tab) = this.tabs.get_mut(tab_ix) {
+                tab.connection_id = Some(id);
+                tab.error = None;
+                tab.log.clear();
+                tab.sending = true;
+            }
+        }
+        Err(error) => {
+            if let Some(tab) = this.tabs.get_mut(tab_ix) {
+                tab.error = Some(error.to_string());
+            }
+        }
+    }
+    cx.notify();
+}
+
+fn add_mqtt_subscription(
+    this: &mut AppView,
+    tab_ix: usize,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    let Some(tab) = this.tabs.get(tab_ix) else {
+        return;
+    };
+    let topic = tab.mqtt_sub_topic.read(cx).value().trim().to_string();
+    if topic.is_empty() {
+        return;
+    }
+    let qos = tab.mqtt_draft_qos.min(2);
+    let connection = tab.connection_id.clone();
+    if let Some(id) = connection.as_deref() {
+        let variables = load_variables(&this.core);
+        let resolved = match substitute_required(&topic, &variables) {
+            Ok(value) => value,
+            Err(missing) => {
+                reject_mqtt(this, tab_ix, &missing, cx);
+                return;
+            }
+        };
+        if let Err(error) = this.core.mqtt.subscribe(id, &resolved, qos) {
+            window.push_notification((NotificationType::Error, error.to_string()), cx);
+            return;
+        }
+    }
+    if let Some(tab) = this.tabs.get_mut(tab_ix) {
+        if !tab
+            .mqtt_subscriptions
+            .iter()
+            .any(|sub| sub.topic == topic && sub.qos == qos)
+        {
+            tab.mqtt_subscriptions.push(MqttSubscription { topic, qos });
+        }
+        tab.mark_unsaved();
+        tab.error = None;
+    }
+    if let Some(tab) = this.tabs.get(tab_ix) {
+        let input = tab.mqtt_sub_topic.clone();
+        input.update(cx, |state, cx| state.set_value(String::new(), window, cx));
+    }
+    cx.notify();
+}
+
+fn remove_mqtt_subscription(
+    this: &mut AppView,
+    tab_ix: usize,
+    index: usize,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) {
+    let Some(tab) = this.tabs.get(tab_ix) else {
+        return;
+    };
+    let Some(sub) = tab.mqtt_subscriptions.get(index).cloned() else {
+        return;
+    };
+    if let Some(id) = tab.connection_id.clone() {
+        let variables = load_variables(&this.core);
+        if let Ok(topic) = substitute_required(&sub.topic, &variables)
+            && let Err(error) = this.core.mqtt.unsubscribe(&id, &topic)
+        {
+            window.push_notification((NotificationType::Error, error.to_string()), cx);
+        }
+    }
+    if let Some(tab) = this.tabs.get_mut(tab_ix) {
+        if index < tab.mqtt_subscriptions.len() {
+            tab.mqtt_subscriptions.remove(index);
+            tab.mark_unsaved();
+        }
+    }
+    cx.notify();
+}
+
+fn publish_mqtt(this: &mut AppView, tab_ix: usize, window: &mut Window, cx: &mut Context<AppView>) {
+    let Some(tab) = this.tabs.get(tab_ix) else {
+        return;
+    };
+    let Some(id) = tab.connection_id.clone() else {
+        if let Some(tab) = this.tabs.get_mut(tab_ix) {
+            tab.error = Some(tr!(cx, "先连接 Broker。", "Connect to a broker first.").into());
+            cx.notify();
+        }
+        return;
+    };
+    let topic = tab.mqtt_publish_topic.read(cx).value().to_string();
+    let payload = tab.message.read(cx).value().to_string();
+    let qos = tab.mqtt_publish_qos.min(2);
+    let retain = tab.mqtt_retain;
+    let variables = load_variables(&this.core);
+    let topic = match substitute_required(&topic, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    let payload = match substitute_required(&payload, &variables) {
+        Ok(value) => value,
+        Err(missing) => {
+            reject_mqtt(this, tab_ix, &missing, cx);
+            return;
+        }
+    };
+    if let Err(error) = this
+        .core
+        .mqtt
+        .publish(&id, &topic, payload.into_bytes(), qos, retain)
+    {
+        window.push_notification((NotificationType::Error, error.to_string()), cx);
+    }
+}
+
+fn reject_mqtt(this: &mut AppView, tab_ix: usize, missing: &str, cx: &mut Context<AppView>) {
+    if let Some(tab) = this.tabs.get_mut(tab_ix) {
+        tab.error = Some(
+            tr!(
+                cx,
+                format!("未解析的变量：{missing}"),
+                format!("Unresolved variables: {missing}")
+            )
+            .into(),
+        );
+    }
+    cx.notify();
+}
+
+fn substitute_required(text: &str, variables: &BTreeMap<String, String>) -> Result<String, String> {
+    let mut missing = Vec::new();
+    let value = thread_core::services::variables::substitute(text, variables, &mut missing);
+    if missing.is_empty() {
+        Ok(value)
+    } else {
+        Err(missing.join(", "))
+    }
 }
 
 fn toggle_websocket(this: &mut AppView, tab_ix: usize, cx: &mut Context<AppView>) {
@@ -1289,7 +2089,7 @@ fn insert_completion(
         if let Some(schema) = schema {
             tab.suggestions = complete_fields(&schema, &next);
         }
-        tab.dirty = true;
+        tab.mark_unsaved();
     }
     cx.notify();
 }
@@ -1425,7 +2225,10 @@ impl AppView {
                 Protocol::Grpc => {
                     self.core.protos.cancel_stream(id);
                 }
-                Protocol::Http | Protocol::Mqtt => {}
+                Protocol::Mqtt => {
+                    self.core.mqtt.disconnect(id);
+                }
+                Protocol::Http => {}
             }
         }
         if let Some(tab) = self.tabs.get_mut(tab_ix) {

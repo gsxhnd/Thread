@@ -213,12 +213,17 @@ fn shortcut_row(
                         .child(detail.to_string()),
                 ),
         )
-        .child(match Kbd::binding_for_action(action, context, window) {
-            Some(kbd) => kbd.into_any_element(),
-            None => div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(tr!(cx, "未绑定", "Not bound"))
-                .into_any_element(),
-        })
+        .child(
+            match context
+                .map(|context| Kbd::binding_for_action(action, Some(context), window))
+                .unwrap_or_else(|| Kbd::global_binding_for_action(action, window))
+            {
+                Some(kbd) => kbd.into_any_element(),
+                None => div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(tr!(cx, "未绑定", "Not bound"))
+                    .into_any_element(),
+            },
+        )
 }

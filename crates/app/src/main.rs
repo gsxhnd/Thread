@@ -42,44 +42,42 @@ fn quit(_: &Quit, cx: &mut App) {
     cx.quit();
 }
 
-fn open_settings(_: &OpenSettings, cx: &mut App) {
+/// 按键处理发生在窗口更新里面。这时窗口已经从应用里取出，立刻再 `update_in`
+/// 会失败，快捷键就看起来没反应。等这一轮更新结束再进主窗口。
+fn on_main_window(
+    cx: &mut App,
+    update: impl FnOnce(&mut app::AppView, &mut gpui_kit::Window, &mut gpui_kit::Context<app::AppView>)
+    + 'static,
+) {
     let Some(main) = cx.try_global::<app::MainApp>() else {
         return;
     };
     let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| view.open_settings(window, cx));
+    cx.defer(move |cx| {
+        if let Err(error) = app.update_in(cx, update) {
+            tracing::warn!(%error, "shortcut could not reach the main window");
+        }
+    });
+}
+
+fn open_settings(_: &OpenSettings, cx: &mut App) {
+    on_main_window(cx, |view, window, cx| view.open_settings(window, cx));
 }
 
 fn save_request(_: &SaveRequest, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| view.save_active_tab(window, cx));
+    on_main_window(cx, |view, window, cx| view.save_active_tab(window, cx));
 }
 
 fn toggle_sidebar(_: &ToggleSidebar, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update(cx, |view, cx| view.toggle_sidebar(cx));
+    on_main_window(cx, |view, _, cx| view.toggle_sidebar(cx));
 }
 
 fn toggle_layout(_: &ToggleLayout, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update(cx, |view, cx| view.toggle_editor_layout(cx));
+    on_main_window(cx, |view, _, cx| view.toggle_editor_layout(cx));
 }
 
 fn send_request(_: &SendRequest, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| {
+    on_main_window(cx, |view, window, cx| {
         if view.view != crate::state::MainView::Request || view.open_collection.is_some() {
             return;
         }
@@ -91,11 +89,7 @@ fn send_request(_: &SendRequest, cx: &mut App) {
 }
 
 fn new_request(_: &NewRequest, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| {
+    on_main_window(cx, |view, window, cx| {
         if !view.workspace.read(cx).is_open() {
             return;
         }
@@ -104,11 +98,7 @@ fn new_request(_: &NewRequest, cx: &mut App) {
 }
 
 fn close_tab(_: &CloseTab, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| {
+    on_main_window(cx, |view, window, cx| {
         let Some(index) = view.active_tab else {
             return;
         };
@@ -117,27 +107,15 @@ fn close_tab(_: &CloseTab, cx: &mut App) {
 }
 
 fn next_tab(_: &NextTab, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update(cx, |view, cx| view.cycle_tab(1, cx));
+    on_main_window(cx, |view, _, cx| view.cycle_tab(1, cx));
 }
 
 fn previous_tab(_: &PreviousTab, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update(cx, |view, cx| view.cycle_tab(-1, cx));
+    on_main_window(cx, |view, _, cx| view.cycle_tab(-1, cx));
 }
 
 fn close_workspace(_: &CloseWorkspace, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| {
+    on_main_window(cx, |view, window, cx| {
         if view.workspace.read(cx).is_open() {
             view.close_workspace(window, cx);
         }
@@ -145,11 +123,7 @@ fn close_workspace(_: &CloseWorkspace, cx: &mut App) {
 }
 
 fn rename_tree_selection(_: &RenameTreeSelection, cx: &mut App) {
-    let Some(main) = cx.try_global::<app::MainApp>() else {
-        return;
-    };
-    let app = main.0.clone();
-    let _ = app.update_in(cx, |view, window, cx| {
+    on_main_window(cx, |view, window, cx| {
         view.rename_or_toggle_selected(window, cx);
     });
 }

@@ -53,6 +53,10 @@ cargo build --release -p thread-app
 
 详见 [docs/](docs/) 目录。
 
+## 使用的依赖
+
+> GPUI Kit <https://gpui-kit.com/>
+
 ## License
 
 [MIT](LICENSE)

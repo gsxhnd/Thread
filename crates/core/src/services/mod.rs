@@ -11,6 +11,7 @@ pub mod graphql;
 pub mod grpc;
 pub mod history;
 pub mod http;
+pub mod mqtt;
 pub mod proxy;
 pub mod secrets;
 mod transport;

@@ -2,6 +2,7 @@
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogFooter;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState, TabSize};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::NotificationType;
@@ -12,19 +13,22 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, FontWeight, IntoElement,
-    ParentElement as _, PathPromptOptions, SharedString, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, ClipboardItem, Context, Entity, Focusable as _, FontWeight,
+    IntoElement, ParentElement as _, PathPromptOptions, SharedString, Styled as _, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
-use thread_core::error::AppError;
+use thread_core::error::{AppError, AppResult};
 use thread_core::services::history::HistoryDetail;
 use thread_core::services::http::{HttpRequestConfig, HttpResponse, Timing};
 use thread_core::workspace::formats::{
     AuthSpec, GraphqlRequestDoc, GrpcRequestDoc, HttpBody, HttpBodyField, HttpRequestDoc, KeyValue,
-    RequestFile, WsRequestDoc,
+    MqttPublishDefaults, MqttRequestDoc, RequestFile, WsRequestDoc,
 };
+use thread_core::workspace::index::CollectionNode;
 use uuid::Uuid;
 
 use crate::app::{AppView, RequestTab};
@@ -64,7 +68,7 @@ impl RequestSection {
     }
 }
 
-/// 标签页协议。MQTT 只展示，不发送。
+/// 标签页协议。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Http,
@@ -204,6 +208,7 @@ impl RequestTab {
             path,
             name,
             dirty: false,
+            edit_rev: 0,
             protocol: Protocol::Http,
             method: cx.new(|cx| {
                 SelectState::new(
@@ -229,8 +234,11 @@ impl RequestTab {
                 .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "令牌", "Token"))),
             auth_username: cx
                 .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "用户名", "Username"))),
-            auth_password: cx
-                .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "密码", "Password"))),
+            auth_password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(tr!(cx, "密码", "Password"))
+                    .masked(true)
+            }),
             auth_key: cx.new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "键", "Key"))),
             auth_value: cx
                 .new(|cx| InputState::new(window, cx).placeholder(tr!(cx, "值", "Value"))),
@@ -302,8 +310,33 @@ impl RequestTab {
             proto_source: "file".into(),
             proto_file_path: None,
             timeout_ms: 30_000,
-            preserved: None,
+            mqtt_client_id: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr!(cx, "客户端 ID", "Client ID"))
+            }),
+            mqtt_keep_alive: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("60")
+                    .default_value("60")
+            }),
+            mqtt_sub_topic: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr!(cx, "订阅主题", "Topic filter"))
+            }),
+            mqtt_publish_topic: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(tr!(cx, "发布主题", "Publish topic"))
+            }),
+            mqtt_subscriptions: Vec::new(),
+            mqtt_draft_qos: 0,
+            mqtt_publish_qos: 0,
+            mqtt_retain: false,
+            mqtt_clean_session: true,
+            mqtt_protocol_level: 4,
         }
+    }
+
+    /// 记一次未保存的修改。保存进行中的新改动也会把版本号往前推。
+    pub(crate) fn mark_unsaved(&mut self) {
+        self.edit_rev = self.edit_rev.wrapping_add(1);
+        self.dirty = true;
     }
 
     /// 新建临时（未保存）请求。
@@ -656,7 +689,27 @@ impl RequestTab {
                 tab.path = Some(path);
                 tab.name = doc.name.clone();
                 set_input(&tab.url, &doc.broker_url, window, cx);
-                tab.preserved = serde_json::to_value(RequestFile::Mqtt(doc)).ok();
+                set_input(&tab.mqtt_client_id, &doc.client_id, window, cx);
+                set_input(&tab.auth_username, &doc.username, window, cx);
+                set_input(&tab.auth_password, &doc.password, window, cx);
+                set_input(
+                    &tab.mqtt_keep_alive,
+                    &doc.keep_alive_secs.to_string(),
+                    window,
+                    cx,
+                );
+                set_input(
+                    &tab.mqtt_publish_topic,
+                    &doc.publish_defaults.topic,
+                    window,
+                    cx,
+                );
+                tab.mqtt_subscriptions = doc.subscriptions;
+                tab.mqtt_publish_qos = doc.publish_defaults.qos.min(2);
+                tab.mqtt_retain = doc.publish_defaults.retain;
+                tab.tls = doc.tls_enabled;
+                tab.mqtt_clean_session = doc.clean_session;
+                tab.mqtt_protocol_level = if doc.protocol_level == 5 { 5 } else { 4 };
                 tab
             }
         }
@@ -735,14 +788,37 @@ impl RequestTab {
 
     /// 序列化成保存到磁盘的请求文档。
     pub fn to_document(&self, cx: &App) -> serde_json::Value {
-        // MQTT 只展示不发送，保存时原样写回读入的文档，不丢字段。
-        if self.protocol == Protocol::Mqtt
-            && let Some(value) = self.preserved.clone()
-        {
-            return value;
-        }
         let file = match self.protocol {
-            Protocol::Http | Protocol::Mqtt => {
+            Protocol::Mqtt => {
+                let broker = self.url.read(cx).value().to_string();
+                let keep_alive = self
+                    .mqtt_keep_alive
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse::<u16>()
+                    .unwrap_or(60);
+                RequestFile::Mqtt(MqttRequestDoc {
+                    version: 1,
+                    id: None,
+                    name: self.name.clone(),
+                    broker_url: broker.clone(),
+                    client_id: self.mqtt_client_id.read(cx).value().to_string(),
+                    username: self.auth_username.read(cx).value().to_string(),
+                    password: self.auth_password.read(cx).value().to_string(),
+                    subscriptions: self.mqtt_subscriptions.clone(),
+                    publish_defaults: MqttPublishDefaults {
+                        topic: self.mqtt_publish_topic.read(cx).value().to_string(),
+                        qos: self.mqtt_publish_qos.min(2),
+                        retain: self.mqtt_retain,
+                    },
+                    tls_enabled: self.tls || broker_uses_tls(&broker),
+                    keep_alive_secs: keep_alive,
+                    clean_session: self.mqtt_clean_session,
+                    protocol_level: if self.mqtt_protocol_level == 5 { 5 } else { 4 },
+                })
+            }
+            Protocol::Http => {
                 let config = self.collect_config(cx);
                 RequestFile::Http(HttpRequestDoc {
                     version: 1,
@@ -804,6 +880,14 @@ impl RequestTab {
         };
         serde_json::to_value(file).unwrap_or(serde_json::Value::Null)
     }
+}
+
+fn broker_uses_tls(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("mqtts://")
+        || lower.starts_with("ssl://")
+        || lower.starts_with("tls://")
+        || lower.starts_with("wss://")
 }
 
 fn set_input(
@@ -1715,11 +1799,21 @@ fn auth_editor(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> 
             }
         })))
         .child(match kind.as_str() {
-            "bearer" => labeled_input(cx, tr!(cx, "令牌", "Token"), &token),
+            "bearer" => labeled_input(cx, tr!(cx, "令牌", "Token"), &token, false),
             "basic" => v_flex()
                 .gap_2()
-                .child(labeled_input(cx, tr!(cx, "用户名", "Username"), &username))
-                .child(labeled_input(cx, tr!(cx, "密码", "Password"), &password))
+                .child(labeled_input(
+                    cx,
+                    tr!(cx, "用户名", "Username"),
+                    &username,
+                    false,
+                ))
+                .child(labeled_input(
+                    cx,
+                    tr!(cx, "密码", "Password"),
+                    &password,
+                    true,
+                ))
                 .into_any_element(),
             "apiKey" => v_flex()
                 .gap_2()
@@ -1747,8 +1841,8 @@ fn auth_editor(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> 
                             }
                         })),
                 )
-                .child(labeled_input(cx, tr!(cx, "键", "Key"), &key))
-                .child(labeled_input(cx, tr!(cx, "值", "Value"), &value))
+                .child(labeled_input(cx, tr!(cx, "键", "Key"), &key, false))
+                .child(labeled_input(cx, tr!(cx, "值", "Value"), &value, false))
                 .into_any_element(),
             "none" => div()
                 .text_xs()
@@ -1772,8 +1866,17 @@ fn auth_editor(this: &mut AppView, active: usize, cx: &mut Context<AppView>) -> 
         .into_any_element()
 }
 
-fn labeled_input(cx: &App, label: &'static str, input: &Entity<InputState>) -> AnyElement {
+fn labeled_input(
+    cx: &App,
+    label: &'static str,
+    input: &Entity<InputState>,
+    masked: bool,
+) -> AnyElement {
     let theme = cx.theme().clone();
+    let mut field = Input::new(input).small();
+    if masked {
+        field = field.mask_toggle();
+    }
     v_flex()
         .gap_1()
         .child(
@@ -1782,7 +1885,7 @@ fn labeled_input(cx: &App, label: &'static str, input: &Entity<InputState>) -> A
                 .text_color(theme.muted_foreground)
                 .child(label),
         )
-        .child(Input::new(input).small())
+        .child(field)
         .into_any_element()
 }
 
@@ -2045,7 +2148,7 @@ impl AppView {
                 KvKind::Headers => tab.headers.push(row),
                 KvKind::Form => tab.form_fields.push(row),
             }
-            tab.dirty = true;
+            tab.mark_unsaved();
         }
         watch_tab_edits(self, tab_ix, window, cx);
         cx.notify();
@@ -2068,7 +2171,7 @@ impl AppView {
         };
         if row_ix < rows.len() {
             rows.remove(row_ix);
-            tab.dirty = true;
+            tab.mark_unsaved();
             cx.notify();
         }
     }
@@ -2090,7 +2193,7 @@ impl AppView {
         };
         if let Some(row) = rows.get_mut(row_ix) {
             row.enabled = !row.enabled;
-            tab.dirty = true;
+            tab.mark_unsaved();
             cx.notify();
         }
     }
@@ -2103,7 +2206,7 @@ impl AppView {
             return;
         }
         tab.auth_kind = kind.to_string();
-        tab.dirty = true;
+        tab.mark_unsaved();
         cx.notify();
     }
 
@@ -2115,7 +2218,7 @@ impl AppView {
             return;
         }
         tab.auth_in = location.to_string();
-        tab.dirty = true;
+        tab.mark_unsaved();
         cx.notify();
     }
 
@@ -2139,7 +2242,7 @@ impl AppView {
         }
         let select = tab.body_kind.clone();
         let body = tab.body.clone();
-        tab.dirty = true;
+        tab.mark_unsaved();
         select.update(cx, |state, cx| {
             state.set_selected_index(Some(IndexPath::default().row(index)), window, cx);
         });
@@ -2164,7 +2267,7 @@ impl AppView {
         if !file {
             row.file_path = None;
         }
-        tab.dirty = true;
+        tab.mark_unsaved();
         cx.notify();
     }
 
@@ -2200,7 +2303,7 @@ impl AppView {
                 row.file_path = Some(text.clone());
                 let input = row.value.clone();
                 input.update(cx, |state, cx| state.set_value(text, window, cx));
-                tab.dirty = true;
+                tab.mark_unsaved();
                 cx.notify();
             })
             .ok();
@@ -2254,7 +2357,7 @@ impl AppView {
         body.update(cx, |state, cx| state.set_value(rewritten, window, cx));
         if let Some(tab) = self.tabs.get_mut(tab_ix) {
             tab.error = None;
-            tab.dirty = true;
+            tab.mark_unsaved();
         }
         cx.notify();
     }
@@ -2382,8 +2485,110 @@ impl AppView {
         }
     }
 
-    /// 保存已存在的请求文件。
-    pub fn save_request(&mut self, tab_ix: usize, _: &mut Window, cx: &mut Context<Self>) {
+    /// 保存已存在的请求文件。还没落盘的临时请求改走「保存到集合」。
+    pub fn save_request(&mut self, tab_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(tab_ix) else {
+            return;
+        };
+        if tab.path.is_none() {
+            self.save_request_as(tab_ix, window, cx);
+            return;
+        }
+        self.persist_existing(tab_ix, window, cx);
+    }
+
+    /// 把临时请求写进一个集合。工作区根目录不接收请求文件，所以没有集合时会先建一个。
+    pub fn save_request_as(&mut self, tab_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace.read(cx).root().is_none() {
+            self.close_after_save = None;
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    tr!(cx, "先打开一个工作区。", "Open a workspace before saving."),
+                ),
+                cx,
+            );
+            return;
+        }
+        let Some(tab) = self.tabs.get(tab_ix) else {
+            self.close_after_save = None;
+            return;
+        };
+        let document = tab.to_document(cx);
+        if !document.is_object() {
+            self.close_after_save = None;
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    tr!(cx, "请求内容无法保存。", "This request cannot be saved."),
+                ),
+                cx,
+            );
+            return;
+        }
+        let name = tab.name.clone();
+        let protocol = tab.protocol.file_protocol().to_string();
+        let tab_id = tab.id.clone();
+        let choices = self
+            .workspace
+            .read(cx)
+            .index()
+            .map(|index| collection_choices(&index.collections))
+            .unwrap_or_default();
+        let preferred = self
+            .open_collection
+            .clone()
+            .filter(|path| choices.iter().any(|(candidate, _)| candidate == path));
+
+        if let Some(path) = preferred {
+            self.persist_draft(
+                tab_id,
+                DraftHome::Collection(path),
+                name,
+                protocol,
+                document,
+                cx,
+            );
+            return;
+        }
+        match choices.len() {
+            0 => {
+                let collection = tr!(cx, "默认集合", "Collection").to_string();
+                self.persist_draft(
+                    tab_id,
+                    DraftHome::NewCollection(collection),
+                    name,
+                    protocol,
+                    document,
+                    cx,
+                );
+            }
+            1 => {
+                let path = choices[0].0.clone();
+                self.persist_draft(
+                    tab_id,
+                    DraftHome::Collection(path),
+                    name,
+                    protocol,
+                    document,
+                    cx,
+                );
+            }
+            _ => self.prompt_save_collection(window, cx, tab_id, name, protocol, document, choices),
+        }
+    }
+
+    fn persist_existing(&mut self, tab_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    tr!(cx, "先打开一个工作区。", "Open a workspace before saving."),
+                ),
+                cx,
+            );
+            return;
+        };
         let Some(tab) = self.tabs.get(tab_ix) else {
             return;
         };
@@ -2391,80 +2596,44 @@ impl AppView {
             return;
         };
         let document = tab.to_document(cx);
-        if let Some(tab) = self.tabs.get_mut(tab_ix) {
-            tab.dirty = false;
+        if !document.is_object() {
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    tr!(cx, "请求内容无法保存。", "This request cannot be saved."),
+                ),
+                cx,
+            );
+            return;
         }
-        let locale = crate::i18n::current(cx);
-        tracing::info!(path = %path, "request saved");
-        self.workspace.update(cx, |model, cx| {
-            model.run(cx, move |root| {
-                thread_core::workspace::ops::update_request_document(&root, &path, document).map(
-                    |_| {
-                        crate::i18n::owned(
-                            locale,
-                            "请求已保存。".to_string(),
-                            "Request saved.".to_string(),
-                        )
-                    },
-                )
-            });
-        });
-        cx.notify();
-    }
-
-    /// 把临时请求保存为工作区根目录下的新文件（当前版本无弹窗，使用请求名）。
-    pub fn save_request_as(&mut self, tab_ix: usize, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.workspace.read(cx).root() else {
-            return;
-        };
-        let Some(tab) = self.tabs.get(tab_ix) else {
-            return;
-        };
-        let document = tab.to_document(cx);
-        let name = tab.name.clone();
-        let protocol = tab.protocol.file_protocol();
+        let revision = tab.edit_rev;
         let tab_id = tab.id.clone();
-
+        let saved_path = path.clone();
         let core = self.core.clone();
         let receiver = core.spawn(async move {
-            thread_core::workspace::ops::create_request(&root, "", &name, protocol)
+            thread_core::workspace::ops::update_request_document(&root, &path, document)
         });
         cx.spawn(async move |this, cx| {
-            let created = receiver
+            let saved = receiver
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))
                 .and_then(|outcome| outcome);
-            let _ = this.update_in(cx, |view, window, cx| match created {
-                Ok((path, _)) => {
-                    let locale = crate::i18n::current(cx);
-                    view.workspace.update(cx, |model, cx| {
-                        let document = document.clone();
-                        let path = path.clone();
-                        model.run(cx, move |root| {
-                            thread_core::workspace::ops::update_request_document(
-                                &root, &path, document,
-                            )
-                            .map(|_| {
-                                crate::i18n::owned(
-                                    locale,
-                                    format!("已保存到 {path}"),
-                                    format!("Saved to {path}"),
-                                )
-                            })
-                        });
-                    });
-                    tracing::info!(%path, "request saved as");
-                    if let Some(tab) = view.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                        tab.path = Some(path);
-                        tab.dirty = false;
-                    }
-                    if view.close_after_save.as_deref() == Some(tab_id.as_str()) {
-                        view.close_after_save = None;
-                        if let Some(index) = view.tabs.iter().position(|tab| tab.id == tab_id) {
-                            view.finish_close_tab(index, cx);
-                        }
-                    }
-                    cx.notify();
+            let _ = this.update_in(cx, |view, window, cx| match saved {
+                Ok(_) => {
+                    tracing::info!(path = %saved_path, "request saved");
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    view.apply_saved_tab(&tab_id, revision, None, None, cx);
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(
+                                cx,
+                                format!("已保存到 {saved_path}"),
+                                format!("Saved to {saved_path}")
+                            ),
+                        ),
+                        cx,
+                    );
                 }
                 Err(error) => {
                     view.close_after_save = None;
@@ -2474,6 +2643,313 @@ impl AppView {
         })
         .detach();
     }
+
+    fn persist_draft(
+        &mut self,
+        tab_id: String,
+        home: DraftHome,
+        name: String,
+        protocol: String,
+        document: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = self.workspace.read(cx).root() else {
+            self.close_after_save = None;
+            return;
+        };
+        let Some(revision) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| tab.edit_rev)
+        else {
+            self.close_after_save = None;
+            return;
+        };
+        let core = self.core.clone();
+        let receiver = core.spawn(async move {
+            write_draft(&root, home, &name, &protocol, document).map(|path| (path, name))
+        });
+        cx.spawn(async move |this, cx| {
+            let saved = receiver
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))
+                .and_then(|outcome| outcome);
+            let _ = this.update_in(cx, |view, window, cx| match saved {
+                Ok((path, name)) => {
+                    tracing::info!(%path, "request saved as");
+                    view.workspace.update(cx, |model, cx| model.refresh(cx));
+                    view.apply_saved_tab(&tab_id, revision, Some(path.clone()), Some(name), cx);
+                    window.push_notification(
+                        (
+                            NotificationType::Success,
+                            tr!(cx, format!("已保存到 {path}"), format!("Saved to {path}")),
+                        ),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    view.close_after_save = None;
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn apply_saved_tab(
+        &mut self,
+        tab_id: &str,
+        revision: u64,
+        path: Option<String>,
+        name: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let close = self.close_after_save.as_deref() == Some(tab_id);
+        let mut clean = false;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            if let Some(path) = path {
+                tab.path = Some(path);
+            }
+            if let Some(name) = name {
+                tab.name = name;
+            }
+            clean = tab.edit_rev == revision;
+            if clean {
+                tab.dirty = false;
+            }
+        }
+        if close {
+            self.close_after_save = None;
+            if clean {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) {
+                    self.finish_close_tab(index, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn prompt_save_collection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        tab_id: String,
+        name: String,
+        protocol: String,
+        document: serde_json::Value,
+        choices: Vec<(String, String)>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        let new_collection = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(tr!(cx, "新集合名称", "New collection name"))
+        });
+        let weak = cx.entity().downgrade();
+        let submitted = Rc::new(Cell::new(false));
+        let initial_focus = Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if initial_focus.replace(false) {
+                input.focus_handle(cx).focus(window, cx);
+            }
+            let theme = cx.theme().clone();
+            let weak_cancel = weak.clone();
+            dialog
+                .title(tr!(cx, "保存请求", "Save request"))
+                .w(px(420.))
+                .on_cancel({
+                    let weak_cancel = weak_cancel.clone();
+                    move |_, _, cx| {
+                        let _ = weak_cancel.update(cx, |view, _cx| view.close_after_save = None);
+                        true
+                    }
+                })
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(Input::new(&input))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(tr!(cx, "保存到集合", "Save into collection")),
+                        )
+                        .child(
+                            v_flex()
+                                .id("save-collection-list")
+                                .max_h(px(220.))
+                                .overflow_y_scroll()
+                                .gap_0p5()
+                                .children(choices.iter().map(|(path, label)| {
+                                    let path = path.clone();
+                                    let label = label.clone();
+                                    let weak = weak.clone();
+                                    let submitted = submitted.clone();
+                                    let input = input.clone();
+                                    let tab_id = tab_id.clone();
+                                    let protocol = protocol.clone();
+                                    let document = document.clone();
+                                    div()
+                                        .id(SharedString::from(format!("save-into-{path}")))
+                                        .px_2()
+                                        .py_1p5()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .hover(|row| row.bg(theme.muted))
+                                        .text_sm()
+                                        .text_ellipsis()
+                                        .child(label)
+                                        .on_click(move |_, window, cx| {
+                                            if submitted.replace(true) {
+                                                return;
+                                            }
+                                            let name = input.read(cx).value().trim().to_string();
+                                            if name.is_empty() {
+                                                submitted.set(false);
+                                                window.push_notification(
+                                                    tr!(
+                                                        cx,
+                                                        "名称不能为空。",
+                                                        "Name cannot be empty."
+                                                    ),
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                            let path = path.clone();
+                                            window.close_dialog(cx);
+                                            let _ = weak.update(cx, |view, cx| {
+                                                view.persist_draft(
+                                                    tab_id.clone(),
+                                                    DraftHome::Collection(path),
+                                                    name,
+                                                    protocol.clone(),
+                                                    document.clone(),
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(div().flex_1().child(Input::new(&new_collection).small()))
+                                .child(
+                                    Button::new("save-new-collection")
+                                        .outline()
+                                        .small()
+                                        .label(tr!(cx, "新建集合并保存", "Save in new collection"))
+                                        .on_click({
+                                            let weak = weak.clone();
+                                            let submitted = submitted.clone();
+                                            let input = input.clone();
+                                            let new_collection = new_collection.clone();
+                                            let tab_id = tab_id.clone();
+                                            let protocol = protocol.clone();
+                                            let document = document.clone();
+                                            move |_, window, cx| {
+                                                if submitted.replace(true) {
+                                                    return;
+                                                }
+                                                let name =
+                                                    input.read(cx).value().trim().to_string();
+                                                let collection = new_collection
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_string();
+                                                if name.is_empty() || collection.is_empty() {
+                                                    submitted.set(false);
+                                                    window.push_notification(
+                                                    tr!(
+                                                        cx,
+                                                        "请求名和集合名都不能为空。",
+                                                        "Request and collection names are required."
+                                                    ),
+                                                    cx,
+                                                );
+                                                    return;
+                                                }
+                                                window.close_dialog(cx);
+                                                let _ = weak.update(cx, |view, cx| {
+                                                    view.persist_draft(
+                                                        tab_id.clone(),
+                                                        DraftHome::NewCollection(collection),
+                                                        name,
+                                                        protocol.clone(),
+                                                        document.clone(),
+                                                        cx,
+                                                    );
+                                                });
+                                            }
+                                        }),
+                                ),
+                        ),
+                )
+                .footer(
+                    DialogFooter::new().child(
+                        Button::new("save-request-cancel")
+                            .label(tr!(cx, "取消", "Cancel"))
+                            .on_click({
+                                let weak_cancel = weak_cancel.clone();
+                                move |_, window, cx| {
+                                    let _ = weak_cancel
+                                        .update(cx, |view, _cx| view.close_after_save = None);
+                                    window.close_dialog(cx);
+                                }
+                            }),
+                    ),
+                )
+        });
+    }
+}
+
+/// 临时请求要落在集合目录里。根目录上的请求文件不会出现在侧边栏。
+enum DraftHome {
+    Collection(String),
+    NewCollection(String),
+}
+
+fn write_draft(
+    root: &std::path::Path,
+    home: DraftHome,
+    name: &str,
+    protocol: &str,
+    mut document: serde_json::Value,
+) -> AppResult<String> {
+    if let Some(object) = document.as_object_mut() {
+        object.insert("name".to_string(), serde_json::Value::from(name));
+    }
+    let collection = match home {
+        DraftHome::Collection(path) => path,
+        DraftHome::NewCollection(collection_name) => {
+            thread_core::workspace::ops::create_collection(root, None, &collection_name, None)?.0
+        }
+    };
+    let (rel, _) = thread_core::workspace::ops::create_request(root, &collection, name, protocol)?;
+    if let Err(error) = thread_core::workspace::ops::update_request_document(root, &rel, document) {
+        let _ = std::fs::remove_file(root.join(&rel));
+        return Err(error);
+    }
+    Ok(rel)
+}
+
+fn collection_choices(collections: &[CollectionNode]) -> Vec<(String, String)> {
+    fn walk(nodes: &[CollectionNode], prefix: &str, out: &mut Vec<(String, String)>) {
+        for node in nodes {
+            let label = if prefix.is_empty() {
+                node.name.clone()
+            } else {
+                format!("{prefix} / {}", node.name)
+            };
+            out.push((node.path.clone(), label.clone()));
+            walk(&node.children, &label, out);
+        }
+    }
+    let mut choices = Vec::new();
+    walk(collections, "", &mut choices);
+    choices
 }
 
 /// 订阅这个标签上的输入。用户改了内容就标成未保存，不会自动写盘。
@@ -2497,6 +2973,9 @@ pub fn watch_tab_edits(
         tab.auth_password.clone(),
         tab.auth_key.clone(),
         tab.auth_value.clone(),
+        tab.mqtt_client_id.clone(),
+        tab.mqtt_keep_alive.clone(),
+        tab.mqtt_publish_topic.clone(),
     ];
     for row in tab.kv_rows() {
         inputs.push(row.key.clone());
@@ -2566,11 +3045,11 @@ fn mark_dirty(this: &mut AppView, cx: &mut Context<AppView>, owns: impl Fn(&Requ
     let Some(tab) = this.tabs.iter_mut().find(|tab| owns(tab)) else {
         return;
     };
-    if tab.dirty {
-        return;
+    let was_dirty = tab.dirty;
+    tab.mark_unsaved();
+    if !was_dirty {
+        cx.notify();
     }
-    tab.dirty = true;
-    cx.notify();
 }
 
 impl RequestTab {
@@ -2594,6 +3073,9 @@ impl RequestTab {
             || self.auth_password == *input
             || self.auth_key == *input
             || self.auth_value == *input
+            || self.mqtt_client_id == *input
+            || self.mqtt_keep_alive == *input
+            || self.mqtt_publish_topic == *input
             || self
                 .kv_rows()
                 .any(|row| row.key == *input || row.value == *input)
