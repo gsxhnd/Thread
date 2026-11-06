@@ -160,6 +160,8 @@ impl WorkspaceIndex {
             environment.id.hash(&mut hasher);
             environment.name.hash(&mut hasher);
             environment.variable_count.hash(&mut hasher);
+            // 切换当前环境不改文件内容，但界面缓存的变量值要跟着重算。
+            environment.is_active.hash(&mut hasher);
             // 变量名参与摘要：改名/新增变量也要触发 workspace://changed。
             for name in &environment.variable_names {
                 name.hash(&mut hasher);
@@ -366,8 +368,12 @@ fn scan_environments(
             .unwrap_or_default();
         match files::read_json::<EnvironmentFile>(&path) {
             Ok(environment) => {
-                let is_active =
-                    matches_active(config.active_environment.as_deref(), &environment, &stem);
+                let is_active = matches_active(
+                    config.active_environment.as_deref(),
+                    &environment,
+                    &stem,
+                    &rel,
+                );
                 let mut variable_names = names_of(&environment, None);
                 variable_names.sort();
                 variable_names.dedup();
@@ -423,6 +429,7 @@ pub(crate) fn matches_active(
     active: Option<&str>,
     environment: &EnvironmentFile,
     stem: &str,
+    rel: &str,
 ) -> bool {
     let Some(active) = active else {
         return false;
@@ -438,6 +445,8 @@ pub(crate) fn matches_active(
         .unwrap_or(false)
         || environment.name.eq_ignore_ascii_case(active)
         || stem.eq_ignore_ascii_case(active)
+        // 界面按文件的相对路径切换环境。
+        || rel == active
 }
 
 fn scan_collection(dir: &Path, rel: &str, warnings: &mut Vec<String>) -> Option<CollectionNode> {
@@ -866,6 +875,50 @@ mod tests {
             scan_elapsed.as_secs() < 10,
             "scan too slow: {scan_elapsed:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn active_environment_can_be_set_by_relative_path() {
+        let root = temp_workspace("active-by-path");
+        write_json(
+            &root.join(layout::WORKSPACE_FILE),
+            &WorkspaceConfig {
+                active_environment: Some("environments/staging.env.json".into()),
+                ..WorkspaceConfig::new("ByPath")
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("environments")).unwrap();
+        for name in ["dev", "staging"] {
+            fs::write(
+                root.join(format!("environments/{name}.env.json")),
+                format!(r#"{{"version":1,"name":"{name}","variables":[]}}"#),
+            )
+            .unwrap();
+        }
+
+        let outcome = scan(&root, None).unwrap();
+        let active: Vec<_> = outcome
+            .index
+            .environments
+            .iter()
+            .filter(|environment| environment.is_active)
+            .map(|environment| environment.name.as_str())
+            .collect();
+        assert_eq!(active, vec!["staging"]);
+
+        // 切换当前环境后摘要必须变化，界面缓存的变量值才会重算。
+        write_json(
+            &root.join(layout::WORKSPACE_FILE),
+            &WorkspaceConfig {
+                active_environment: Some("environments/dev.env.json".into()),
+                ..WorkspaceConfig::new("ByPath")
+            },
+        )
+        .unwrap();
+        let switched = scan(&root, None).unwrap();
+        assert_ne!(outcome.index.digest, switched.index.digest);
         let _ = fs::remove_dir_all(&root);
     }
 }

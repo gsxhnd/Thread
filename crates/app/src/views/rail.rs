@@ -22,40 +22,44 @@ pub fn render(this: &AppView, cx: &mut Context<AppView>) -> impl IntoElement {
         .h_full()
         .flex_shrink_0()
         .items_center()
+        .justify_between()
         .py_2()
         .gap_1()
         .bg(theme.sidebar)
         .border_r_1()
         .border_color(theme.border)
-        .child(rail_button(cx, active, MainView::Request))
-        .child(rail_button(cx, active, MainView::Environments))
-        .child(rail_button(cx, active, MainView::History))
-        .child(div().w(px(16.)).h(px(1.)).my_2().bg(theme.border))
-        .child(rail_button(cx, active, MainView::Proxy))
-        .child(rail_button(cx, active, MainView::Certificates))
+        .child(
+            v_flex()
+                .gap_1()
+                .child(rail_button(cx, active, MainView::Request))
+                .child(rail_button(cx, active, MainView::Environments))
+                .child(rail_button(cx, active, MainView::History))
+                .child(div().w(px(16.)).h(px(1.)).my_2().bg(theme.border))
+                .child(rail_button(cx, active, MainView::Proxy))
+                .child(rail_button(cx, active, MainView::Certificates)),
+        )
+        .child(
+            Button::new("rail-settings")
+                .ghost()
+                .compact()
+                .icon(IconName::Settings)
+                .tooltip(tr!(cx, "设置", "Settings"))
+                .tooltip_placement(Placement::Right)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_settings(window, cx);
+                })),
+        )
 }
 
 fn rail_button(cx: &mut Context<AppView>, active: MainView, view: MainView) -> AnyElement {
     let theme = cx.theme().clone();
     let selected = active == view;
     div()
-        .relative()
         .w_full()
         .h(px(40.))
         .flex()
         .items_center()
         .justify_center()
-        .when(selected, |row| {
-            row.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .w(px(2.))
-                    .h(px(16.))
-                    .rounded_full()
-                    .bg(theme.primary),
-            )
-        })
         .child(
             div()
                 .size(px(32.))

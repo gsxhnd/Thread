@@ -162,6 +162,9 @@ pub fn render(
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
+    let theme_muted = theme.muted_foreground;
+    let theme_drop_target = theme.drop_target;
+    let theme_drag_border = theme.drag_border;
     // 只取需要的字段，避免每次渲染都克隆整份工作区索引。
     let (collection_count, request_count) = this
         .workspace
@@ -182,6 +185,7 @@ pub fn render(
         .map(|index| collect_marks(&index.collections))
         .unwrap_or_default();
 
+    let tree_state = this.tree.clone();
     let tree = tree(&this.tree, move |ix, entry, selected, _, app| {
         let item = entry.item();
         let id = item.id.clone();
@@ -196,14 +200,17 @@ pub fn render(
         let expanded = entry.is_expanded();
         let open_here = open_collection.as_deref() == id.strip_prefix("coll:");
         let editing = renaming_id.as_deref() == Some(id.as_ref());
+        let is_selected = selected || open_here;
         let mut row = ListItem::new(ix)
-            .selected(selected || open_here)
+            .selected(is_selected)
+            .h(px(28.))
             .pl(px(8.) + px(12.) * entry.depth() as f32)
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1p5()
                     .min_w_0()
                     .flex_1()
+                    .items_center()
                     .when(folder, |row| {
                         let toggle_id = id.clone();
                         let toggle_weak = weak.clone();
@@ -213,9 +220,11 @@ pub fn render(
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .size_4()
+                                .w(px(16.))
+                                .h(px(16.))
                                 .rounded_sm()
                                 .cursor_pointer()
+                                .text_color(theme_muted)
                                 .child(
                                     Icon::new(if expanded {
                                         IconName::ChevronDown
@@ -321,38 +330,38 @@ pub fn render(
         } else if !editing {
             let weak = weak.clone();
             let click_id = id.clone();
-            row = row
-                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                    cx.stop_propagation();
-                })
-                .on_click(move |_, _, cx| {
-                    let Some(path) = click_id.strip_prefix("coll:") else {
-                        return;
-                    };
-                    let path = path.to_string();
-                    let Some(view) = weak.upgrade() else {
-                        return;
-                    };
-                    view.update(cx, |view, cx| view.open_collection(path, cx));
-                });
+            let tree_state = tree_state.clone();
+            // 按下就选中并打开：等抬起再处理会让高亮慢半拍。
+            // 这里拦住事件，Tree 自带的"点击即展开"不会触发，展开只走箭头。
+            row = row.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                tree_state.update(cx, |state, cx| state.set_selected_index(Some(ix), cx));
+                let Some(path) = click_id.strip_prefix("coll:") else {
+                    return;
+                };
+                let path = path.to_string();
+                let Some(view) = weak.upgrade() else {
+                    return;
+                };
+                view.update(cx, |view, cx| view.open_collection(path, cx));
+            });
         }
         let drop_weak = weak.clone();
         let drop_id = id.clone();
         let hover_id = id.clone();
         row = row
             .can_drop(|value: &dyn std::any::Any, _, _| value.is::<RequestDrag>())
-            .drag_over::<RequestDrag>(move |style, drag, _, cx| {
-                let theme = cx.theme();
+            .drag_over::<RequestDrag>(move |style, drag, _, _cx| {
                 if hover_id.starts_with("coll:") {
                     style
                         .rounded_md()
-                        .bg(theme.drop_target)
+                        .bg(theme_drop_target)
                         .border_l_4()
-                        .border_color(theme.drag_border)
+                        .border_color(theme_drag_border)
                 } else if hover_id.strip_prefix("req:") == Some(drag.path.as_str()) {
                     style
                 } else {
-                    style.border_t_4().border_color(theme.drag_border)
+                    style.border_t_4().border_color(theme_drag_border)
                 }
             })
             .on_drop(move |drag: &RequestDrag, window, cx| {

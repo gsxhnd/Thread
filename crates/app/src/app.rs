@@ -1286,38 +1286,47 @@ fn environment_switcher(this: &AppView, cx: &mut Context<AppView>) -> impl gpui_
         .small()
         .icon(IconName::Braces)
         .label(label)
-        .dropdown_menu(move |menu, _, cx| {
-            let none_weak = weak.clone();
-            let mut menu = menu.item(
-                PopupMenuItem::new(tr!(cx, "无环境", "No environment")).on_click(
-                    move |_, _window, cx| {
-                        let _ = none_weak.update_in(cx, |view, window, cx| {
-                            view.activate_environment(None, window, cx);
-                        });
-                    },
-                ),
-            );
+        .dropdown_menu(move |menu, _window, cx| {
+            let mut menu = menu;
+            if environments.is_empty() {
+                menu = menu.item(PopupMenuItem::new(tr!(
+                    cx,
+                    "还没有环境",
+                    "No environments yet"
+                )));
+            }
             for environment in &environments {
-                let path = environment.path.clone();
+                // 再点一次当前环境就是取消。
+                let target = if environment.is_active {
+                    None
+                } else {
+                    Some(environment.path.clone())
+                };
                 let name = if environment.is_active {
                     format!("✓ {}", environment.name)
                 } else {
                     environment.name.clone()
                 };
                 let item_weak = weak.clone();
-                menu = menu.item(PopupMenuItem::new(name).on_click(move |_, _window, cx| {
-                    let path = path.clone();
-                    let _ = item_weak.update_in(cx, |view, window, cx| {
-                        view.activate_environment(Some(path), window, cx);
-                    });
+                // 点击发生在窗口的事件分发里，窗口已被借出，不能再用 update_in 重入。
+                // 直接用回调给的 window。
+                menu = menu.item(PopupMenuItem::new(name).on_click(move |_, window, cx| {
+                    let Some(view) = item_weak.upgrade() else {
+                        return;
+                    };
+                    let target = target.clone();
+                    view.update(cx, |view, cx| view.activate_environment(target, window, cx));
                 }));
             }
             let manage_weak = weak.clone();
             menu.separator().item(
                 PopupMenuItem::new(tr!(cx, "管理环境", "Manage environments")).on_click(
-                    move |_, _window, cx| {
-                        let _ = manage_weak.update_in(cx, |view, window, cx| {
-                            view.switch_view(MainView::Environments, window, cx);
+                    move |_, window, cx| {
+                        let Some(view) = manage_weak.upgrade() else {
+                            return;
+                        };
+                        view.update(cx, |view, cx| {
+                            view.switch_view(MainView::Environments, window, cx)
                         });
                     },
                 ),

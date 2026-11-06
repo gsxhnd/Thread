@@ -393,7 +393,11 @@ impl RequestTab {
         );
     }
 
-    /// 用上一次实际发出的配置填这一页，并带回当时的响应。
+    /// 带回上一次发送的响应。
+    ///
+    /// 请求文件读成功时以文件为准，不再用历史里发送时的配置覆盖，
+    /// 否则保存过的修改重新打开就会退回到上次发送的样子。
+    /// 只有文件读不出来时，才退而用历史里的配置把这一页填上。
     pub fn restore_last_run(
         &mut self,
         detail: &HistoryDetail,
@@ -404,26 +408,27 @@ impl RequestTab {
             return;
         }
         let snapshot = &detail.request_snapshot;
-        let restored = snapshot
-            .get("sent")
-            .and_then(|sent| serde_json::from_value::<HttpRequestConfig>(sent.clone()).ok())
-            .map(|config| {
-                let name = self.name.clone();
-                self.fill_http(
-                    HttpFields {
-                        name: &name,
-                        method: &config.method,
-                        url: &config.url,
-                        params: &config.query_params,
-                        headers: &config.headers,
-                        body: &config.body,
-                        auth: &config.auth,
-                    },
-                    window,
-                    cx,
-                );
-            })
-            .is_some()
+        let restored = self.error.is_none()
+            || snapshot
+                .get("sent")
+                .and_then(|sent| serde_json::from_value::<HttpRequestConfig>(sent.clone()).ok())
+                .map(|config| {
+                    let name = self.name.clone();
+                    self.fill_http(
+                        HttpFields {
+                            name: &name,
+                            method: &config.method,
+                            url: &config.url,
+                            params: &config.query_params,
+                            headers: &config.headers,
+                            body: &config.body,
+                            auth: &config.auth,
+                        },
+                        window,
+                        cx,
+                    );
+                })
+                .is_some()
             || snapshot
                 .get("document")
                 .and_then(|document| {

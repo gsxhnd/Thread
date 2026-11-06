@@ -27,6 +27,14 @@ struct VarHome {
     secret: bool,
 }
 
+/// 变量来自哪个环境。`effective` 为假表示它只存在于没启用的环境里。
+#[derive(Clone, Debug)]
+struct VarSource {
+    env: String,
+    secret: bool,
+    effective: bool,
+}
+
 /// 地址栏补全的选中项。只在用户正在输入 `{{` 时有意义。
 pub struct UrlAssist {
     pub selected: usize,
@@ -35,6 +43,7 @@ pub struct UrlAssist {
     /// 当前环境的有效变量。工作区索引变了才重新读。
     values: BTreeMap<String, String>,
     homes: BTreeMap<String, VarHome>,
+    sources: BTreeMap<String, VarSource>,
     stamp: String,
     /// 悬停变量时用来改值的输入框。
     editor: Entity<InputState>,
@@ -49,6 +58,7 @@ impl UrlAssist {
             syncing: false,
             values: BTreeMap::new(),
             homes: BTreeMap::new(),
+            sources: BTreeMap::new(),
             stamp: String::new(),
             editor,
             editing: None,
@@ -125,6 +135,7 @@ impl AppView {
         let Some(index) = self.workspace.read(cx).index().cloned() else {
             self.url_assist.values.clear();
             self.url_assist.homes.clear();
+            self.url_assist.sources.clear();
             self.url_assist.stamp.clear();
             return;
         };
@@ -161,6 +172,7 @@ impl AppView {
         {
             remember_home(&mut homes, environment);
         }
+        self.url_assist.sources = variable_sources(&index, &values);
         self.url_assist.values = values;
         self.url_assist.homes = homes;
         self.url_assist.stamp = index.digest;
@@ -284,6 +296,7 @@ pub fn field(
 ) -> AnyElement {
     this.ensure_variables(cx);
     let values = this.url_assist.values.clone();
+    let sources = this.url_assist.sources.clone();
     let menu = if this.active_tab == Some(tab) {
         suggestion_menu(this, url, cx)
     } else {
@@ -293,7 +306,7 @@ pub fn field(
         .flex_1()
         .min_w(px(160.))
         .relative()
-        .child(styled_input(url, values, bordered))
+        .child(styled_input(url, values, sources, bordered))
         .when_some(menu, |row, menu| {
             row.child(
                 deferred(
@@ -314,6 +327,7 @@ pub fn field(
 fn styled_input(
     url: &Entity<InputState>,
     values: BTreeMap<String, String>,
+    sources: BTreeMap<String, VarSource>,
     bordered: bool,
 ) -> Input {
     let input = Input::new(url).small().token(move |token, _, cx| {
@@ -325,7 +339,17 @@ fn styled_input(
             .unwrap_or("")
             .to_string();
         let known = id.starts_with("var:");
-        let color = if known { theme.primary } else { theme.warning };
+        let dynamic = key.starts_with('$');
+        let source = sources.get(&key).cloned();
+        // 生效用主色；只存在于没启用的环境里用灰色；真的没定义才用警告色。
+        let inactive = source.as_ref().is_some_and(|source| !source.effective);
+        let color = if inactive {
+            theme.muted_foreground
+        } else if known || dynamic {
+            theme.primary
+        } else {
+            theme.warning
+        };
         let chip = div()
             .px_0p5()
             .rounded_sm()
@@ -335,7 +359,6 @@ fn styled_input(
         if key.is_empty() {
             return chip.into_any_element();
         }
-        let dynamic = key.starts_with('$');
         let shown = values.get(&key).cloned();
         let open_key = key.clone();
         HoverCard::new(SharedString::from(format!("url-var-{key}")))
@@ -351,7 +374,8 @@ fn styled_input(
             .content({
                 let key = key.clone();
                 let shown = shown.clone();
-                move |_, _, cx| var_card(&key, dynamic, shown.clone(), cx)
+                let source = source.clone();
+                move |_, _, cx| var_card(&key, dynamic, shown.clone(), source.clone(), cx)
             })
             .into_any_element()
     });
@@ -386,41 +410,100 @@ fn begin_var_edit(key: &str, window: &mut Window, cx: &mut App) {
     });
 }
 
-fn var_card(key: &str, dynamic: bool, shown: Option<String>, cx: &mut App) -> AnyElement {
+fn var_card(
+    key: &str,
+    dynamic: bool,
+    shown: Option<String>,
+    source: Option<VarSource>,
+    cx: &mut App,
+) -> AnyElement {
     let theme = cx.theme().clone();
     let editor = cx
         .try_global::<crate::app::MainApp>()
         .and_then(|app| app.0.upgrade())
         .map(|view| view.read(cx).url_assist.editor.clone());
-    let defined = shown.is_some();
-    let value = if dynamic {
-        tr!(cx, "发送时生成", "Generated when the request is sent").to_string()
+    let inactive = source.as_ref().is_some_and(|source| !source.effective);
+    let secret = source.as_ref().is_some_and(|source| source.secret);
+    let editable = !dynamic && shown.is_some() && !inactive;
+
+    let (tag, value, color) = if dynamic {
+        (
+            tr!(cx, "动态", "Dynamic").to_string(),
+            tr!(cx, "发送时生成", "Generated when the request is sent").to_string(),
+            theme.muted_foreground,
+        )
+    } else if let Some(source) = source.as_ref().filter(|source| !source.effective) {
+        (
+            source.env.clone(),
+            tr!(
+                cx,
+                format!("未启用。当前没有启用「{}」。", source.env),
+                format!(
+                    "Not in use. \"{}\" is not the active environment.",
+                    source.env
+                )
+            )
+            .to_string(),
+            theme.muted_foreground,
+        )
+    } else if let Some(value) = shown {
+        let tag = source
+            .as_ref()
+            .map(|source| source.env.clone())
+            .unwrap_or_default();
+        let value = if secret {
+            "••••••••".to_string()
+        } else if value.is_empty() {
+            tr!(cx, "（空值）", "(empty)").to_string()
+        } else {
+            value
+        };
+        (tag, value, theme.foreground)
     } else {
-        shown.unwrap_or_else(|| tr!(cx, "未定义", "Undefined").to_string())
+        (
+            String::new(),
+            tr!(
+                cx,
+                "未定义。保存后写入当前环境。",
+                "Undefined. Saving writes it to the active environment."
+            )
+            .to_string(),
+            theme.warning,
+        )
     };
+
     v_flex()
         .w(px(260.))
         .gap_2()
         .child(
-            div()
-                .text_xs()
-                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .child(key.to_string()),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .min_w_0()
+                        .text_xs()
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_ellipsis()
+                        .child(key.to_string()),
+                )
+                .when(!tag.is_empty(), |row| {
+                    row.child(crate::widgets::mini_tag(cx, tag.clone()))
+                }),
         )
         .child(
             div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.muted)
                 .text_xs()
                 .whitespace_normal()
-                .text_color(if defined && !dynamic {
-                    theme.foreground
-                } else if dynamic {
-                    theme.muted_foreground
-                } else {
-                    theme.warning
-                })
+                .text_color(color)
                 .child(value),
         )
-        .when(!dynamic, |card| {
+        .when(!dynamic && !inactive, |card| {
             card.when_some(editor, |card, editor| {
                 let save_key = key.to_string();
                 card.child(Input::new(&editor).small()).child(
@@ -431,6 +514,18 @@ fn var_card(key: &str, dynamic: bool, shown: Option<String>, cx: &mut App) -> An
                         .on_click(move |_, window, cx| save_var_edit(&save_key, window, cx)),
                 )
             })
+        })
+        .when(editable && secret, |card| {
+            card.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme.muted_foreground)
+                    .child(tr!(
+                        cx,
+                        "机密值，输入框里是明文。",
+                        "Secret value. The field above shows plain text."
+                    )),
+            )
         })
         .into_any_element()
 }
@@ -532,6 +627,40 @@ fn remember_home(homes: &mut BTreeMap<String, VarHome>, environment: &Environmen
             },
         );
     }
+}
+
+/// 记下每个变量来自哪个环境。先放没启用的，再让全局、当前环境覆盖，优先级和发送时一致。
+fn variable_sources(
+    index: &WorkspaceIndex,
+    values: &BTreeMap<String, String>,
+) -> BTreeMap<String, VarSource> {
+    let mut sources = BTreeMap::new();
+    let mut add = |environment: &EnvironmentSummary| {
+        for name in &environment.variable_names {
+            sources.insert(
+                name.clone(),
+                VarSource {
+                    env: environment.name.clone(),
+                    secret: environment.secret_variable_names.contains(name),
+                    effective: values.contains_key(name),
+                },
+            );
+        }
+    };
+    for environment in index
+        .environments
+        .iter()
+        .filter(|env| !env.is_active && !env.is_global)
+    {
+        add(environment);
+    }
+    for environment in index.environments.iter().filter(|env| env.is_global) {
+        add(environment);
+    }
+    for environment in index.environments.iter().filter(|env| env.is_active) {
+        add(environment);
+    }
+    sources
 }
 
 fn variable_destination(

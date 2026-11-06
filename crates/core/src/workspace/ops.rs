@@ -764,6 +764,7 @@ pub fn environment_detail(
             environment.id.as_deref() == Some(active)
                 || environment.name.eq_ignore_ascii_case(active)
                 || environment_stem(rel).eq_ignore_ascii_case(active)
+                || rel == active
         })
         .unwrap_or(false);
 
@@ -854,8 +855,9 @@ pub fn resolve_environment_rel(root: &Path, identifier: &str) -> Option<String> 
         let Ok(environment) = files::read_json::<EnvironmentFile>(&path) else {
             continue;
         };
-        if crate::workspace::index::matches_active(Some(identifier), &environment, &stem) {
-            return Some(layout::to_relative_string(root, &path));
+        let rel = layout::to_relative_string(root, &path);
+        if crate::workspace::index::matches_active(Some(identifier), &environment, &stem, &rel) {
+            return Some(rel);
         }
     }
     None
