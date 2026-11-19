@@ -145,6 +145,14 @@ fn compact_method(method: &str) -> String {
     }
 }
 
+/// 展开或收起一个集合目录，并按这份状态重建树。
+fn toggle_collection(view: &mut AppView, path: String, cx: &mut Context<AppView>) {
+    if !view.collapsed_collections.remove(&path) {
+        view.collapsed_collections.insert(path);
+    }
+    rebuild_tree(view, cx);
+}
+
 /// 打开/重建侧边栏树（工作区变化时调用）。
 pub fn rebuild_tree(this: &mut AppView, cx: &mut Context<AppView>) {
     let items = this
@@ -175,6 +183,9 @@ pub fn render(
     let weak: WeakEntity<AppView> = cx.entity().downgrade();
     let menu_weak = weak.clone();
     let header_weak = weak.clone();
+    // 只有集合页正显示在主区域时才高亮侧边栏里的集合；请求标签激活时
+    // 集合标签只是待在标签条里，不算选中。
+    let collection_page_open = this.collection_page_open();
     let open_collection = this.open_collection.clone();
     let renaming_id = this.rename.as_ref().map(|rename| rename.node_id.clone());
     let renaming_input = this.rename.as_ref().map(|rename| rename.input.clone());
@@ -198,7 +209,8 @@ pub fn render(
 
         let folder = !is_request && entry.is_folder();
         let expanded = entry.is_expanded();
-        let open_here = open_collection.as_deref() == id.strip_prefix("coll:");
+        let open_here =
+            collection_page_open && open_collection.as_deref() == id.strip_prefix("coll:");
         let editing = renaming_id.as_deref() == Some(id.as_ref());
         let is_selected = selected || open_here;
         let mut row = ListItem::new(ix)
@@ -233,8 +245,12 @@ pub fn render(
                                     })
                                     .xsmall(),
                                 )
-                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
                                     cx.stop_propagation();
+                                    // 双击留给整行：第二次按下不再切换，避免和双击展开抵消。
+                                    if event.click_count != 1 {
+                                        return;
+                                    }
                                     let Some(path) = toggle_id.strip_prefix("coll:") else {
                                         return;
                                     };
@@ -243,10 +259,7 @@ pub fn render(
                                         return;
                                     };
                                     view.update(cx, |view, cx| {
-                                        if !view.collapsed_collections.remove(&path) {
-                                            view.collapsed_collections.insert(path);
-                                        }
-                                        rebuild_tree(view, cx);
+                                        toggle_collection(view, path, cx);
                                     });
                                 })
                                 .on_click(|_, _, cx| {
@@ -331,9 +344,9 @@ pub fn render(
             let weak = weak.clone();
             let click_id = id.clone();
             let tree_state = tree_state.clone();
-            // 按下就选中并打开：等抬起再处理会让高亮慢半拍。
-            // 这里拦住事件，Tree 自带的"点击即展开"不会触发，展开只走箭头。
-            row = row.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            // 按下就选中并打开，不等抬起。拦住事件后，Tree 自带的“点击即展开”不会触发。
+            // 单击打开集合；有子项的目录双击展开或收起。箭头仍是单击切换。
+            row = row.on_mouse_down(MouseButton::Left, move |event, _, cx| {
                 cx.stop_propagation();
                 tree_state.update(cx, |state, cx| state.set_selected_index(Some(ix), cx));
                 let Some(path) = click_id.strip_prefix("coll:") else {
@@ -343,6 +356,10 @@ pub fn render(
                 let Some(view) = weak.upgrade() else {
                     return;
                 };
+                if folder && event.click_count == 2 {
+                    view.update(cx, |view, cx| toggle_collection(view, path, cx));
+                    return;
+                }
                 view.update(cx, |view, cx| view.open_collection(path, cx));
             });
         }

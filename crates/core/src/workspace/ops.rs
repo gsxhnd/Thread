@@ -6,11 +6,17 @@
 use std::fs;
 use std::path::Path;
 
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::db::new_id;
 use crate::error::{AppError, AppResult};
 use crate::services::secrets;
+
+/// 环境文件的每个写操作都是「读 → 改 → 写」。UI 的自动保存可能并发触发
+/// 多个写操作，不串行的话会互相覆盖丢更新（例如改名和写值同时发生时，
+/// 乱序执行会把旧名字的变量重新建出来）。
+static ENV_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 use super::formats::{
     AuthSpec, CollectionMeta, EnvVariable, EnvironmentFile, HttpRequestDoc, RequestFile,
@@ -603,6 +609,7 @@ pub fn update_environment(
     rel: &str,
     name: Option<String>,
 ) -> AppResult<EnvironmentFile> {
+    let _guard = ENV_WRITE_LOCK.lock();
     let path = layout::resolve_inside(root, rel)?;
     let mut environment = files::read_json::<EnvironmentFile>(&path)?;
     if let Some(name) = name {
@@ -617,6 +624,7 @@ pub fn update_environment(
 }
 
 pub fn delete_environment(root: &Path, rel: &str, trash_root: &Path) -> AppResult<String> {
+    let _guard = ENV_WRITE_LOCK.lock();
     let path = layout::resolve_inside(root, rel)?;
     if !path.is_file() {
         return Err(AppError::NotFound(format!("environment not found: {rel}")));
@@ -638,6 +646,7 @@ pub fn set_env_variable(
     description: Option<String>,
 ) -> AppResult<EnvironmentFile> {
     crate::db::require_non_empty("variable key", key)?;
+    let _guard = ENV_WRITE_LOCK.lock();
     let path = layout::resolve_inside(root, rel)?;
     let mut environment = files::read_json::<EnvironmentFile>(&path)?;
     if environment.id.is_none() {
@@ -710,6 +719,7 @@ pub fn rename_env_variable(
     let from = from.trim();
     let to = to.trim();
     crate::db::require_non_empty("variable key", to)?;
+    let _guard = ENV_WRITE_LOCK.lock();
     let path = layout::resolve_inside(root, rel)?;
     let mut environment = files::read_json::<EnvironmentFile>(&path)?;
     if from == to {
@@ -744,6 +754,7 @@ pub fn rename_env_variable(
 }
 
 pub fn delete_env_variable(root: &Path, rel: &str, key: &str) -> AppResult<EnvironmentFile> {
+    let _guard = ENV_WRITE_LOCK.lock();
     let path = layout::resolve_inside(root, rel)?;
     let mut environment = files::read_json::<EnvironmentFile>(&path)?;
     environment.variables.retain(|variable| variable.key != key);

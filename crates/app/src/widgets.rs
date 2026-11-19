@@ -6,9 +6,10 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _, h_flex, h_resizable, resizable_panel, v_flex, v_resizable,
 };
+use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     AnyElement, App, FontWeight, Hsla, IntoElement, ParentElement as _, RenderOnce, SharedString,
-    Styled as _, Window, div, px,
+    Styled, Window, div, px,
 };
 
 use crate::format::{SemanticColors, method_color, status_color};
@@ -256,6 +257,29 @@ impl RenderOnce for StatusTag {
             .bg(color.opacity(0.12))
             .child(label)
     }
+}
+
+/// 页内分区标签：选中的一块有底和边，未选中只留文字。请求分区、协议分区、响应分区共用。
+pub fn tab_chip<E>(element: E, selected: bool, theme: &gpui_kit::component::Theme) -> E
+where
+    E: Styled + FluentBuilder,
+{
+    element
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .border_1()
+        .when(selected, |this| {
+            this.bg(theme.background)
+                .text_color(theme.foreground)
+                .font_weight(FontWeight::SEMIBOLD)
+                .border_color(theme.border)
+        })
+        .when(!selected, |this| {
+            this.text_color(theme.muted_foreground)
+                .border_color(gpui_kit::transparent_black())
+        })
 }
 
 /// 简单小标签。

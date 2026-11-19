@@ -137,7 +137,11 @@ fn back_button(cx: &mut Context<AppView>) -> Button {
         .icon(IconName::ArrowLeft)
         .label(tr!(cx, "返回请求", "Back to requests"))
         .on_click(cx.listener(|this, _, _, cx| {
-            this.open_collection = None;
+            // 集合标签留在标签条里（和请求标签一样）；没有请求标签时才整个关掉。
+            if this.tabs.is_empty() {
+                this.open_collection = None;
+            }
+            this.collection_active = false;
             cx.notify();
         }))
 }

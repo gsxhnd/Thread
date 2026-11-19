@@ -10,14 +10,18 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    PromptLevel, SharedString, Styled as _, Subscription, WeakEntity, Window, div, px,
+    PromptLevel, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
+use std::time::Duration;
 use thread_core::error::AppError;
 use thread_core::workspace::index::EnvironmentSummary;
 
 use crate::app::AppView;
 use crate::widgets;
+
+/// 值输入停下来的这段毫秒数之后自动保存。继续输入会重置计时。
+const ENV_AUTOSAVE_DELAY: Duration = Duration::from_millis(600);
 
 /// 一行环境变量的名称和值。订阅写在输入框前面，丢掉这一行时先取消订阅，
 /// 避免输入框销毁时的失焦再提交一次。
@@ -33,6 +37,9 @@ pub struct EnvVariableField {
     value_watch: Subscription,
     name_input: Entity<InputState>,
     value_input: Entity<InputState>,
+    /// 值输入的防抖自动保存任务。新的改动会替换（即取消）旧任务；
+    /// 这一行的其它字段被丢弃时任务一起取消，不会把已删除的变量写回去。
+    pending_save: Option<Task<()>>,
 }
 
 /// 侧边栏里的环境列表。变量编辑留在主区域。
@@ -509,8 +516,8 @@ fn detail_view(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
                             .cursor_pointer()
                             .hover(|this| this.bg(theme.muted))
                             .child(gpui_kit::component::Icon::new(IconName::Delete).xsmall())
-                            .on_click(cx.listener(move |this, _: &gpui_kit::ClickEvent, _, cx| {
-                                this.delete_env_variable(ix, cx);
+                            .on_click(cx.listener(move |this, _: &gpui_kit::ClickEvent, window, cx| {
+                                this.delete_env_variable(ix, window, cx);
                             })),
                     )
                     .into_any_element(),
@@ -553,7 +560,10 @@ fn variable_form(this: &mut AppView, cx: &mut Context<AppView>) -> AnyElement {
 }
 
 impl AppView {
-    pub fn reload_environment(&mut self, cx: &mut Context<Self>) {
+    pub fn reload_environment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 重载会重建变量输入框。先把还没落盘的修改提交到当前环境
+        // （此刻详情还指向旧环境），否则它们会被重建悄悄丢掉。
+        self.flush_env_edits(window, cx);
         let Some(root) = self.workspace.read(cx).root() else {
             self.environment.detail = None;
             self.env_fields.clear();
@@ -573,8 +583,16 @@ impl AppView {
         self.environment.selected_path = Some(path.clone());
 
         let core = self.core.clone();
+        // 传入当前激活的环境，详情页才知道该显示「停用」还是「启用此环境」。
+        let active = self
+            .core
+            .workspace
+            .config()
+            .ok()
+            .and_then(|config| config.active_environment);
+        let loaded_path = path.clone();
         let receiver = core.spawn(async move {
-            thread_core::workspace::ops::environment_detail(&root, &path, None)
+            thread_core::workspace::ops::environment_detail(&root, &path, active.as_deref())
         });
         cx.spawn(async move |this, cx| {
             let result = receiver
@@ -582,15 +600,19 @@ impl AppView {
                 .map_err(|error| AppError::Internal(error.to_string()))
                 .and_then(|outcome| outcome);
             let _ = this.update_in(cx, |view, window, cx| {
-                view.environment.detail = result.ok();
-                view.sync_env_fields(window, cx);
-                cx.notify();
+                // 快速连点几个环境时会有多个加载在飞，只接受仍然被选中的那个，
+                // 否则旧的加载结果会把新选中的环境覆盖掉。
+                if view.environment.selected_path.as_deref() == Some(loaded_path.as_str()) {
+                    view.environment.detail = result.ok();
+                    view.sync_env_fields(window, cx);
+                    cx.notify();
+                }
             });
         })
         .detach();
     }
 
-    pub fn select_environment(&mut self, ix: usize, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn select_environment(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(path) = self
             .workspace
             .read(cx)
@@ -600,7 +622,7 @@ impl AppView {
             return;
         };
         self.environment.selected_path = Some(path);
-        self.reload_environment(cx);
+        self.reload_environment(window, cx);
     }
 
     pub fn create_environment(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -659,7 +681,7 @@ impl AppView {
                         cx.emit(crate::state::WorkspaceEvent::Changed);
                         cx.notify();
                     });
-                    view.reload_environment(cx);
+                    view.reload_environment(window, cx);
                     window.push_notification(tr!(cx, "环境已切换。", "Environment switched."), cx);
                 }
                 Err(error) => {
@@ -747,7 +769,7 @@ impl AppView {
                 Ok(_) => {
                     view.workspace.update(cx, |model, cx| model.refresh(cx));
                     if selected {
-                        view.reload_environment(cx);
+                        view.reload_environment(window, cx);
                     }
                     window.push_notification(tr!(cx, "环境已重命名。", "Environment renamed."), cx);
                 }
@@ -826,8 +848,13 @@ impl AppView {
                 &watched_value,
                 window,
                 |this, input, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                        this.commit_env_value(input, window, cx);
+                    match event {
+                        // 打字就自动保存（防抖）；机密值不自动保存，避免半截密码落盘。
+                        InputEvent::Change => this.schedule_env_value_save(input, cx),
+                        InputEvent::PressEnter { .. } | InputEvent::Blur => {
+                            this.commit_env_value(input, window, cx, true);
+                        }
+                        _ => {}
                     }
                 },
             );
@@ -840,6 +867,7 @@ impl AppView {
                 value_input,
                 name_watch,
                 value_watch,
+                pending_save: None,
             });
         }
     }
@@ -895,7 +923,7 @@ impl AppView {
             let _ = this.update_in(cx, |view, window, cx| match result {
                 Ok(_) => {
                     view.workspace.update(cx, |model, cx| model.refresh(cx));
-                    view.reload_environment(cx);
+                    view.reload_environment(window, cx);
                     window.push_notification(tr!(cx, "变量名已更新。", "Variable renamed."), cx);
                 }
                 Err(error) => {
@@ -912,12 +940,198 @@ impl AppView {
         .detach();
     }
 
-    /// 失焦或回车时把变量值写回。机密值留空表示不改，避免一点输入框就把原值清掉。
+    /// 值输入变化后安排一次防抖自动保存。继续输入会重置计时；
+    /// 机密值不自动保存（只在回车 / 失焦 / 冲刷时提交），避免半截密码落盘。
+    fn schedule_env_value_save(&mut self, input: &Entity<InputState>, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .env_fields
+            .iter()
+            .position(|field| field.value_input == *input)
+        else {
+            return;
+        };
+        if self.env_fields[ix].secret {
+            return;
+        }
+        let value_input = input.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(ENV_AUTOSAVE_DELAY).await;
+            let _ = this.update_in(cx, |view, window, cx| {
+                view.commit_env_value(&value_input, window, cx, false);
+            });
+        });
+        self.env_fields[ix].pending_save = Some(task);
+    }
+
+    /// 立即提交还在输入中的变量名 / 值（防抖计时没到、又没有失焦的场景）。
+    /// 必须在切换环境或重建输入框之前调用：此刻详情还指向旧环境，
+    /// 提交会写到正确的文件里。
+    pub fn flush_env_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_env_edits_except(None, window, cx);
+    }
+
+    /// 同上，但可以跳过一行（例如正要被删除的变量：先写它再删毫无意义，
+    /// 而改名再删会让删除找不到新的键）。
+    pub fn flush_env_edits_except(
+        &mut self,
+        skip: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.env_fields.is_empty() {
+            return;
+        }
+        for field in &mut self.env_fields {
+            field.pending_save = None;
+        }
+        let inputs: Vec<(Entity<InputState>, Entity<InputState>)> = self
+            .env_fields
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| skip != Some(*ix))
+            .map(|(_, field)| (field.name_input.clone(), field.value_input.clone()))
+            .collect();
+        for (name_input, value_input) in inputs {
+            let name_next = name_input.read(cx).value().trim().to_string();
+            let value_next = value_input.read(cx).value().to_string();
+            let name_changed = self
+                .env_fields
+                .iter()
+                .find(|field| field.name_input == name_input)
+                .is_some_and(|field| !name_next.is_empty() && name_next != field.key);
+            let value_changed = self
+                .env_fields
+                .iter()
+                .find(|field| field.value_input == value_input)
+                .is_some_and(|field| {
+                    value_next != field.value && !(field.secret && value_next.is_empty())
+                });
+            if name_changed && value_changed {
+                // 名字和值同时变了：先按旧名写值再改名。两个写操作必须在
+                // 同一个任务里按顺序执行，并发乱序会把旧名字的变量建回来。
+                self.commit_env_name_and_value(&name_input, &name_next, &value_next, cx);
+            } else if name_changed {
+                self.commit_env_name(&name_input, window, cx);
+            } else {
+                self.commit_env_value(&value_input, window, cx, false);
+            }
+        }
+    }
+
+    /// 名字和值同时被修改：先按旧名写新值，再改名，同一个任务里按顺序执行。
+    /// 失败时回滚字段状态；冲刷是静默的，出错只弹通知。
+    fn commit_env_name_and_value(
+        &mut self,
+        name_input: &Entity<InputState>,
+        to: &str,
+        value: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .env_fields
+            .iter()
+            .position(|field| field.name_input == *name_input)
+        else {
+            return;
+        };
+        let from = self.env_fields[ix].key.clone();
+        let secret = self.env_fields[ix].secret;
+        let previous_value = self.env_fields[ix].value.clone();
+        let Some(root) = self.workspace.read(cx).root() else {
+            return;
+        };
+        let Some(detail) = self.environment.detail.as_ref() else {
+            return;
+        };
+        let path = detail.path.clone();
+        let enabled = detail
+            .variables
+            .iter()
+            .find(|variable| variable.key == from)
+            .is_none_or(|variable| variable.enabled);
+
+        // 乐观更新字段；失败时回滚。
+        self.env_fields[ix].key = to.to_string();
+        self.env_fields[ix].value = if secret {
+            String::new()
+        } else {
+            value.to_string()
+        };
+
+        let to = to.to_string();
+        let value = value.to_string();
+        let name_input = name_input.clone();
+        let saved_from = from.clone();
+        let saved_to = to.clone();
+        let saved_value = value.clone();
+        let saved_secret = secret;
+        let ui_path = path.clone();
+        let core = self.core.clone();
+        let receiver = core.spawn(async move {
+            let saved = thread_core::workspace::ops::set_env_variable(
+                &root,
+                &path,
+                &saved_from,
+                Some(saved_value),
+                Some(enabled),
+                Some(saved_secret),
+                None,
+            );
+            saved.and_then(|_| {
+                thread_core::workspace::ops::rename_env_variable(
+                    &root,
+                    &path,
+                    &saved_from,
+                    &saved_to,
+                )
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = receiver
+                .await
+                .map_err(|error| AppError::Internal(error.to_string()))
+                .and_then(|outcome| outcome);
+            let _ = this.update_in(cx, |view, window, cx| match result {
+                Ok(_) => {
+                    // 原地更新详情，避免重新加载打断正在输入的其它变量。
+                    if let Some(detail) = view.environment.detail.as_mut()
+                        && detail.path == ui_path
+                        && let Some(variable) =
+                            detail.variables.iter_mut().find(|variable| variable.key == from)
+                    {
+                        variable.key = to.clone();
+                        if secret {
+                            variable.has_stored_value = true;
+                        } else {
+                            variable.value = value.clone();
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(field) = view
+                        .env_fields
+                        .iter_mut()
+                        .find(|field| field.name_input == name_input)
+                    {
+                        field.key = from.clone();
+                        field.value = previous_value.clone();
+                    }
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 提交一个变量的值。`notify` 为 true 时是显式提交（回车 / 失焦），
+    /// 成功会弹通知、失败会恢复输入框；自动保存和切换前的冲刷是静默的，
+    /// 失败时保留输入内容，下一次改动或失焦会重试。
     pub fn commit_env_value(
         &mut self,
         input: &Entity<InputState>,
         _window: &mut Window,
         cx: &mut Context<Self>,
+        notify: bool,
     ) {
         let Some(ix) = self
             .env_fields
@@ -947,6 +1161,9 @@ impl AppView {
             .is_none_or(|variable| variable.enabled);
         self.env_fields[ix].value = if secret { String::new() } else { next.clone() };
         let value_input = input.clone();
+        let saved_value = next.clone();
+        let ui_path = path.clone();
+        let ui_key = key.clone();
         let core = self.core.clone();
         let receiver = core.spawn(async move {
             thread_core::workspace::ops::set_env_variable(
@@ -970,18 +1187,32 @@ impl AppView {
                         .env_fields
                         .iter_mut()
                         .find(|field| field.value_input == value_input)
+                        && field.secret
                     {
-                        if field.secret {
-                            field.stored = true;
-                            field
-                                .value_input
-                                .update(cx, |state, cx| state.set_value("", window, cx));
+                        field.stored = true;
+                        field
+                            .value_input
+                            .update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                    // 原地更新详情。重新加载会在保存还在线时重建输入框，
+                    // 打断正在输入的其它变量。
+                    if let Some(detail) = view.environment.detail.as_mut()
+                        && detail.path == ui_path
+                        && let Some(variable) = detail
+                            .variables
+                            .iter_mut()
+                            .find(|variable| variable.key == ui_key)
+                    {
+                        if secret {
+                            variable.has_stored_value = true;
+                        } else {
+                            variable.value = saved_value.clone();
                         }
                     }
-                    view.workspace.update(cx, |model, cx| model.refresh(cx));
-                    view.reload_environment(cx);
-                    window
-                        .push_notification(tr!(cx, "变量值已更新。", "Variable value saved."), cx);
+                    if notify {
+                        window
+                            .push_notification(tr!(cx, "变量值已更新。", "Variable value saved."), cx);
+                    }
                 }
                 Err(error) => {
                     if let Some(field) = view
@@ -990,7 +1221,7 @@ impl AppView {
                         .find(|field| field.value_input == value_input)
                     {
                         field.value = previous.clone();
-                        if !field.secret {
+                        if notify && !field.secret {
                             let restore = previous.clone();
                             field.value_input.update(cx, |state, cx| {
                                 state.set_value(restore, window, cx);
@@ -1004,7 +1235,7 @@ impl AppView {
         .detach();
     }
 
-    pub fn save_env_variable(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn save_env_variable(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.read(cx).root() else {
             return;
         };
@@ -1040,7 +1271,7 @@ impl AppView {
                         .update(cx, |state, cx| state.set_value("", window, cx));
                     view.env_value
                         .update(cx, |state, cx| state.set_value("", window, cx));
-                    view.reload_environment(cx);
+                    view.reload_environment(window, cx);
                     window.push_notification(tr!(cx, "变量已保存。", "Variable saved."), cx);
                 }
                 Err(error) => {
@@ -1057,7 +1288,7 @@ impl AppView {
         .detach();
     }
 
-    pub fn delete_env_variable(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub fn delete_env_variable(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.workspace.read(cx).root() else {
             return;
         };
@@ -1069,6 +1300,10 @@ impl AppView {
         };
         let path = detail.path.clone();
         let key = variable.key.clone();
+        // 先把其它行还在输入中的修改落盘，并取消所有防抖任务；否则自动保存
+        // 可能在删除之后触发，把删掉的变量重新建回来。正要删除的这一行
+        // 跳过（写了也马上删，改名还会让删除找不到键）。
+        self.flush_env_edits_except(Some(ix), window, cx);
         let core = self.core.clone();
         let receiver = core.spawn(async move {
             thread_core::workspace::ops::delete_env_variable(&root, &path, &key)
@@ -1078,10 +1313,11 @@ impl AppView {
                 .await
                 .map_err(|error| AppError::Internal(error.to_string()))
                 .and_then(|outcome| outcome);
-            let _ = this.update(cx, |view, cx| match result {
-                Ok(_) => view.reload_environment(cx),
+            let _ = this.update_in(cx, |view, window, cx| match result {
+                Ok(_) => view.reload_environment(window, cx),
                 Err(error) => {
                     tracing::warn!(?error, "failed to delete variable");
+                    window.push_notification((NotificationType::Error, error.to_string()), cx);
                 }
             });
         })

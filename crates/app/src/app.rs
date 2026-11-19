@@ -194,8 +194,11 @@ pub struct AppView {
     pub core: Arc<AppCore>,
     pub workspace: Entity<WorkspaceModel>,
     pub view: MainView,
-    /// 侧边栏点开的集合。有值时主区域显示集合页，而不是请求标签。
+    /// 侧边栏点开的集合。有值时标签条里有一个集合标签；点击别的请求
+    /// 不会关掉它，只会把它切成非激活。
     pub open_collection: Option<String>,
+    /// 集合标签是否正显示在主区域。请求标签激活时它只是待在标签条里。
+    pub collection_active: bool,
     /// 侧边栏里收起的集合路径。点箭头切换，点文件夹本身打开集合页。
     pub collapsed_collections: HashSet<String>,
     pub theme: ThemePreference,
@@ -345,6 +348,7 @@ impl AppView {
             workspace,
             view: MainView::Request,
             open_collection: None,
+            collection_active: false,
             collapsed_collections: HashSet::new(),
             theme: theme_pref,
             sidebar_collapsed,
@@ -404,9 +408,34 @@ impl AppView {
             self.workspace_root = root;
         } else {
             self.sync_open_tabs(cx);
+            self.sync_open_collection(cx);
         }
         views::sidebar::rebuild_tree(self, cx);
         self.reload_history(cx);
+    }
+
+    /// 集合被删除后同步关掉集合标签页。
+    fn sync_open_collection(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.open_collection.clone() else {
+            return;
+        };
+        let exists = self
+            .workspace
+            .read(cx)
+            .index()
+            .map(|index| {
+                views::collection::find_collection(&index.collections, &path).is_some()
+            })
+            .unwrap_or(false);
+        if !exists {
+            self.open_collection = None;
+            self.collection_active = false;
+        }
+    }
+
+    /// 集合页是否正显示在主区域（集合标签存在且处于激活状态）。
+    pub fn collection_page_open(&self) -> bool {
+        self.collection_active && self.open_collection.is_some()
     }
 
     fn dismiss_open_tabs(&mut self) {
@@ -649,6 +678,7 @@ impl AppView {
     pub fn open_collection(&mut self, path: String, cx: &mut Context<Self>) {
         self.view = crate::state::MainView::Request;
         self.open_collection = Some(path);
+        self.collection_active = true;
         cx.notify();
     }
 
@@ -664,9 +694,9 @@ impl AppView {
             .iter()
             .position(|tab| tab.path.as_deref() == Some(&node.path))
         {
-            // 标签已经开着时也要回到请求页。停在环境页时再点同一个请求，
-            // 只改 active_tab 会让主区域继续停在环境页。
-            self.open_collection = None;
+            // 标签已经开着时也要回到请求页。停在集合页时再点同一个请求，
+            // 只改 active_tab 会让主区域继续停在集合页。集合标签保持打开。
+            self.collection_active = false;
             self.view = crate::state::MainView::Request;
             self.active_tab = Some(existing);
             cx.notify();
@@ -702,7 +732,7 @@ impl AppView {
                 if let Some(detail) = latest.as_ref() {
                     tab.restore_last_run(detail, window, cx);
                 }
-                view.open_collection = None;
+                view.collection_active = false;
                 view.view = crate::state::MainView::Request;
                 view.tabs.push(tab);
                 view.active_tab = Some(view.tabs.len() - 1);
@@ -723,14 +753,14 @@ impl AppView {
         self.new_draft_tab_for(views::request::Protocol::Http, window, cx);
     }
 
-    /// 新建指定协议的临时请求，并切到请求视图。
+    /// 新建指定协议的临时请求，并切到请求视图。集合标签保持打开。
     pub fn new_draft_tab_for(
         &mut self,
         protocol: views::request::Protocol,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_collection = None;
+        self.collection_active = false;
         self.view = crate::state::MainView::Request;
         self.tabs.push(RequestTab::draft(protocol, window, cx));
         self.active_tab = Some(self.tabs.len() - 1);
@@ -891,7 +921,7 @@ impl AppView {
 
     /// Ctrl/Cmd+S：保存当前请求。临时请求会写成工作区里的新文件。
     pub fn save_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.view != crate::state::MainView::Request {
+        if self.view != crate::state::MainView::Request || self.collection_page_open() {
             return;
         }
         let Some(index) = self.active_tab else {
@@ -941,7 +971,7 @@ impl AppView {
         let len = self.tabs.len() as isize;
         let current = self.active_tab.unwrap_or(0) as isize;
         let next = (current + delta).rem_euclid(len) as usize;
-        self.open_collection = None;
+        self.collection_active = false;
         self.view = crate::state::MainView::Request;
         self.active_tab = Some(next);
         cx.notify();
@@ -1132,16 +1162,17 @@ impl AppView {
         }));
     }
 
-    /// 切换活动栏。已经停在集合页时再点「集合」不会把集合页关掉。
-    pub fn switch_view(&mut self, view: MainView, _: &mut Window, cx: &mut Context<Self>) {
-        if self.view != view {
-            self.open_collection = None;
+    /// 切换活动栏。打开的集合标签像请求标签一样保留，切回来时还在；
+    /// 离开环境页前把还在输入中的变量修改落盘。
+    pub fn switch_view(&mut self, view: MainView, window: &mut Window, cx: &mut Context<Self>) {
+        if self.view == MainView::Environments && view != MainView::Environments {
+            self.flush_env_edits(window, cx);
         }
         self.view = view;
         match view {
             MainView::History => self.reload_history(cx),
             MainView::Certificates => self.reload_certificate(cx),
-            MainView::Environments => self.reload_environment(cx),
+            MainView::Environments => self.reload_environment(window, cx),
             MainView::Proxy => {
                 // 每次进入刷新一次状态，流量靠事件循环持续推进。
                 self.refresh_proxy_status(cx);

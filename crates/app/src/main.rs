@@ -78,7 +78,7 @@ fn toggle_layout(_: &ToggleLayout, cx: &mut App) {
 
 fn send_request(_: &SendRequest, cx: &mut App) {
     on_main_window(cx, |view, window, cx| {
-        if view.view != crate::state::MainView::Request || view.open_collection.is_some() {
+        if view.view != crate::state::MainView::Request || view.collection_page_open() {
             return;
         }
         let Some(index) = view.active_tab else {
@@ -99,6 +99,13 @@ fn new_request(_: &NewRequest, cx: &mut App) {
 
 fn close_tab(_: &CloseTab, cx: &mut App) {
     on_main_window(cx, |view, window, cx| {
+        // 停在集合页时，Cmd+W 关掉的是集合标签，而不是下面藏着的请求标签。
+        if view.collection_page_open() {
+            view.open_collection = None;
+            view.collection_active = false;
+            cx.notify();
+            return;
+        }
         let Some(index) = view.active_tab else {
             return;
         };

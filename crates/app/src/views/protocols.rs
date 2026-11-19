@@ -27,7 +27,7 @@ use thread_core::services::websocket::{WsConnect, WsOutgoing, WsSink};
 use thread_core::workspace::formats::{AuthSpec, MqttSubscription};
 
 use crate::app::AppView;
-use crate::views::request::{self, EditorPane, KvKind, Protocol};
+use crate::views::request::{self, EditorPane, KvKind, Protocol, RequestSection};
 use crate::views::response;
 use crate::widgets;
 
@@ -77,6 +77,7 @@ fn graphql_body(
         )
     };
     let suggestions = this.tabs[active].suggestions.clone();
+    let timeline = this.tabs[active].section == RequestSection::Timeline;
 
     v_flex()
         .flex_1()
@@ -127,6 +128,7 @@ fn graphql_body(
             this,
             active,
             pane,
+            timeline,
             &[
                 (EditorPane::Primary, tr!(cx, "查询", "Query")),
                 (EditorPane::Secondary, tr!(cx, "变量", "Variables")),
@@ -135,7 +137,7 @@ fn graphql_body(
             cx,
         ))
         .when(
-            !suggestions.is_empty() && pane == EditorPane::Primary,
+            !timeline && !suggestions.is_empty() && pane == EditorPane::Primary,
             |parent| parent.child(suggestion_row(this, active, &suggestions, window, cx)),
         )
         .child(widgets::editor_split(
@@ -146,14 +148,22 @@ fn graphql_body(
             } else {
                 "gql-editor-split-side"
             },
-            filling_editor(match pane {
-                EditorPane::Primary => editor_box(&body, &theme),
-                EditorPane::Secondary => editor_box(&variables, &theme),
-                EditorPane::Headers => widgets::pane_frame(
+            filling_editor(if timeline {
+                widgets::pane_frame(
                     theme.border,
                     theme.background,
-                    request::kv_editor(this, active, KvKind::Headers, cx),
-                ),
+                    crate::views::history::request_timeline(this, active, cx),
+                )
+            } else {
+                match pane {
+                    EditorPane::Primary => editor_box(&body, &theme),
+                    EditorPane::Secondary => editor_box(&variables, &theme),
+                    EditorPane::Headers => widgets::pane_frame(
+                        theme.border,
+                        theme.background,
+                        request::kv_editor(this, active, KvKind::Headers, cx),
+                    ),
+                }
             }),
             activity_pane(this, active, window, cx),
         ))
@@ -175,6 +185,7 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
             tab.path.is_some(),
         )
     };
+    let timeline = this.tabs[active].section == RequestSection::Timeline;
 
     v_flex()
         .flex_1()
@@ -247,44 +258,69 @@ fn websocket_body(this: &mut AppView, active: usize, cx: &mut Context<AppView>) 
             this,
             active,
             pane,
+            timeline,
             &[
                 (EditorPane::Primary, tr!(cx, "消息", "Message")),
                 (EditorPane::Headers, tr!(cx, "请求头", "Headers")),
             ],
             cx,
         ))
-        .child(widgets::editor_split(
-            theme.muted,
-            this.editor_layout == crate::theme::EditorLayout::Stacked,
-            if this.editor_layout == crate::theme::EditorLayout::Stacked {
-                "ws-editor-split"
-            } else {
-                "ws-editor-split-side"
-            },
-            match pane {
-                EditorPane::Headers => filling_editor(widgets::pane_frame(
-                    theme.border,
-                    theme.background,
-                    request::kv_editor(this, active, KvKind::Headers, cx),
-                )),
-                _ => h_flex()
-                    .flex_shrink_0()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(Input::new(&message).small()))
-                    .child(
-                        Button::new("ws-send")
-                            .outline()
-                            .small()
-                            .label(tr!(cx, "发送", "Send"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                send_ws_message(this, active, window, cx);
-                            })),
+        .child(if timeline || pane == EditorPane::Headers {
+            widgets::editor_split(
+                theme.muted,
+                this.editor_layout == crate::theme::EditorLayout::Stacked,
+                if this.editor_layout == crate::theme::EditorLayout::Stacked {
+                    "ws-editor-split"
+                } else {
+                    "ws-editor-split-side"
+                },
+                filling_editor(if timeline {
+                    widgets::pane_frame(
+                        theme.border,
+                        theme.background,
+                        crate::views::history::request_timeline(this, active, cx),
                     )
-                    .into_any_element(),
-            },
-            Some(session_log(this, active, true, cx)),
-        ))
+                } else {
+                    widgets::pane_frame(
+                        theme.border,
+                        theme.background,
+                        request::kv_editor(this, active, KvKind::Headers, cx),
+                    )
+                }),
+                Some(session_log(this, active, true, cx)),
+            )
+        } else {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(theme.muted)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(session_log(this, active, true, cx)),
+                )
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .items_center()
+                        .child(div().flex_1().min_w_0().child(Input::new(&message).small()))
+                        .child(
+                            Button::new("ws-send")
+                                .outline()
+                                .small()
+                                .label(tr!(cx, "发送", "Send"))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    send_ws_message(this, active, window, cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        })
         .into_any_element()
 }
 
@@ -313,6 +349,7 @@ fn grpc_body(
             streaming,
         )
     };
+    let timeline = this.tabs[active].section == RequestSection::Timeline;
     let discovered = this.tabs[active].services.clone();
 
     v_flex()
@@ -428,6 +465,7 @@ fn grpc_body(
             this,
             active,
             pane,
+            timeline,
             &[
                 (EditorPane::Primary, tr!(cx, "载荷", "Payload")),
                 (EditorPane::Headers, "Metadata"),
@@ -442,13 +480,21 @@ fn grpc_body(
             } else {
                 "grpc-editor-split-side"
             },
-            filling_editor(match pane {
-                EditorPane::Headers => widgets::pane_frame(
+            filling_editor(if timeline {
+                widgets::pane_frame(
                     theme.border,
                     theme.background,
-                    request::kv_editor(this, active, KvKind::Headers, cx),
-                ),
-                _ => editor_box(&body, &theme),
+                    crate::views::history::request_timeline(this, active, cx),
+                )
+            } else {
+                match pane {
+                    EditorPane::Headers => widgets::pane_frame(
+                        theme.border,
+                        theme.background,
+                        request::kv_editor(this, active, KvKind::Headers, cx),
+                    ),
+                    _ => editor_box(&body, &theme),
+                }
             }),
             activity_pane(this, active, window, cx),
         ))
@@ -504,6 +550,7 @@ fn mqtt_body(
             tab.mqtt_subscriptions.clone(),
         )
     };
+    let timeline = this.tabs[active].section == RequestSection::Timeline;
 
     let clean_label: SharedString = if level == 5 {
         tr!(cx, "Clean start", "Clean start").into()
@@ -652,7 +699,29 @@ fn mqtt_body(
                 crate::widgets::notice_line(cx, error),
             ))
         })
-        .child(widgets::editor_split(
+        .child(pane_bar(
+            this,
+            active,
+            EditorPane::Primary,
+            timeline,
+            &[(EditorPane::Primary, tr!(cx, "会话", "Session"))],
+            cx,
+        ))
+        .child(if timeline {
+            div()
+                .flex_1()
+                .min_h_0()
+                .px_2()
+                .py_1()
+                .bg(theme.muted)
+                .child(widgets::pane_frame(
+                    theme.border,
+                    theme.background,
+                    crate::views::history::request_timeline(this, active, cx),
+                ))
+                .into_any_element()
+        } else {
+            widgets::editor_split(
             theme.muted,
             this.editor_layout == crate::theme::EditorLayout::Stacked,
             if this.editor_layout == crate::theme::EditorLayout::Stacked {
@@ -812,7 +881,8 @@ fn mqtt_body(
                     ),
             ),
             Some(mqtt_log(this, active, cx)),
-        ))
+            )
+        })
         .into_any_element()
 }
 
@@ -1084,43 +1154,53 @@ fn pane_bar(
     _this: &mut AppView,
     active: usize,
     selected: EditorPane,
+    timeline: bool,
     panes: &[(EditorPane, &'static str)],
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
     let theme = cx.theme().clone();
     h_flex()
         .flex_shrink_0()
-        .px_3()
+        .px_2()
+        .py_1()
         .gap_1()
+        .bg(theme.secondary)
         .border_b_1()
         .border_color(theme.border)
         .children(panes.iter().map(|(pane, label)| {
             let pane = *pane;
-            let on = selected == pane;
-            div()
+            let on = !timeline && selected == pane;
+            widgets::tab_chip(div(), on, &theme)
                 .id(SharedString::from(format!("pane-{label}")))
-                .px_2()
-                .py_1p5()
-                .text_xs()
-                .border_b_2()
                 .cursor_pointer()
-                .when(on, |this| {
-                    this.border_color(theme.primary)
-                        .text_color(theme.foreground)
-                })
                 .when(!on, |this| {
-                    this.border_color(gpui_kit::transparent_black())
-                        .text_color(theme.muted_foreground)
-                        .hover(|this| this.text_color(theme.foreground))
+                    this.hover(|this| this.text_color(theme.foreground))
                 })
                 .child(*label)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(tab) = this.tabs.get_mut(active) {
+                        tab.section = RequestSection::Body;
                         tab.pane = pane;
                         cx.notify();
                     }
                 }))
         }))
+        .child({
+            widgets::tab_chip(div(), timeline, &theme)
+                .id("pane-timeline")
+                .cursor_pointer()
+                .when(!timeline, |this| {
+                    this.hover(|this| this.text_color(theme.foreground))
+                })
+                .child(tr!(cx, "时间线", "Timeline"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tab) = this.tabs.get_mut(active) {
+                        tab.section = RequestSection::Timeline;
+                    }
+                    this.reload_request_timeline(active, cx);
+                    cx.notify();
+                }))
+        })
 }
 
 fn editor_box(editor: &Entity<EditorState>, theme: &gpui_kit::component::Theme) -> AnyElement {

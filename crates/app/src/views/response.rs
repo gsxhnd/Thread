@@ -8,8 +8,8 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    AnyElement, App, Context, FontWeight, IntoElement, ParentElement as _, SharedString, Styled,
-    Window, div, px,
+    AnyElement, App, Context, IntoElement, ParentElement as _, SharedString, Styled, Window, div,
+    px,
 };
 use gpui_kit::{InteractiveElement as _, StatefulInteractiveElement as _};
 
@@ -84,20 +84,7 @@ pub fn auto_select_section(tab: &mut RequestTab) {
 
 /// 分栏标签的基础样式：选中态有底线并加粗，未选中态是弱化文字。
 fn tab_style<E: Styled + FluentBuilder>(element: E, selected: bool, theme: &Theme) -> E {
-    element
-        .px_2()
-        .py_1()
-        .text_xs()
-        .border_b_2()
-        .when(selected, |this| {
-            this.border_color(theme.primary)
-                .text_color(theme.foreground)
-                .font_weight(FontWeight::SEMIBOLD)
-        })
-        .when(!selected, |this| {
-            this.border_color(gpui_kit::transparent_black())
-                .text_color(theme.muted_foreground)
-        })
+    widgets::tab_chip(element, selected, theme)
 }
 
 pub fn render(
